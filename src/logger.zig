@@ -567,3 +567,43 @@ test "logger.log via global() works" {
     try l.log(io, .info, "via global");
     try l.logf(io, .warn, "fmt {d}", .{7});
 }
+
+test "CLOEXEC flag set on fd via fcntl F_GETFD" {
+    var tmp = tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+
+    const file_path = try tmpLogPath(&tmp, io, "cloexec.txt");
+    defer testing.allocator.free(file_path);
+
+    var l = try Logger.init(io, file_path);
+    defer l.deinit(io);
+
+    // fcntl(F.GETFD) returns fd flags; FD_CLOEXEC bit indicates the fd is
+    // closed on exec. Verifies that O_CLOEXEC was applied at open time.
+    const fd_flags = std.os.linux.fcntl(l.fd, std.os.linux.F.GETFD, 0);
+    try testing.expect((fd_flags & std.os.linux.FD_CLOEXEC) != 0);
+}
+
+test "first writable candidate wins in fallback chain" {
+    const io = testing.io;
+
+    var tmp_a = tmpDir(.{});
+    defer tmp_a.cleanup();
+    var tmp_b = tmpDir(.{});
+    defer tmp_b.cleanup();
+
+    var path_a: [std.fs.max_path_bytes]u8 = undefined;
+    const len_a = try tmp_a.dir.realPath(io, &path_a);
+    var path_b: [std.fs.max_path_bytes]u8 = undefined;
+    const len_b = try tmp_b.dir.realPath(io, &path_b);
+
+    // Both candidates writable; first one must win (matches spec requirement
+    // that TMPDIR outranks XDG_RUNTIME_DIR outranks /tmp when all set).
+    const candidates = [_][]const u8{
+        path_a[0..len_a],
+        path_b[0..len_b],
+    };
+    const picked = resolveWritableDir(&candidates) orelse return error.NoWritableTempDir;
+    try testing.expectEqualStrings(path_a[0..len_a], picked);
+}
