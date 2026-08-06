@@ -6,8 +6,6 @@
 
 > **AI Harness TUI** — A terminal-native AI agent harness built in Zig with a least-privilege execution sandbox.
 
-![zargeant banner](docs/zargeant-banner_001.jpg)
-
 ## What is zargeant?
 
 Zargeant is a **terminal-native AI agent harness**: a TUI that lets you drive an LLM agent directly from your terminal, with strict security boundaries on every tool invocation. It is written in **Zig 0.16** with zero external runtime dependencies, built on three concurrent threads (TUI render / Agent HTTP-SSE / Tools subprocess pool) and a Linux sandbox based on **Landlock LSM + Seccomp-BPF**.
@@ -53,15 +51,15 @@ Three threads:
 
 In development. Three of seven planned slices are shipped on `main`:
 
-| Slice | Status | Lines | Tests |
-|---|---|---|---|
-| Build toolchain (`build.zig` + `zig.zon`) | ✓ shipped | 78 | 1 smoke |
-| Logger (`/tmp/ai-harness-debug.log`) | ✓ shipped | 609 | 15 |
-| Sandbox Linux (Landlock + Seccomp-BPF) | ✓ shipped | 1,615 | 25 |
-| API Client (MiniMax HTTP-SSE) | 🚧 next | — | — |
-| TUI (libvaxis + agent loop) | 📋 planned | — | — |
-| logger-macos-port | 📋 follow-up | — | — |
-| sandbox-macos | 📋 follow-up | — | — |
+| Slice                                     | Status       | Lines | Tests   |
+| ----------------------------------------- | ------------ | ----- | ------- |
+| Build toolchain (`build.zig` + `zig.zon`) | ✓ shipped    | 78    | 1 smoke |
+| Logger (`/tmp/ai-harness-debug.log`)      | ✓ shipped    | 609   | 15      |
+| Sandbox Linux (Landlock + Seccomp-BPF)    | ✓ shipped    | 1,615 | 25      |
+| API Client (MiniMax HTTP-SSE)             | 🚧 next      | —     | —       |
+| TUI (libvaxis + agent loop)               | 📋 planned   | —     | —       |
+| logger-macos-port                         | 📋 follow-up | —     | —       |
+| sandbox-macos                             | 📋 follow-up | —     | —       |
 
 **Total**: 41 tests pass on `zig build test` (Debug + ReleaseSafe + ReleaseFast) as of the sandbox-linux slice.
 
