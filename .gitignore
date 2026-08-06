@@ -1,0 +1,27 @@
+# Zig
+zig-cache/
+zig-out/
+.zig-cache/
+*.o
+*.obj
+*.exe
+*.pdb
+
+# Testing
+*.test
+*.test.exe
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs (debug log MUST stay out of repo; already in /tmp)
+*.log
+
+# Secrets
+.env
+.env.local
+.atl/
