@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     const test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("src/harness.zig"),
+        .root_source_file = b.path("src/root.zig"),
     });
     const test_step = b.addTest(.{ .root_module = test_mod });
     const run_test = b.addRunArtifact(test_step);
