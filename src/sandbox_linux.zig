@@ -97,7 +97,7 @@ pub const Landlock = struct {
         const rc = std.os.linux.syscall3(
             .landlock_create_ruleset,
             @intFromPtr(&attr),
-            0,
+            @sizeOf(ruleset_attr),
             0,
         );
         if (rc == @as(usize, @bitCast(@as(isize, -38)))) return error.Unsupported; // -ENOSYS
