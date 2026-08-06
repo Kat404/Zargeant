@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  test:
+    name: zig build test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Cache zig build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**/*.zig') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-
+
+      - name: Show toolchain
+        run: zig version
+
+      - name: Build (default Debug)
+        run: zig build
+
+      - name: Run tests (Debug)
+        run: zig build test --summary all
+
+      - name: Run tests (ReleaseSafe)
+        run: zig build test --summary all -Doptimize=ReleaseSafe
+
+      - name: Run tests (ReleaseFast)
+        run: zig build test --summary all -Doptimize=ReleaseFast
+
+      - name: Build release artifact (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Verify no Co-Authored-By AI in commits
+        run: |
+          if git log --format='%B' origin/main..HEAD | grep -iE 'Co-Authored-By:.*(Claude|MiniMax|Anthropic|AI)'; then
+            echo "::error::Found Co-Authored-By AI line in commit message"
+            exit 1
+          fi
+
+  strict-tdd:
+    name: Strict TDD check (no production code without tests)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Verify every src/*.zig has test blocks
+        run: |
+          missing=""
+          for f in src/*.zig; do
+            tests=$(grep -c '^test ' "$f" || true)
+            if [ "$tests" -eq 0 ]; then
+              missing="$missing $f"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Sources without tests:$missing"
+            exit 1
+          fi
+          echo "OK: all src/*.zig have test blocks"
