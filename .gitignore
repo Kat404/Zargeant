@@ -24,4 +24,6 @@ zig-out/
 # Secrets
 .env
 .env.local
+
+# Tooling caches (regenerable, contiene paths locales)
 .atl/
