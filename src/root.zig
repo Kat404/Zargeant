@@ -6,6 +6,7 @@ pub const api_client = @import("api_client.zig");
 pub const api_sse = @import("api_sse.zig");
 pub const api_auth = @import("api_auth.zig");
 pub const mock_server = @import("mock_server.zig");
+pub const fixtures_test = @import("fixtures_test.zig");
 
 // ponytail: stub main for the build-toolchain slice. exe.entry = .disabled
 // skips the entry-point link, but std.start.zig still needs root.main to exist
@@ -31,4 +32,5 @@ comptime {
     _ = api_sse.Event;
     _ = api_auth.validateFormat;
     _ = mock_server.Handle;
+    _ = fixtures_test;
 }
