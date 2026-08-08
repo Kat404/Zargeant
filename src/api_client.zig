@@ -926,3 +926,92 @@ test "q cancels and returns to idle" {
 
     try testing.expectError(error.Cancelled, result);
 }
+
+// =============================================================================
+// PR 3 — RED test blocks for backpressure + model/thinking overrides (3 tests)
+// Commit 3: tests added BEFORE the implementation lands.
+// All tests below FAIL because the production code is not yet in place.
+// =============================================================================
+
+// T3.7 — Backpressure coalesces slow-TUI chunks. Spec scenario 39.
+// The mock server sends 3 SSE chunks rapidly. The TUI consumer (test) is
+// slow (sleeps 30ms before calling next()). The Client.stream machinery
+// should coalesce the chunks: instead of yielding each, it should yield
+// a single combined chunk (the latest cumulative content) with a
+// chunk_coalesced warn logged.
+test "backpressure coalesces slow-TUI chunks" {
+    var ms = try mock_server.start(testing.allocator);
+    defer ms.deinit();
+
+    // SSE body: 3 cumulative content chunks with no body terminator so
+    // the stream holds the connection open.
+    const sse_body =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi there\"}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi there friend\"}}]}\n\n";
+    var hdr_buf: [256]u8 = undefined;
+    const response = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\n\r\n{s}", .{ sse_body.len, sse_body }) catch unreachable;
+    try mock_server.sendBytes(ms, response);
+
+    const pipe = try makeCancelPipe();
+    defer closeCancelPipe(pipe);
+
+    const req = testRequest(mock_server.port(ms.*), 1);
+    var stream = try Client.stream(testing.io, req, pipe);
+    defer stream.deinit();
+
+    // Simulate slow TUI consumer: sleep 30ms then call next().
+    // The Client.stream impl should have buffered the chunks and emitted
+    // only the latest (cumulative content: "hi there friend").
+    var ts = std.os.linux.timespec{ .sec = 0, .nsec = 30 * std.time.ns_per_ms };
+    _ = std.os.linux.nanosleep(&ts, null);
+
+    const ev = try stream.next();
+    // Current impl returns .done or null since body is fully buffered.
+    // Expected: .message with content "hi there friend".
+    try testing.expect(ev != null);
+    try testing.expect(ev.? == .message);
+    try testing.expectEqualStrings("hi there friend", ev.?.message);
+}
+
+// T3.9 — Model override via runtime command. Spec scenario 30.
+// Setting `Request.model = "MiniMax-M2.7-highspeed"` should:
+//   - serialize model field as "MiniMax-M2.7-highspeed"
+//   - OMIT `thinking` field (M2.x always thinks, not configurable)
+test "model override via runtime command" {
+    var req = Request{
+        .model = "MiniMax-M2.7-highspeed",
+        .messages = &[_]Message{
+            .{ .role = "user", .content = "hi" },
+        },
+        .target_host = "127.0.0.1",
+    };
+    // Disable thinking for the override path (M2.x always thinks; spec says
+    // omit thinking from request body).
+    req.thinking = null;
+
+    const json = try serializeRequest(req, testing.allocator);
+    defer testing.allocator.free(json);
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"model\":\"MiniMax-M2.7-highspeed\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"thinking\"") == null);
+}
+
+// T3.10 — Thinking disable omits thinking field. Spec scenario 31.
+// Setting `Request.thinking = null` should omit `thinking` from JSON body.
+test "thinking disable omits thinking field" {
+    var req = Request{
+        .model = "MiniMax-M3",
+        .messages = &[_]Message{
+            .{ .role = "user", .content = "hi" },
+        },
+        .target_host = "127.0.0.1",
+    };
+    req.thinking = null;
+
+    const json = try serializeRequest(req, testing.allocator);
+    defer testing.allocator.free(json);
+
+    try testing.expect(std.mem.indexOf(u8, json, "\"thinking\"") == null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"model\":\"MiniMax-M3\"") != null);
+}
