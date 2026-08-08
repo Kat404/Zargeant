@@ -105,24 +105,124 @@ pub fn validateFormat(key: []const u8) bool {
 }
 
 /// Async key validation probe. tls-handrolled (id=323, T2.4): the stub
-/// is replaced with a real HTTP POST probe against `current_url` using
-/// the api-client TLS stack. Sends `max_completion_tokens=1, stream=false`
-/// with `Authorization: Bearer <key>`. Returns:
+/// is replaced with a real HTTP POST probe against `target_host:port`
+/// (defaults to `api.minimax.io:443` from `api_client.current_url`).
+/// Sends `max_completion_tokens=1, stream=false` with
+/// `Authorization: Bearer <key>`. Returns:
 ///   - 200 → success
 ///   - 401 OR `base_resp.status_code == 1004` → `error.Unauthorized`
 ///   - network error → `error.ConnectFailed`
 ///   - TLS handshake error → `error.TlsHandshakeFailed`
 ///
-/// Requires `alloc` for the TLS read/write buffers (~32 KB combined).
+/// `target_host` may be a hostname or an IPv4 literal. When it is
+/// "127.0.0.1" the probe skips TLS (used by mock-server tests).
+/// `target_port = 0` defaults to 443.
+///
 /// Key bytes are NEVER logged (NFR-07 preserved from api-client PR 3).
 pub fn validateViaApi(io: std.Io, alloc: std.mem.Allocator, key: []const u8) AuthError!void {
     _ = io;
-    _ = alloc;
-    _ = key;
-    // Stub (Commit 5 RED): returns OpenFailed as a placeholder error
-    // that's part of the AuthError set. Commit 6 GREEN replaces with
-    // a real HTTP POST probe.
-    return error.OpenFailed;
+    return validateViaApiWithTarget(alloc, key, "api.minimax.io", 443);
+}
+
+/// Internal probe variant that accepts an explicit target host + port.
+/// Public so tests can route to a local mock server (e.g., 127.0.0.1:PORT)
+/// and assert the error mapping without standing up a real TLS stack.
+pub fn validateViaApiWithTarget(alloc: std.mem.Allocator, key: []const u8, target_host: []const u8, target_port: u16) AuthError!void {
+    const api_client = @import("api_client.zig");
+
+    // Build minimal probe request: model=MiniMax-M3, 1 token, no stream.
+    const probe_messages = [_]api_client.Message{
+        .{ .role = "user", .content = "hi" },
+    };
+
+    // Resolve target (DNS or IPv4 literal fast path).
+    var addrs = api_client.dns_resolve(alloc, target_host) catch {
+        return error.ConnectFailed;
+    };
+    defer alloc.free(addrs);
+    if (addrs.len == 0) return error.ConnectFailed;
+    const port: u16 = if (target_port != 0) target_port else 443;
+    addrs[0].port = std.mem.nativeToBig(u16, port);
+
+    // Open TCP socket.
+    const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+    if (sock_rc < 0) return error.OpenFailed;
+    const fd: i32 = @intCast(sock_rc);
+    defer _ = std.os.linux.close(fd);
+
+    const connect_rc = std.os.linux.connect(fd, @ptrCast(&addrs[0]), @sizeOf(@TypeOf(addrs[0])));
+    if (connect_rc != 0) return error.ConnectFailed;
+
+    // For 127.0.0.1 (mock-server tests), skip TLS.
+    // For api.minimax.io, TLS via tls_conn.
+    const needs_tls = !std.mem.eql(u8, target_host, "127.0.0.1");
+    if (needs_tls) {
+        var cancel_pipe: [2]i32 = .{ -1, -1 };
+        _ = std.os.linux.pipe(&cancel_pipe);
+        defer {
+            _ = std.os.linux.close(cancel_pipe[0]);
+            _ = std.os.linux.close(cancel_pipe[1]);
+        }
+        const api_host = std.mem.sliceTo(target_host, 0);
+        var conn = api_client.tls_conn.connect(alloc, fd, api_host, cancel_pipe) catch |err| switch (err) {
+            error.TlsHandshakeFailed => return error.TlsHandshakeFailed,
+            error.HandshakeTimeout => return error.TlsHandshakeFailed,
+            error.CaBundleNotFound => return error.TlsHandshakeFailed,
+            else => return error.TlsHandshakeFailed,
+        };
+        defer conn.deinit();
+    }
+
+    // Build HTTP request body (key bytes go in Authorization header).
+    const body = api_client.serializeRequest(.{
+        .messages = &probe_messages,
+        .max_completion_tokens = 1,
+        .stream_options = .{ .include_usage = false },
+        .key = key,
+    }, alloc) catch return error.WriteFailed;
+    defer alloc.free(body);
+
+    const headers = api_client.buildHeaders(key, alloc) catch return error.WriteFailed;
+    defer alloc.free(headers);
+
+    var req_buf: std.ArrayList(u8) = .empty;
+    defer req_buf.deinit(alloc);
+    req_buf.appendSlice(alloc, headers) catch return error.WriteFailed;
+    req_buf.appendSlice(alloc, body) catch return error.WriteFailed;
+
+    const write_rc = std.os.linux.write(fd, req_buf.items.ptr, req_buf.items.len);
+    if (write_rc != req_buf.items.len) return error.WriteFailed;
+
+    // Read response — up to 16 KB.
+    var resp_buf: [16 * 1024]u8 = undefined;
+    var resp_len: usize = 0;
+    var header_end: usize = 0;
+    while (header_end == 0 and resp_len < resp_buf.len) {
+        const n: isize = @bitCast(std.os.linux.read(fd, resp_buf[resp_len..].ptr, resp_buf.len - resp_len));
+        if (n <= 0) return error.ReadFailed;
+        resp_len += @intCast(n);
+        if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |idx| {
+            header_end = idx + 4;
+        }
+    }
+    if (header_end == 0) return error.ReadFailed;
+
+    const status_line_end = std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n") orelse return error.ReadFailed;
+    const status_line = resp_buf[0..status_line_end];
+    const status = api_client.parseStatusCode(status_line) orelse return error.ReadFailed;
+
+    // Map status to AuthError.
+    if (status == 200) return;
+    if (status == 401 or status == 403) return error.Unauthorized;
+
+    // For 4xx/5xx with body, check base_resp.status_code == 1004.
+    if (resp_len > header_end) {
+        const body_slice = resp_buf[header_end..resp_len];
+        if (std.mem.indexOf(u8, body_slice, "\"status_code\":1004") != null) {
+            return error.Unauthorized;
+        }
+    }
+    return error.ConnectFailed;
 }
 
 /// Writes the key to `path` as plain JSON {"provider":"MiniMax","api_key":
@@ -626,37 +726,27 @@ test "validateViaApi against api.minimax.io succeeds with 200" {
 // POST to a local mock server that responds with status 401. The mock
 // lives in src/mock_server.zig.
 test "validateViaApi returns Unauthorized on 401 or base_resp 1004" {
-    // Build a minimal Request with target_host = "127.0.0.1" so the
-    // mock server route works. RED: this currently errors because the
-    // stub doesn't talk HTTP.
-    const req = @import("api_client.zig").Request{
-        .messages = &[_]@import("api_client.zig").Message{
-            .{ .role = "user", .content = "hi" },
-        },
-        .target_host = "127.0.0.1",
-        .target_port = 0, // mock_server will assign
-        .key = "test-key-1234567890ABCDEF",
-    };
-    _ = req;
-    // The probe asserts error.Unauthorized on HTTP 401 response.
-    const result = validateViaApi(testing.io, testing.allocator, "test-key-1234567890ABCDEF");
-    // Stub currently returns error.OpenFailed; GREEN replaces this
-    // with a real HTTP POST to a local mock returning 401.
+    const mock_server = @import("mock_server.zig");
+    var ms = try mock_server.start(testing.allocator);
+    defer ms.deinit();
+
+    // Queue a 401 response.
+    const body = "{\"error\":\"unauthorized\"}";
+    var status_buf: [256]u8 = undefined;
+    const status_line = std.fmt.bufPrint(&status_buf, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    try mock_server.sendBytes(ms, status_line);
+
+    // Probe the mock server (127.0.0.1:PORT). The probe sends a request;
+    // the mock responds 401; the probe maps to error.Unauthorized.
+    const result = validateViaApiWithTarget(testing.allocator, "test-key-1234567890ABCDEF", "127.0.0.1", mock_server.port(ms.*));
     try testing.expectError(error.Unauthorized, result);
 }
 
 // T2.3 — validateViaApi returns error.ConnectFailed on network error.
 // We probe a closed port on 127.0.0.1 (no listener).
 test "validateViaApi returns ConnectFailed on network error" {
-    const req = @import("api_client.zig").Request{
-        .messages = &[_]@import("api_client.zig").Message{
-            .{ .role = "user", .content = "hi" },
-        },
-        .target_host = "127.0.0.1",
-        .target_port = 1, // port 1 = closed (no listener); ECONNREFUSED
-        .key = "test-key-1234567890ABCDEF",
-    };
-    _ = req;
-    const result = validateViaApi(testing.io, testing.allocator, "test-key-1234567890ABCDEF");
+    // Port 1 is reserved; ECONNREFUSED on connect. The probe maps to
+    // error.ConnectFailed (NOT error.OpenFailed).
+    const result = validateViaApiWithTarget(testing.allocator, "test-key-1234567890ABCDEF", "127.0.0.1", 1);
     try testing.expectError(error.ConnectFailed, result);
 }

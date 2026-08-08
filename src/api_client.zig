@@ -594,7 +594,7 @@ fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator
 }
 
 /// Parses the status code from "HTTP/1.1 200 OK\r\n".
-fn parseStatusCode(status_line: []const u8) ?u16 {
+pub fn parseStatusCode(status_line: []const u8) ?u16 {
     const first_space = std.mem.indexOf(u8, status_line, " ") orelse return null;
     const after = status_line[first_space + 1 ..];
     const second_space = std.mem.indexOf(u8, after, " ") orelse after.len;
@@ -1440,7 +1440,7 @@ const api_auth = @import("api_auth.zig");
 /// getaddrinfo and the Io netLookup vtable requires libc — see lesson id=179).
 /// IPv4 literals ("127.0.0.1") skip DNS entirely. Returns the first
 /// IPv4 result.
-fn dns_resolve(alloc: std.mem.Allocator, host: []const u8) ![]std.os.linux.sockaddr.in {
+pub fn dns_resolve(alloc: std.mem.Allocator, host: []const u8) ![]std.os.linux.sockaddr.in {
     // 1. IPv4 literal fast path.
     if (parseIpv4Literal(host)) |addr_net| {
         const result = try alloc.alloc(std.os.linux.sockaddr.in, 1);
