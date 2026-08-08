@@ -1426,3 +1426,87 @@ test "no stdout or stderr writes" {
     try testing.expect(n > 0);
     try testing.expect(std.mem.indexOf(u8, contents, "dup2-of-pipe-test-flow-start") != null);
 }
+
+// =============================================================================
+// tls-handrolled — RED test blocks for DNS resolution (Commit 1)
+// Spec scenarios: real DNS lookup vs api.minimax.io, NXDOMAIN, IPv4 first.
+// Tests fail at compile time because `dns_resolve` does not exist yet.
+// =============================================================================
+
+const api_auth = @import("api_auth.zig");
+
+/// Resolves `host` to a list of IPv4 `sockaddr_in` records via
+/// `getaddrinfo(3)`. Returns the first IPv4 result. RED: not implemented.
+fn dns_resolve(alloc: std.mem.Allocator, host: []const u8) ![]std.os.linux.sockaddr.in {
+    _ = alloc;
+    _ = host;
+    return error.NotImplemented;
+}
+
+// T0.2 — Real DNS resolution for api.minimax.io returns at least one IPv4
+// address. Gated on network availability (real DNS lookup requires it).
+test "DNS resolution api.minimax.io returns IPv4" {
+    // Gate: skip if /etc/resolv.conf is missing (rare, sandboxed envs).
+    var resolv_z: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const resolv_path = "/etc/resolv.conf";
+    @memcpy(resolv_z[0..resolv_path.len], resolv_path.ptr);
+    resolv_z[resolv_path.len] = 0;
+    const resolv_exists = std.os.linux.access(resolv_z[0..resolv_path.len :0].ptr, 0) == 0;
+    if (!resolv_exists) return;
+
+    const addrs = try dns_resolve(testing.allocator, "api.minimax.io");
+    defer testing.allocator.free(addrs);
+
+    try testing.expect(addrs.len >= 1);
+    // First result must be IPv4 (family AF.INET).
+    try testing.expectEqual(@as(u16, std.os.linux.AF.INET), addrs[0].family);
+    // Port is uninitialized; test only asserts non-zero address octets.
+    try testing.expect(addrs[0].addr != 0);
+}
+
+// T0.2 — DNS NXDOMAIN for nonexistent host returns an error. The function
+// MUST NOT silently succeed for garbage hosts.
+test "DNS NXDOMAIN returns error for nonexistent host" {
+    var resolv_z: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const resolv_path = "/etc/resolv.conf";
+    @memcpy(resolv_z[0..resolv_path.len], resolv_path.ptr);
+    resolv_z[resolv_path.len] = 0;
+    const resolv_exists = std.os.linux.access(resolv_z[0..resolv_path.len :0].ptr, 0) == 0;
+    if (!resolv_exists) return;
+
+    const result = dns_resolve(testing.allocator, "zargeant-no-such-host-xyz987.invalid");
+    try testing.expectError(error.UnknownHostName, result);
+}
+
+// T0.2 — IPv4 literal hosts skip DNS entirely. The function detects
+// `127.0.0.1` (and similar) and returns the parsed address directly.
+test "DNS resolution skips for IPv4 literal" {
+    const addrs = try dns_resolve(testing.allocator, "127.0.0.1");
+    defer testing.allocator.free(addrs);
+
+    try testing.expect(addrs.len == 1);
+    try testing.expectEqual(@as(u16, std.os.linux.AF.INET), addrs[0].family);
+    // 127.0.0.1 → 0x7F000001 (network byte order)
+    try testing.expectEqual(@as(u32, 0x7F000001), std.mem.bigToNative(u32, addrs[0].addr));
+}
+
+// =============================================================================
+// tls-handrolled — RED test block for AuthError widening (Commit 1)
+// The new variants (Unauthorized, ConnectFailed, TlsHandshakeFailed) do NOT
+// exist yet on `api_auth.AuthError`. This test fails at compile time until
+// they are added in Commit 2.
+// =============================================================================
+
+// D — AuthError widening adds the three variants required by real
+// `validateViaApi` (Unauthorized / ConnectFailed / TlsHandshakeFailed).
+test "AuthError exposes Unauthorized ConnectFailed TlsHandshakeFailed" {
+    const samples = [_]api_auth.AuthError{
+        api_auth.AuthError.Unauthorized,
+        api_auth.AuthError.ConnectFailed,
+        api_auth.AuthError.TlsHandshakeFailed,
+    };
+    // Just touching the variants is enough — this test compiles iff the
+    // variants are declared on `api_auth.AuthError`. The runtime assertion
+    // is a sanity check that we listed three.
+    try testing.expectEqual(@as(usize, 3), samples.len);
+}
