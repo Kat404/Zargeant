@@ -447,14 +447,18 @@ fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator
     if (sock_rc < 0) return error.SocketFailed;
     const fd: i32 = @intCast(sock_rc);
 
-    // 3. Connect.
-    var addr: std.os.linux.sockaddr.in = .{
-        .family = std.os.linux.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, 0x7F000001),
-        .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    // 3. Resolve target host (IPv4 literal OR UDP DNS) and connect.
+    var resolved = dns_resolve(allocator, req.target_host) catch {
+        _ = std.os.linux.close(fd);
+        return error.ConnectionRefused;
     };
-    const connect_rc = std.os.linux.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+    defer allocator.free(resolved);
+    if (resolved.len == 0) {
+        _ = std.os.linux.close(fd);
+        return error.ConnectionRefused;
+    }
+    resolved[0].port = std.mem.nativeToBig(u16, port);
+    const connect_rc = std.os.linux.connect(fd, @ptrCast(&resolved[0]), @sizeOf(@TypeOf(resolved[0])));
     if (connect_rc != 0) {
         _ = std.os.linux.close(fd);
         return error.ConnectionRefused;
@@ -1436,11 +1440,266 @@ test "no stdout or stderr writes" {
 const api_auth = @import("api_auth.zig");
 
 /// Resolves `host` to a list of IPv4 `sockaddr_in` records via
-/// `getaddrinfo(3)`. Returns the first IPv4 result. RED: not implemented.
+/// `getaddrinfo(3)`-equivalent over UDP DNS (Zig 0.16 stripped libc
+/// getaddrinfo and the Io netLookup vtable requires libc — see lesson id=179).
+/// IPv4 literals ("127.0.0.1") skip DNS entirely. Returns the first
+/// IPv4 result.
 fn dns_resolve(alloc: std.mem.Allocator, host: []const u8) ![]std.os.linux.sockaddr.in {
-    _ = alloc;
-    _ = host;
-    return error.NotImplemented;
+    // 1. IPv4 literal fast path.
+    if (parseIpv4Literal(host)) |addr_net| {
+        const result = try alloc.alloc(std.os.linux.sockaddr.in, 1);
+        result[0] = .{
+            .family = std.os.linux.AF.INET,
+            .port = 0,
+            .addr = addr_net,
+            .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        return result;
+    }
+
+    // 2. Real DNS via UDP query to nameserver (read from /etc/resolv.conf;
+    //    falls back to 8.8.8.8:53 if the file is missing).
+    return dnsUdpQuery(alloc, host);
+}
+
+/// Parses a dotted-quad IPv4 literal into a network-byte-order u32.
+/// Returns null if `host` is not a literal.
+fn parseIpv4Literal(host: []const u8) ?u32 {
+    var octets: [4]u8 = undefined;
+    var octet_idx: usize = 0;
+    var value: u16 = 0;
+    var digit_count: usize = 0;
+    for (host) |c| {
+        if (c == '.') {
+            if (digit_count == 0 or digit_count > 3) return null;
+            if (octet_idx >= 4) return null;
+            octets[octet_idx] = @intCast(value);
+            octet_idx += 1;
+            value = 0;
+            digit_count = 0;
+        } else if (c >= '0' and c <= '9') {
+            value = value * 10 + (c - '0');
+            if (value > 255) return null;
+            digit_count += 1;
+        } else {
+            return null;
+        }
+    }
+    if (digit_count == 0 or octet_idx != 3) return null;
+    octets[3] = @intCast(value);
+
+    const host_order: u32 = (@as(u32, octets[0]) << 24) |
+        (@as(u32, octets[1]) << 16) |
+        (@as(u32, octets[2]) << 8) |
+        @as(u32, octets[3]);
+    return std.mem.nativeToBig(u32, host_order);
+}
+
+/// Performs a real DNS A-record lookup via UDP to the first nameserver
+/// listed in /etc/resolv.conf (or 8.8.8.8 fallback). Returns an owned
+/// slice of IPv4 `sockaddr_in` records. `error.UnknownHostName` is
+/// returned for NXDOMAIN or empty responses.
+fn dnsUdpQuery(alloc: std.mem.Allocator, host: []const u8) ![]std.os.linux.sockaddr.in {
+    // 1. Resolve nameserver from /etc/resolv.conf or fall back to 8.8.8.8.
+    const nameserver = readResolvNameserver() orelse std.mem.nativeToBig(u32, 0x08080808);
+
+    // 2. Build DNS A-record query packet.
+    var query: [512]u8 = undefined;
+    const query_len = buildDnsQuery(host, &query);
+
+    // 3. Open UDP socket.
+    const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.DGRAM | std.os.linux.SOCK.CLOEXEC, 0);
+    if (sock_rc < 0) return error.SocketFailed;
+    const fd: i32 = @intCast(sock_rc);
+    defer _ = std.os.linux.close(fd);
+
+    // 4. Set 2-second receive timeout (SO_RCVTIMEO).
+    const timeout = std.os.linux.timeval{ .sec = 2, .usec = 0 };
+    const timeout_bytes = std.mem.toBytes(timeout);
+    _ = std.os.linux.setsockopt(fd, std.os.linux.SOL.SOCKET, std.os.linux.SO.RCVTIMEO, &timeout_bytes, @sizeOf(@TypeOf(timeout)));
+
+    // 5. Send query to nameserver:53.
+    var dst: std.os.linux.sockaddr.in = .{
+        .family = std.os.linux.AF.INET,
+        .port = std.mem.nativeToBig(u16, 53),
+        .addr = nameserver,
+        .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    const sent = std.os.linux.sendto(fd, query[0..query_len].ptr, query_len, 0, @ptrCast(&dst), @sizeOf(@TypeOf(dst)));
+    if (sent != query_len) return error.DnsSendFailed;
+
+    // 6. Receive response (up to 512 bytes).
+    var resp: [512]u8 = undefined;
+    const received: isize = @bitCast(std.os.linux.recvfrom(fd, &resp, resp.len, 0, null, null));
+    if (received <= 0) return error.UnknownHostName;
+
+    // 7. Parse response — extract A records.
+    return parseDnsResponse(alloc, resp[0..@intCast(received)]);
+}
+
+/// Reads the first `nameserver` directive from /etc/resolv.conf. Returns
+/// null if the file is missing or no nameservers are listed.
+fn readResolvNameserver() ?u32 {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "/etc/resolv.conf", .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer _ = std.os.linux.close(fd);
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n: isize = @bitCast(std.os.linux.read(fd, buf[total..].ptr, buf.len - total));
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+
+    var idx: usize = 0;
+    while (idx < total) {
+        const line_end = std.mem.indexOfScalarPos(u8, buf[0..total], idx, '\n') orelse total;
+        const line = std.mem.trim(u8, buf[idx..line_end], " \t\r");
+        if (std.mem.startsWith(u8, line, "nameserver")) {
+            var it = std.mem.tokenizeAny(u8, line, " \t");
+            _ = it.next(); // discard the "nameserver" keyword
+            if (it.next()) |ip_str| {
+                if (parseIpv4Literal(ip_str)) |ns| return ns;
+            }
+        }
+        idx = line_end + 1;
+    }
+    return null;
+}
+
+/// Builds a standard DNS A-record query packet. Returns the packet length.
+/// Format: 12-byte header + QNAME labels + QTYPE (1) + QCLASS (1).
+fn buildDnsQuery(host: []const u8, out: []u8) usize {
+    // Header.
+    out[0] = 0x12;
+    out[1] = 0x34; // ID (any non-zero)
+    out[2] = 0x01; // Flags: standard query, RD=1
+    out[3] = 0x00;
+    out[4] = 0x00;
+    out[5] = 0x01; // QDCOUNT = 1
+    out[6] = 0x00;
+    out[7] = 0x00;
+    out[8] = 0x00;
+    out[9] = 0x00;
+    out[10] = 0x00;
+    out[11] = 0x00;
+
+    // QNAME — labels prefixed by length, terminated by 0x00.
+    var pos: usize = 12;
+    var label_start: usize = 0;
+    for (host, 0..) |c, i| {
+        if (c == '.') {
+            const label_len = i - label_start;
+            if (label_len == 0 or label_len > 63) return 0;
+            out[pos] = @intCast(label_len);
+            pos += 1;
+            @memcpy(out[pos..][0..label_len], host[label_start..i]);
+            pos += label_len;
+            label_start = i + 1;
+        }
+    }
+    // Final label (or trailing root label).
+    const final_len = host.len - label_start;
+    if (final_len > 0) {
+        if (final_len > 63) return 0;
+        out[pos] = @intCast(final_len);
+        pos += 1;
+        @memcpy(out[pos..][0..final_len], host[label_start..]);
+        pos += final_len;
+    }
+    out[pos] = 0;
+    pos += 1;
+
+    // QTYPE (A) + QCLASS (IN).
+    out[pos] = 0x00;
+    pos += 1;
+    out[pos] = 0x01;
+    pos += 1;
+    out[pos] = 0x00;
+    pos += 1;
+    out[pos] = 0x01;
+    pos += 1;
+    return pos;
+}
+
+/// Parses a DNS response packet and returns the A-records as
+/// `sockaddr_in` array. Returns `error.UnknownHostName` if the
+/// response is NXDOMAIN or has no answers.
+fn parseDnsResponse(alloc: std.mem.Allocator, resp: []const u8) ![]std.os.linux.sockaddr.in {
+    if (resp.len < 12) return error.UnknownHostName;
+    const flags = std.mem.readInt(u16, resp[2..4], .big);
+    const rcode = flags & 0x000F;
+    if (rcode == 3) return error.UnknownHostName; // NXDOMAIN
+    const ancount = std.mem.readInt(u16, resp[6..8], .big);
+    if (ancount == 0) return error.UnknownHostName;
+
+    // Skip the question section.
+    var pos: usize = 12;
+    const qdcount = std.mem.readInt(u16, resp[4..6], .big);
+    var q: usize = 0;
+    while (q < qdcount) : (q += 1) {
+        pos = skipDnsName(resp, pos) orelse return error.UnknownHostName;
+        pos += 4; // QTYPE + QCLASS
+        if (pos > resp.len) return error.UnknownHostName;
+    }
+
+    // Parse answer records; collect A records.
+    var results: [8]std.os.linux.sockaddr.in = undefined;
+    var count: usize = 0;
+    var a: usize = 0;
+    while (a < ancount and count < results.len) : (a += 1) {
+        pos = skipDnsName(resp, pos) orelse return error.UnknownHostName;
+        if (pos + 10 > resp.len) return error.UnknownHostName;
+        const rtype = std.mem.readInt(u16, resp[pos..][0..2], .big);
+        pos += 8; // TYPE + CLASS + TTL
+        const rdlen = std.mem.readInt(u16, resp[pos..][0..2], .big);
+        pos += 2;
+        if (rtype == 1 and rdlen == 4) {
+            // A record — 4 bytes IPv4 in network order.
+            if (pos + 4 > resp.len) return error.UnknownHostName;
+            const addr_net = std.mem.readInt(u32, resp[pos..][0..4], .big);
+            results[count] = .{
+                .family = std.os.linux.AF.INET,
+                .port = 0,
+                .addr = addr_net,
+                .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+            };
+            count += 1;
+        }
+        pos += rdlen;
+    }
+    if (count == 0) return error.UnknownHostName;
+
+    const out = try alloc.alloc(std.os.linux.sockaddr.in, count);
+    @memcpy(out, results[0..count]);
+    return out;
+}
+
+/// Skips a DNS name (with optional compression pointer) starting at `pos`.
+/// Returns the new position or null on malformed packet.
+fn skipDnsName(resp: []const u8, pos_in: usize) ?usize {
+    var pos: usize = pos_in;
+    var jumps: u32 = 0;
+    var advanced: usize = pos_in;
+    while (pos < resp.len) {
+        const b = resp[pos];
+        if ((b & 0xC0) == 0xC0) {
+            // Compression pointer — jump.
+            if (pos + 1 >= resp.len) return null;
+            if (jumps == 0) advanced = pos + 2;
+            pos = (@as(usize, b & 0x3F) << 8) | resp[pos + 1];
+            jumps += 1;
+            if (jumps > 16) return null;
+        } else if (b == 0) {
+            pos += 1;
+            if (jumps == 0) advanced = pos;
+            return advanced;
+        } else {
+            pos += 1 + b;
+            if (pos > resp.len) return null;
+        }
+    }
+    return null;
 }
 
 // T0.2 — Real DNS resolution for api.minimax.io returns at least one IPv4

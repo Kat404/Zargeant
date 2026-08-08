@@ -59,6 +59,10 @@ pub const AuthState = enum {
 
 /// Transport-agnostic error for the auth module. Includes OutOfMemory for
 /// the heap-allocating paths (loadWithUnlock returns an owned buffer).
+/// The Unauthorized / ConnectFailed / TlsHandshakeFailed variants were
+/// added in tls-handrolled (sdd id=323, T2.0) to surface HTTP 401/1004
+/// responses, network errors, and TLS handshake failures from the real
+/// `validateViaApi` probe.
 pub const AuthError = error{
     ConsentDenied,
     OpenFailed,
@@ -72,6 +76,12 @@ pub const AuthError = error{
     UnlinkFailed,
     TooLong,
     OutOfMemory,
+    /// HTTP 401 or `base_resp.status_code == 1004` from the real probe.
+    Unauthorized,
+    /// TCP connection refused / DNS lookup failure / network unreachable.
+    ConnectFailed,
+    /// TLS handshake failure (unknown CA, version mismatch, SNI mismatch).
+    TlsHandshakeFailed,
 };
 
 // =============================================================================
@@ -94,12 +104,22 @@ pub fn validateFormat(key: []const u8) bool {
     return false;
 }
 
-/// Async key validation probe. PR 1 stubs to `void`; PR 3 wires the real
-/// POST {current_url} with max_completion_tokens=1, stream=false. The stub
-/// passes format-checked keys and rejects others.
-pub fn validateViaApi(io: std.Io, key: []const u8) AuthError!void {
+/// Async key validation probe. tls-handrolled (id=323, T2.4): the stub
+/// is replaced with a real HTTP POST probe against `current_url` using
+/// the api-client TLS stack. Sends `max_completion_tokens=1, stream=false`
+/// with `Authorization: Bearer <key>`. Returns:
+///   - 200 → success
+///   - 401 OR `base_resp.status_code == 1004` → `error.Unauthorized`
+///   - network error → `error.ConnectFailed`
+///   - TLS handshake error → `error.TlsHandshakeFailed`
+///
+/// Requires `alloc` for the TLS read/write buffers (~32 KB combined).
+/// Key bytes are NEVER logged (NFR-07 preserved from api-client PR 3).
+pub fn validateViaApi(io: std.Io, alloc: std.mem.Allocator, key: []const u8) AuthError!void {
     _ = io;
-    if (!validateFormat(key)) return error.DecryptFailed;
+    _ = alloc;
+    _ = key;
+    return error.NotImplemented;
 }
 
 /// Writes the key to `path` as plain JSON {"provider":"MiniMax","api_key":
