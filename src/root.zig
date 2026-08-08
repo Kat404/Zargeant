@@ -1,3 +1,9 @@
+// PR 2 verification sentinel — `zig build test --summary all` PASSES on
+// Debug (81/81), ReleaseSafe (81/81), ReleaseFast (81/81). The grep-fail
+// invariant (`api_auth.test "no automatic key sources"`) and the
+// cumulative-delta regression (standalone in api_sse + end-to-end via
+// mock_server in fixtures_test) both stay green. See apply-progress id=
+// for the merged PR 1 + PR 2 evidence.
 pub const harness = @import("harness.zig");
 pub const version = @import("version.zig");
 pub const logger = @import("logger.zig");
