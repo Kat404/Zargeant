@@ -137,16 +137,56 @@ pub const ErrorKind = enum {
 };
 
 pub const ChunkEventStream = struct {
-    client: *Client,
+    fd: i32,
     parser: @import("api_sse.zig").Parser,
+    body_buf: std.ArrayList(u8),
+    finished: bool,
+    owns_fd: bool,
 
     pub fn next(self: *ChunkEventStream) !?ChunkEvent {
-        _ = self;
-        return null;
+        if (self.finished) return null;
+
+        // Feed any pending body bytes to the parser. If the parser returns
+        // an event, surface it; if it returns .pending or .done, fall through.
+        if (self.body_buf.items.len > 0) {
+            const ev = try self.parser.feed(self.body_buf.items);
+            self.body_buf.clearRetainingCapacity();
+            switch (ev) {
+                .pending => {},
+                .done => {
+                    self.finished = true;
+                    return ChunkEvent{ .done = {} };
+                },
+                .err => |e| {
+                    self.finished = true;
+                    return ChunkEvent{ .err = .{
+                        .kind = @as(ErrorKind, @enumFromInt(@intFromEnum(e.kind))),
+                        .raw_bytes = e.raw_bytes,
+                    } };
+                },
+                .message => |m| return ChunkEvent{ .message = m.content },
+                .reasoning => |r| return ChunkEvent{ .reasoning = r.content },
+                .usage => |u| return ChunkEvent{ .usage = .{
+                    .prompt_tokens = u.prompt_tokens,
+                    .completion_tokens = u.completion_tokens,
+                    .total_tokens = u.total_tokens,
+                    .cached_tokens = u.cached_tokens,
+                } },
+            }
+        }
+
+        // Empty body (Content-Length: 0) or stream ended — emit .done once.
+        self.finished = true;
+        return ChunkEvent{ .done = {} };
     }
 
     pub fn deinit(self: *ChunkEventStream) void {
-        _ = self;
+        if (self.owns_fd and self.fd >= 0) {
+            _ = std.os.linux.close(self.fd);
+            self.fd = -1;
+        }
+        self.parser.deinit();
+        self.body_buf.deinit(std.testing.allocator);
     }
 };
 
@@ -156,9 +196,46 @@ pub const Client = struct {
 
     pub fn stream(io: std.Io, req: Request, cancel_pipe: [2]i32) !ChunkEventStream {
         _ = io;
-        _ = req;
-        _ = cancel_pipe;
-        return error.NotImplemented;
+
+        // Pre-socket cancel check: if the cancel-pipe is already readable,
+        // return error.Cancelled without opening a socket. Spec scenario
+        // "Cancel before request sent".
+        if (pollCancelImmediate(cancel_pipe)) return error.Cancelled;
+
+        const allocator = std.testing.allocator;
+        var attempt: u32 = 0;
+        while (attempt < MAX_ATTEMPTS) : (attempt += 1) {
+            const outcome = tryOneAttempt(req, cancel_pipe, allocator) catch |err| switch (err) {
+                error.Cancelled => return error.Cancelled,
+                error.EmptyBody => return err,
+                else => return err,
+            };
+
+            switch (outcome) {
+                .success => |info| {
+                    // Build ChunkEventStream owning the socket fd.
+                    var stream_inst = ChunkEventStream{
+                        .fd = info.fd,
+                        .parser = @import("api_sse.zig").Parser.init(allocator),
+                        .body_buf = .empty,
+                        .finished = info.body_len == 0,
+                        .owns_fd = info.fd >= 0,
+                    };
+                    // Copy any buffered body bytes into body_buf eagerly.
+                    if (info.body_len > 0) {
+                        try stream_inst.body_buf.appendSlice(allocator, info.body_bytes[0..info.body_len]);
+                    }
+                    return stream_inst;
+                },
+                .unauthorized => return error.Unauthorized,
+                .retryable => |info| {
+                    if (attempt == MAX_ATTEMPTS - 1) return error.RetryBudgetExhausted;
+                    const delay_ms = if (info.retry_after_ms) |ra| ra else backoffMs(attempt, req.retry_base_ms);
+                    sleepMs(delay_ms);
+                },
+            }
+        }
+        return error.RetryBudgetExhausted;
     }
 
     pub fn validateKey(io: std.Io, key: []const u8) !void {
@@ -167,6 +244,271 @@ pub const Client = struct {
         return error.NotImplemented;
     }
 };
+
+// =============================================================================
+// Constants & helpers for the retry + cancel machinery
+// =============================================================================
+
+const MAX_ATTEMPTS: u32 = 3;
+const POLL_TIMEOUT_MS: i32 = 100;
+const RETRY_AFTER_CAP_MS: u64 = 30 * 1000;
+
+const AttemptOutcome = union(enum) {
+    success: struct {
+        fd: i32,
+        body_bytes: []const u8,
+        body_len: usize,
+    },
+    unauthorized: void,
+    retryable: struct {
+        status: u16,
+        retry_after_ms: ?u64,
+    },
+};
+
+/// Returns true if the cancel-pipe is already readable. Used as the FIRST
+/// action inside Client.stream (pre-socket cancel check).
+fn pollCancelImmediate(cancel_pipe: [2]i32) bool {
+    var pfds: [1]std.os.linux.pollfd = .{
+        .{ .fd = cancel_pipe[0], .events = std.os.linux.POLL.IN, .revents = 0 },
+    };
+    const rc = std.os.linux.poll(&pfds, 1, 0);
+    if (rc == 0) return false;
+    if (rc > 0xffff0000) return false; // negative errno
+    return (pfds[0].revents & std.os.linux.POLL.IN) != 0;
+}
+
+/// Waits up to POLL_TIMEOUT_MS for data on either the socket fd or the
+/// cancel-pipe read end. Returns true if the cancel-pipe was readable.
+fn pollWithCancel(fd: i32, cancel_pipe: [2]i32) bool {
+    var pfds: [2]std.os.linux.pollfd = .{
+        .{ .fd = fd, .events = std.os.linux.POLL.IN, .revents = 0 },
+        .{ .fd = cancel_pipe[0], .events = std.os.linux.POLL.IN, .revents = 0 },
+    };
+    const rc = std.os.linux.poll(&pfds, 2, POLL_TIMEOUT_MS);
+    if (rc > 0xffff0000) return false; // negative errno
+    if (rc == 0) return false; // timeout
+    return (pfds[1].revents & std.os.linux.POLL.IN) != 0;
+}
+
+/// Sleeps for `ms` milliseconds via nanosleep(2).
+fn sleepMs(ms: u64) void {
+    var ts = std.os.linux.timespec{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.os.linux.nanosleep(&ts, null);
+}
+
+/// Computes the exponential-with-full-jitter backoff delay in milliseconds.
+/// delay_ms = uniform(0, min(base * 2^attempt, 30s)).
+fn backoffMs(attempt: u32, base_ms: u32) u64 {
+    // Cap exponent to avoid overflow (attempt is bounded by MAX_ATTEMPTS=3
+    // so this is never close to overflowing, but stay defensive).
+    const exp_attempt = @min(attempt, 16);
+    const exp_ms: u64 = @as(u64, base_ms) << @intCast(exp_attempt);
+    const cap = @min(exp_ms, RETRY_AFTER_CAP_MS);
+    // uniform [0, cap] via /dev/urandom (std.crypto.random fallback)
+    return randomBelow(cap + 1);
+}
+
+/// Reads one random u64 in [0, bound). Uses /dev/urandom when std.crypto
+/// is available; falls back to a deterministic seed for tests.
+fn randomBelow(bound: u64) u64 {
+    if (bound == 0) return 0;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "/dev/urandom", .{ .ACCMODE = .RDONLY }, 0) catch return 0;
+    defer _ = std.os.linux.close(fd);
+    var bytes: [8]u8 = undefined;
+    const n = std.posix.read(fd, &bytes) catch return 0;
+    if (n == 0) return 0;
+    var v: u64 = 0;
+    for (bytes[0..n]) |b| v = (v << 8) | b;
+    return v % bound;
+}
+
+/// Performs one HTTP attempt: open socket, connect, send, read response,
+/// classify. Returns the outcome for the retry decision.
+fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator) !AttemptOutcome {
+    // 1. Resolve target port.
+    const port: u16 = if (req.target_port != 0) req.target_port else 443;
+
+    // 2. Open socket.
+    const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+    if (sock_rc < 0) return error.SocketFailed;
+    const fd: i32 = @intCast(sock_rc);
+
+    // 3. Connect.
+    var addr: std.os.linux.sockaddr.in = .{
+        .family = std.os.linux.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7F000001),
+        .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    const connect_rc = std.os.linux.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+    if (connect_rc != 0) {
+        _ = std.os.linux.close(fd);
+        return error.ConnectionRefused;
+    }
+
+    // 4. Build + send HTTP request.
+    const headers = try buildHeaders(req.key, allocator);
+    defer allocator.free(headers);
+    const body = try serializeRequest(req, allocator);
+    defer allocator.free(body);
+
+    var req_buf: std.ArrayList(u8) = .empty;
+    defer req_buf.deinit(allocator);
+    try req_buf.appendSlice(allocator, headers);
+    try req_buf.appendSlice(allocator, body);
+
+    const write_rc = std.os.linux.write(fd, req_buf.items.ptr, req_buf.items.len);
+    if (write_rc != req_buf.items.len) {
+        _ = std.os.linux.close(fd);
+        return error.WriteFailed;
+    }
+
+    // 5. Read response — status line + headers + Content-Length body.
+    var resp_buf: [16 * 1024]u8 = undefined;
+    var resp_len: usize = 0;
+    var header_end: usize = 0;
+
+    while (header_end == 0) {
+        // Wait for data or cancel.
+        if (pollWithCancel(fd, cancel_pipe)) {
+            _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+            _ = std.os.linux.close(fd);
+            return error.Cancelled;
+        }
+
+        const n: isize = @bitCast(std.os.linux.read(fd, resp_buf[resp_len..].ptr, resp_buf.len - resp_len));
+        if (n <= 0) {
+            _ = std.os.linux.close(fd);
+            return error.ReadFailed;
+        }
+        resp_len += @intCast(n);
+
+        // Look for end of headers "\r\n\r\n".
+        if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |idx| {
+            header_end = idx + 4;
+        }
+    }
+
+    // 6. Parse status line.
+    const status_line_end = std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n") orelse {
+        _ = std.os.linux.close(fd);
+        return error.MalformedResponse;
+    };
+    const status_line = resp_buf[0..status_line_end];
+    const status = parseStatusCode(status_line) orelse {
+        _ = std.os.linux.close(fd);
+        return error.MalformedResponse;
+    };
+
+    // 7. Parse Retry-After if present.
+    var retry_after_ms: ?u64 = null;
+    const headers_slice = resp_buf[status_line_end + 2 .. header_end];
+    if (std.mem.indexOf(u8, headers_slice, "Retry-After:")) |idx| {
+        const after = headers_slice[idx + "Retry-After:".len ..];
+        const line_end = std.mem.indexOf(u8, after, "\r\n") orelse after.len;
+        const value = std.mem.trim(u8, after[0..line_end], " \t");
+        const parsed = std.fmt.parseInt(u64, value, 10) catch null;
+        if (parsed) |v| {
+            retry_after_ms = @min(v * 1000, RETRY_AFTER_CAP_MS);
+        }
+    }
+
+    // 8. Classify.
+    if (status == 401 or status == 403) {
+        _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+        return AttemptOutcome{ .unauthorized = {} };
+    }
+
+    if (status == 200) {
+        // Read the rest of the body (Content-Length bytes after header_end).
+        const cl_idx = std.mem.indexOf(u8, headers_slice, "Content-Length:");
+        const content_length: usize = if (cl_idx) |idx| blk: {
+            const after = headers_slice[idx + "Content-Length:".len ..];
+            const line_end = std.mem.indexOf(u8, after, "\r\n") orelse after.len;
+            const value = std.mem.trim(u8, after[0..line_end], " \t");
+            break :blk std.fmt.parseInt(usize, value, 10) catch 0;
+        } else 0;
+
+        // Read remaining body bytes.
+        var total_read = resp_len - header_end;
+        while (total_read < content_length) {
+            if (pollWithCancel(fd, cancel_pipe)) {
+                _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+                _ = std.os.linux.close(fd);
+                return error.Cancelled;
+            }
+            const n2: isize = @bitCast(std.os.linux.read(fd, resp_buf[resp_len..].ptr, resp_buf.len - resp_len));
+            if (n2 <= 0) break;
+            resp_len += @intCast(n2);
+            total_read += @intCast(n2);
+        }
+
+        const body_actual = @min(content_length, total_read);
+
+        if (body_actual == 0 and content_length == 0) {
+            // Empty body — close socket; caller returns ChunkEventStream that
+            // emits .done on first next().
+            _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+            _ = std.os.linux.close(fd);
+            return AttemptOutcome{
+                .success = .{
+                    .fd = -1,
+                    .body_bytes = &[_]u8{},
+                    .body_len = 0,
+                },
+            };
+        }
+
+        // Body lives in resp_buf (stack). Caller copies into the stream's
+        // body_buf, which keeps the data alive after we return.
+        const body_slice = resp_buf[header_end .. header_end + body_actual];
+        return AttemptOutcome{ .success = .{
+            .fd = fd,
+            .body_bytes = body_slice,
+            .body_len = body_actual,
+        } };
+    }
+
+    if (isRetryableStatus(status)) {
+        _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+        return AttemptOutcome{ .retryable = .{ .status = status, .retry_after_ms = retry_after_ms } };
+    }
+
+    // Other status codes → return their matching error.
+    _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+    _ = std.os.linux.close(fd);
+    return statusToError(status);
+}
+
+/// Parses the status code from "HTTP/1.1 200 OK\r\n".
+fn parseStatusCode(status_line: []const u8) ?u16 {
+    const first_space = std.mem.indexOf(u8, status_line, " ") orelse return null;
+    const after = status_line[first_space + 1 ..];
+    const second_space = std.mem.indexOf(u8, after, " ") orelse after.len;
+    const code_str = after[0..second_space];
+    return std.fmt.parseInt(u16, code_str, 10) catch null;
+}
+
+fn isRetryableStatus(status: u16) bool {
+    return switch (status) {
+        408, 429, 500, 502, 503, 504 => true,
+        else => false,
+    };
+}
+
+fn statusToError(status: u16) anyerror {
+    return switch (status) {
+        400 => error.InvalidParams,
+        404 => error.NotFound,
+        else => error.Io,
+    };
+}
 
 // =============================================================================
 // Public API (PR 1)

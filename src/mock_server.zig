@@ -188,6 +188,10 @@ fn workerLoop(handle: *Handle, conn_fd: i32) void {
     handle.lock();
     if (handle.fixtures.items.len == 0) {
         handle.unlock();
+        // PR 3 in-flight cancel test: hold the connection open until stop.
+        // The client is expected to cancel or close the connection; we poll
+        // for either until the server is stopped.
+        holdConnectionUntilStop(handle, conn_fd);
         return;
     }
     const fixture = handle.fixtures.orderedRemove(0);
@@ -202,6 +206,32 @@ fn workerLoop(handle: *Handle, conn_fd: i32) void {
 
     // Free the fixture bytes now that we've sent them.
     handle.allocator.free(fixture);
+
+    // Hold the connection open so the client can detect cancel via poll(2)
+    // on [socket_fd, cancel_pipe[0]]. Without this, the worker would close
+    // immediately and the client's read would return 0 (EOF) before the
+    // cancel thread can write to the cancel-pipe.
+    holdConnectionUntilStop(handle, conn_fd);
+}
+
+/// Polls `conn_fd` for incoming data, discarding anything the client sends,
+/// until either the connection is closed by the peer OR the server's stop_flag
+/// is set. This keeps the connection alive so the client can block in poll(2)
+/// for cancel-pipe detection.
+fn holdConnectionUntilStop(handle: *Handle, conn_fd: i32) void {
+    var discard: [4096]u8 = undefined;
+    while (!handle.stop_flag.load(.acquire)) {
+        var pfds: [1]std.os.linux.pollfd = .{
+            .{ .fd = conn_fd, .events = std.os.linux.POLL.IN, .revents = 0 },
+        };
+        const prc = std.os.linux.poll(&pfds, 1, 50);
+        if (prc > 0xffff0000) break; // negative errno
+        if (prc == 0) continue; // timeout, re-check stop_flag
+        // Socket readable — read and discard. Stops on EOF (n == 0) or error.
+        if ((pfds[0].revents & (std.os.linux.POLL.HUP | std.os.linux.POLL.ERR)) != 0) break;
+        const n: isize = @bitCast(std.os.linux.read(conn_fd, &discard, discard.len));
+        if (n <= 0) break;
+    }
 }
 
 // =============================================================================
