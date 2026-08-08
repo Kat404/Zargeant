@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/root.zig"),
     });
+    test_mod.addIncludePath(b.path("test"));
     const test_step = b.addTest(.{ .root_module = test_mod });
     const run_test = b.addRunArtifact(test_step);
     const test_decl = b.step("test", "Run unit tests");
