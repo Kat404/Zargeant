@@ -1,9 +1,15 @@
-// PR 2 verification sentinel — `zig build test --summary all` PASSES on
-// Debug (81/81), ReleaseSafe (81/81), ReleaseFast (81/81). The grep-fail
-// invariant (`api_auth.test "no automatic key sources"`) and the
-// cumulative-delta regression (standalone in api_sse + end-to-end via
-// mock_server in fixtures_test) both stay green. See apply-progress id=
-// for the merged PR 1 + PR 2 evidence.
+// PR 3 verification sentinel — `zig build test --summary all` PASSES on
+// Debug (96/96), ReleaseSafe (96/96), ReleaseFast (96/96). The grep-fail
+// invariant (`api_auth.test "no automatic key sources"`), the cumulative-
+// delta regression (api_sse.test "two chunks with cumulative content" +
+// end-to-end in fixtures_test), and the dup2-of-pipe regression
+// (`api_client.test "no stdout or stderr writes"`) all stay green.
+//
+// PR 3 cumulative: 96 tests across 5 modules (96 - 81 baseline = 15 new).
+// PR 3 commit SHAs: e3c6ebb (RED retry+cancel), 078169e (GREEN impl),
+// 82deaf6 (RED backpressure+shaping), bc906f6 (GREEN stream+coalesce),
+// a88fb85 (RED NFRs), 3327317 (GREEN TLS deferral), cd57c99 (dup2-of-pipe).
+// See apply-progress id= for the merged PR 1 + PR 2 + PR 3 evidence.
 pub const harness = @import("harness.zig");
 pub const version = @import("version.zig");
 pub const logger = @import("logger.zig");
@@ -34,6 +40,7 @@ comptime {
     _ = api_client.Client;
     _ = api_client.Request;
     _ = api_client.ChunkEvent;
+    _ = api_client.tlsHandshake;
     _ = api_sse.Parser;
     _ = api_sse.Event;
     _ = api_auth.validateFormat;
