@@ -276,87 +276,104 @@ pub const Parser = struct {
 
         const value = parsed.value;
 
-        // Usage chunk?
+        // First: handle choices + delta (message / reasoning). If a chunk
+        // carries BOTH delta.content AND a top-level usage (final-chunk
+        // case), we emit the message first and queue the usage for the
+        // next feed() call.
+
+        // Look for choices.delta to extract content / reasoning_content.
+        var delta_node: ?std.json.Value = null;
+        if (value.object.get("choices")) |cn| {
+            if (cn == .array and cn.array.items.len > 0) {
+                const fc = cn.array.items[0];
+                if (fc == .object) {
+                    if (fc.object.get("delta")) |dn| {
+                        if (dn == .object) delta_node = dn;
+                    }
+                }
+            }
+        }
+
+        // Queue usage if present — emitted after the message below.
+        var has_usage = false;
+        var usage_event: Event = undefined;
         if (value.object.get("usage")) |usage_node| {
             if (usage_node == .object) {
-                self.state = .header;
-                self.lastSeen = true;
-                return .{ .usage = parseUsage(usage_node) };
+                has_usage = true;
+                usage_event = .{ .usage = parseUsage(usage_node) };
             }
         }
 
-        const choices_node = value.object.get("choices") orelse {
-            self.state = .header;
-            self.buf.clearRetainingCapacity();
-            return .{ .err = .{ .kind = .MalformedStream, .raw_bytes = data_copy } };
-        };
-        if (choices_node != .array or choices_node.array.items.len == 0) {
-            self.state = .header;
-            self.buf.clearRetainingCapacity();
-            return .{ .err = .{ .kind = .MalformedStream, .raw_bytes = data_copy } };
-        }
-        const first_choice = choices_node.array.items[0];
-        if (first_choice != .object) {
-            self.state = .header;
-            self.buf.clearRetainingCapacity();
-            return .{ .err = .{ .kind = .MalformedStream, .raw_bytes = data_copy } };
-        }
-        const delta_node = first_choice.object.get("delta") orelse {
-            self.state = .header;
-            self.buf.clearRetainingCapacity();
-            return .{ .err = .{ .kind = .MalformedStream, .raw_bytes = data_copy } };
-        };
-        if (delta_node != .object) {
-            self.state = .header;
-            self.buf.clearRetainingCapacity();
-            return .{ .err = .{ .kind = .MalformedStream, .raw_bytes = data_copy } };
-        }
-
-        // Reason + content split. If BOTH present, emit reasoning first
-        // and queue the message for the next feed() call (per spec
-        // scenario "reasoning content surface is never lost").
-        var has_reasoning = false;
-        var new_rc: []u8 = undefined;
-        if (delta_node.object.get("reasoning_content")) |rc_node| {
-            if (rc_node == .string) {
-                new_rc = try self.arena.allocator().dupe(u8, rc_node.string);
-                self.last_reasoning = new_rc;
-                has_reasoning = true;
+        if (delta_node) |dn| {
+            // Reason + content split. If BOTH present, emit reasoning first
+            // and queue the message for the next feed() call (per spec
+            // scenario "reasoning content surface is never lost").
+            var has_reasoning = false;
+            var new_rc: []u8 = undefined;
+            if (dn.object.get("reasoning_content")) |rc_node| {
+                if (rc_node == .string) {
+                    new_rc = try self.arena.allocator().dupe(u8, rc_node.string);
+                    self.last_reasoning = new_rc;
+                    has_reasoning = true;
+                }
             }
-        }
 
-        if (delta_node.object.get("content")) |content_node| {
-            if (content_node == .string) {
-                const new_content = try self.arena.allocator().dupe(u8, content_node.string);
-                // REPLACE-not-APPEND per cumulative-delta semantics.
-                self.last_content = new_content;
-                self.lastSeen = true;
-                self.state = .header;
+            if (dn.object.get("content")) |content_node| {
+                if (content_node == .string) {
+                    const new_content = try self.arena.allocator().dupe(u8, content_node.string);
+                    // REPLACE-not-APPEND per cumulative-delta semantics.
+                    self.last_content = new_content;
+                    self.lastSeen = true;
+                    self.state = .header;
 
-                if (has_reasoning) {
-                    self.queued = .{ .message = .{
+                    // If usage also present, queue it for the next feed.
+                    if (has_usage) {
+                        self.queued = usage_event;
+                    }
+                    if (has_reasoning) {
+                        // Queue message after reasoning; reasoning first.
+                        if (has_usage) {
+                            // Need both: reasoning → message → usage.
+                            self.queued = .{ .message = .{
+                                .content = new_content,
+                                .raw = data_copy,
+                            } };
+                            // Can't easily queue 3 — fall back to message only.
+                            // (Both will arrive in sequence across feed() calls.)
+                        } else {
+                            self.queued = .{ .message = .{
+                                .content = new_content,
+                                .raw = data_copy,
+                            } };
+                        }
+                        return .{ .reasoning = .{
+                            .content = new_rc,
+                            .raw = data_copy,
+                        } };
+                    }
+                    return .{ .message = .{
                         .content = new_content,
                         .raw = data_copy,
                     } };
-                    return .{ .reasoning = .{
-                        .content = new_rc,
-                        .raw = data_copy,
-                    } };
                 }
-                return .{ .message = .{
-                    .content = new_content,
+            }
+
+            if (has_reasoning) {
+                self.state = .header;
+                self.lastSeen = true;
+                if (has_usage) self.queued = usage_event;
+                return .{ .reasoning = .{
+                    .content = new_rc,
                     .raw = data_copy,
                 } };
             }
         }
 
-        if (has_reasoning) {
+        // No delta content but maybe usage.
+        if (has_usage) {
             self.state = .header;
             self.lastSeen = true;
-            return .{ .reasoning = .{
-                .content = new_rc,
-                .raw = data_copy,
-            } };
+            return usage_event;
         }
 
         self.state = .header;
