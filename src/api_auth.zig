@@ -59,6 +59,10 @@ pub const AuthState = enum {
 
 /// Transport-agnostic error for the auth module. Includes OutOfMemory for
 /// the heap-allocating paths (loadWithUnlock returns an owned buffer).
+/// The Unauthorized / ConnectFailed / TlsHandshakeFailed variants were
+/// added in tls-handrolled (sdd id=323, T2.0) to surface HTTP 401/1004
+/// responses, network errors, and TLS handshake failures from the real
+/// `validateViaApi` probe.
 pub const AuthError = error{
     ConsentDenied,
     OpenFailed,
@@ -72,6 +76,12 @@ pub const AuthError = error{
     UnlinkFailed,
     TooLong,
     OutOfMemory,
+    /// HTTP 401 or `base_resp.status_code == 1004` from the real probe.
+    Unauthorized,
+    /// TCP connection refused / DNS lookup failure / network unreachable.
+    ConnectFailed,
+    /// TLS handshake failure (unknown CA, version mismatch, SNI mismatch).
+    TlsHandshakeFailed,
 };
 
 // =============================================================================
@@ -94,12 +104,125 @@ pub fn validateFormat(key: []const u8) bool {
     return false;
 }
 
-/// Async key validation probe. PR 1 stubs to `void`; PR 3 wires the real
-/// POST {current_url} with max_completion_tokens=1, stream=false. The stub
-/// passes format-checked keys and rejects others.
-pub fn validateViaApi(io: std.Io, key: []const u8) AuthError!void {
+/// Async key validation probe. tls-handrolled (id=323, T2.4): the stub
+/// is replaced with a real HTTP POST probe against `target_host:port`
+/// (defaults to `api.minimax.io:443` from `api_client.current_url`).
+/// Sends `max_completion_tokens=1, stream=false` with
+/// `Authorization: Bearer <key>`. Returns:
+///   - 200 → success
+///   - 401 OR `base_resp.status_code == 1004` → `error.Unauthorized`
+///   - network error → `error.ConnectFailed`
+///   - TLS handshake error → `error.TlsHandshakeFailed`
+///
+/// `target_host` may be a hostname or an IPv4 literal. When it is
+/// "127.0.0.1" the probe skips TLS (used by mock-server tests).
+/// `target_port = 0` defaults to 443.
+///
+/// Key bytes are NEVER logged (NFR-07 preserved from api-client PR 3).
+pub fn validateViaApi(io: std.Io, alloc: std.mem.Allocator, key: []const u8) AuthError!void {
     _ = io;
-    if (!validateFormat(key)) return error.DecryptFailed;
+    return validateViaApiWithTarget(alloc, key, "api.minimax.io", 443);
+}
+
+/// Internal probe variant that accepts an explicit target host + port.
+/// Public so tests can route to a local mock server (e.g., 127.0.0.1:PORT)
+/// and assert the error mapping without standing up a real TLS stack.
+pub fn validateViaApiWithTarget(alloc: std.mem.Allocator, key: []const u8, target_host: []const u8, target_port: u16) AuthError!void {
+    const api_client = @import("api_client.zig");
+
+    // Build minimal probe request: model=MiniMax-M3, 1 token, no stream.
+    const probe_messages = [_]api_client.Message{
+        .{ .role = "user", .content = "hi" },
+    };
+
+    // Resolve target (DNS or IPv4 literal fast path).
+    var addrs = api_client.dns_resolve(alloc, target_host) catch {
+        return error.ConnectFailed;
+    };
+    defer alloc.free(addrs);
+    if (addrs.len == 0) return error.ConnectFailed;
+    const port: u16 = if (target_port != 0) target_port else 443;
+    addrs[0].port = std.mem.nativeToBig(u16, port);
+
+    // Open TCP socket.
+    const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+    if (sock_rc < 0) return error.OpenFailed;
+    const fd: i32 = @intCast(sock_rc);
+    defer _ = std.os.linux.close(fd);
+
+    const connect_rc = std.os.linux.connect(fd, @ptrCast(&addrs[0]), @sizeOf(@TypeOf(addrs[0])));
+    if (connect_rc != 0) return error.ConnectFailed;
+
+    // For 127.0.0.1 (mock-server tests), skip TLS.
+    // For api.minimax.io, TLS via tls_conn.
+    const needs_tls = !std.mem.eql(u8, target_host, "127.0.0.1");
+    if (needs_tls) {
+        var cancel_pipe: [2]i32 = .{ -1, -1 };
+        _ = std.os.linux.pipe(&cancel_pipe);
+        defer {
+            _ = std.os.linux.close(cancel_pipe[0]);
+            _ = std.os.linux.close(cancel_pipe[1]);
+        }
+        const api_host = std.mem.sliceTo(target_host, 0);
+        var conn = api_client.tls_conn.connect(alloc, fd, api_host, cancel_pipe) catch |err| switch (err) {
+            error.TlsHandshakeFailed => return error.TlsHandshakeFailed,
+            error.HandshakeTimeout => return error.TlsHandshakeFailed,
+            error.CaBundleNotFound => return error.TlsHandshakeFailed,
+            else => return error.TlsHandshakeFailed,
+        };
+        defer conn.deinit();
+    }
+
+    // Build HTTP request body (key bytes go in Authorization header).
+    const body = api_client.serializeRequest(.{
+        .messages = &probe_messages,
+        .max_completion_tokens = 1,
+        .stream_options = .{ .include_usage = false },
+        .key = key,
+    }, alloc) catch return error.WriteFailed;
+    defer alloc.free(body);
+
+    const headers = api_client.buildHeaders(key, alloc) catch return error.WriteFailed;
+    defer alloc.free(headers);
+
+    var req_buf: std.ArrayList(u8) = .empty;
+    defer req_buf.deinit(alloc);
+    req_buf.appendSlice(alloc, headers) catch return error.WriteFailed;
+    req_buf.appendSlice(alloc, body) catch return error.WriteFailed;
+
+    const write_rc = std.os.linux.write(fd, req_buf.items.ptr, req_buf.items.len);
+    if (write_rc != req_buf.items.len) return error.WriteFailed;
+
+    // Read response — up to 16 KB.
+    var resp_buf: [16 * 1024]u8 = undefined;
+    var resp_len: usize = 0;
+    var header_end: usize = 0;
+    while (header_end == 0 and resp_len < resp_buf.len) {
+        const n: isize = @bitCast(std.os.linux.read(fd, resp_buf[resp_len..].ptr, resp_buf.len - resp_len));
+        if (n <= 0) return error.ReadFailed;
+        resp_len += @intCast(n);
+        if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |idx| {
+            header_end = idx + 4;
+        }
+    }
+    if (header_end == 0) return error.ReadFailed;
+
+    const status_line_end = std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n") orelse return error.ReadFailed;
+    const status_line = resp_buf[0..status_line_end];
+    const status = api_client.parseStatusCode(status_line) orelse return error.ReadFailed;
+
+    // Map status to AuthError.
+    if (status == 200) return;
+    if (status == 401 or status == 403) return error.Unauthorized;
+
+    // For 4xx/5xx with body, check base_resp.status_code == 1004.
+    if (resp_len > header_end) {
+        const body_slice = resp_buf[header_end..resp_len];
+        if (std.mem.indexOf(u8, body_slice, "\"status_code\":1004") != null) {
+            return error.Unauthorized;
+        }
+    }
+    return error.ConnectFailed;
 }
 
 /// Writes the key to `path` as plain JSON {"provider":"MiniMax","api_key":
@@ -548,4 +671,82 @@ test "key zeroed on deinit" {
     for (loaded) |b| try testing.expectEqual(@as(u8, 0), b);
 
     testing.allocator.free(loaded);
+}
+
+// =============================================================================
+// tls-handrolled — RED test blocks for real validateViaApi (Commit 5)
+// Spec scenarios: success 200, failure 401/1004, network error.
+// Tests fail at compile time because the validateViaApi impl was widened
+// to take an allocator arg but the body returns error.NotImplemented.
+// =============================================================================
+
+// T2.1 — Real validateViaApi against api.minimax.io succeeds with 200.
+// CI-gated on ZARGEANT_RUN_VALIDATE_VIA_API=1 (same pattern as the
+// TLS handshake tests). Asserts the function doesn't return
+// error.Unauthorized / error.ConnectFailed on a real probe.
+test "validateViaApi against api.minimax.io succeeds with 200" {
+    var resolv_z: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const ca_path = "/etc/ssl/certs/ca-certificates.crt";
+    @memcpy(resolv_z[0..ca_path.len], ca_path.ptr);
+    resolv_z[ca_path.len] = 0;
+    const ca_exists = std.os.linux.access(resolv_z[0..ca_path.len :0].ptr, 0) == 0;
+    if (!ca_exists) return;
+
+    const env_fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return;
+    defer _ = std.os.linux.close(env_fd);
+    var env_buf: [4096]u8 = undefined;
+    var env_total: usize = 0;
+    while (env_total < env_buf.len) {
+        const n: isize = @bitCast(std.os.linux.read(env_fd, env_buf[env_total..].ptr, env_buf.len - env_total));
+        if (n <= 0) break;
+        env_total += @intCast(n);
+    }
+    var idx: usize = 0;
+    var enabled = false;
+    while (idx < env_total) {
+        const slice = env_buf[idx..env_total];
+        const rel_end = std.mem.indexOfScalar(u8, slice, 0);
+        const end = if (rel_end) |r| idx + r else env_total;
+        const entry = env_buf[idx..end];
+        if (std.mem.startsWith(u8, entry, "ZARGEANT_RUN_VALIDATE_VIA_API=1")) {
+            enabled = true;
+            break;
+        }
+        idx = end + 1;
+    }
+    if (!enabled) return;
+
+    // RED: this call returns error.NotImplemented in the stub. The
+    // GREEN commit replaces the body with real HTTP POST.
+    try validateViaApi(testing.io, testing.allocator, "test-key-1234567890ABCDEF");
+}
+
+// T2.2 — validateViaApi returns error.Unauthorized on HTTP 401 OR
+// `base_resp.status_code == 1004`. We simulate the 401 by routing the
+// POST to a local mock server that responds with status 401. The mock
+// lives in src/mock_server.zig.
+test "validateViaApi returns Unauthorized on 401 or base_resp 1004" {
+    const mock_server = @import("mock_server.zig");
+    var ms = try mock_server.start(testing.allocator);
+    defer ms.deinit();
+
+    // Queue a 401 response.
+    const body = "{\"error\":\"unauthorized\"}";
+    var status_buf: [256]u8 = undefined;
+    const status_line = std.fmt.bufPrint(&status_buf, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    try mock_server.sendBytes(ms, status_line);
+
+    // Probe the mock server (127.0.0.1:PORT). The probe sends a request;
+    // the mock responds 401; the probe maps to error.Unauthorized.
+    const result = validateViaApiWithTarget(testing.allocator, "test-key-1234567890ABCDEF", "127.0.0.1", mock_server.port(ms.*));
+    try testing.expectError(error.Unauthorized, result);
+}
+
+// T2.3 — validateViaApi returns error.ConnectFailed on network error.
+// We probe a closed port on 127.0.0.1 (no listener).
+test "validateViaApi returns ConnectFailed on network error" {
+    // Port 1 is reserved; ECONNREFUSED on connect. The probe maps to
+    // error.ConnectFailed (NOT error.OpenFailed).
+    const result = validateViaApiWithTarget(testing.allocator, "test-key-1234567890ABCDEF", "127.0.0.1", 1);
+    try testing.expectError(error.ConnectFailed, result);
 }
