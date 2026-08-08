@@ -5,16 +5,18 @@ pub const sandbox = @import("sandbox.zig");
 pub const api_client = @import("api_client.zig");
 pub const api_sse = @import("api_sse.zig");
 pub const api_auth = @import("api_auth.zig");
+pub const mock_server = @import("mock_server.zig");
 
 // ponytail: stub main for the build-toolchain slice. exe.entry = .disabled
 // skips the entry-point link, but std.start.zig still needs root.main to exist
 // at semantic-analysis time. The TUI slice replaces this with the real entry.
 pub fn main() void {}
 
-// Touch logger/sandbox/api-client/api-sse/api-auth types so the test runner
-// pulls in src/{logger,sandbox,api_client,api_sse,api_auth}.zig (which hold
-// the in-file test blocks) under `zig build test`. Without these references,
-// Zig's lazy compilation skips the modules and their tests never run.
+// Touch logger/sandbox/api-client/api-sse/api-auth/mock-server types so the
+// test runner pulls in src/{logger,sandbox,api_client,api_sse,api_auth}.zig
+// AND src/mock_server.zig (which holds the in-file test blocks) under
+// `zig build test`. Without these references, Zig's lazy compilation skips
+// the modules and their tests never run.
 comptime {
     _ = logger.Level;
     _ = logger.Logger;
@@ -28,4 +30,5 @@ comptime {
     _ = api_sse.Parser;
     _ = api_sse.Event;
     _ = api_auth.validateFormat;
+    _ = mock_server.Handle;
 }
