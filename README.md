@@ -1,7 +1,7 @@
 # zargeant
 
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-orange.svg)](https://ziglang.org)
-[![License](https://img.shields.io/badge/license-TBD-blue.svg)](#license)
+[![License](https://img.shields.io/badge/license-Unlicense-blue.svg)](#license)
 [![Status](https://img.shields.io/badge/status-in%20development-yellow.svg)](#status)
 
 > **AI Harness TUI** — A terminal-native AI agent harness built in Zig with a least-privilege execution sandbox.
@@ -93,12 +93,72 @@ zig build test --summary all -Doptimize=ReleaseFast
 
 Expected output: `41/41 tests passed` on each mode.
 
+## Debugging
+
+Pick the tool by what broke — overlap-free matrix:
+
+| Symptom                         | Tool                                | Why                                      |
+| ------------------------------- | ----------------------------------- | ---------------------------------------- |
+| Syscall denied (BPF / Landlock) | `strace`                            | Only tool that sees `EPERM` from BPF     |
+| Memory leak / use-after-free    | `zig build test-asan`¹              | ASan catches at first access             |
+| Data race (3-thread model)      | `zig build test-tsan`¹              | TSan watches all threads                 |
+| TLS handshake state             | `lldb` / `gdb`                      | Inspect Reader/Writer buffers, `poll(2)` |
+| Hard leak ASan can't catch      | `valgrind --leak-check=full`        | Fallback; 10–30× slower                  |
+| NFR-01 perf regression          | `perf record` + FlameGraph          | Sample-based, low overhead               |
+| Crash post-mortem               | `lldb -c core ./zargeant`           | Walk stack from coredump                 |
+| Runtime state (always)          | `tail -f /tmp/ai-harness-debug.log` | Project's own observability, mode `0600` |
+
+¹ Requires a `test-asan` / `test-tsan` step in `build.zig` — TODO before slice 5 (TUI).
+
+### Sandbox: syscall tracing
+
+```bash
+# Landlock + Seccomp denials (EPERM, EACCES)
+strace -f -e trace=%landlock,%seccomp,bpf -o sandbox.log ./zig-out/bin/zargeant
+
+# Watch the deny-list rules fire (ptrace, mount, bpf)
+strace -f -e trace=ptrace,mount,bpf,clone3 -e signal='!SIGCHLD' ./zig-out/bin/zargeant
+```
+
+Use during `sandbox-linux` + `sandbox-macos` slices. A denied syscall that
+should be allowed = missing rule in `src/sandbox_linux.zig`.
+
+### Memory: valgrind
+
+```bash
+zig build -Doptimize=Debug
+valgrind --leak-check=full --show-leak-kinds=all \
+         --track-origins=yes ./zig-out/bin/zargeant
+```
+
+Use when `std.testing.allocator` reports a leak that the test runner can't
+attribute, OR for the long-running Agent HTTP-SSE thread.
+
+### Interactive: lldb / gdb
+
+```bash
+zig build -Doptimize=Debug    # keep DWARF, no strip
+lldb ./zig-out/bin/zargeant
+```
+
+Use during `tls-handrolled` slice to inspect `std.crypto.tls.Client` state
+mid-handshake, `poll(2)` fd readiness, or Reader/Writer buffer contents.
+
+### Logs (always on)
+
+```bash
+tail -f /tmp/ai-harness-debug.log
+```
+
+Project's own observability — mode `0600`, sticky file. First thing to check
+before any debugger; works in every build mode.
+
 ## Project layout
 
 ```
 zargeant/
 ├── README.md                          (this file)
-├── LICENSE                            (TBD)
+├── UNLICENSE                          (Unlicense)
 ├── .gitignore                         (zig-cache, .atl/, etc.)
 ├── build.zig                          (Zig 0.16 std.Build)
 ├── build.zig.zon                      (package metadata, deps = .{})
@@ -113,9 +173,9 @@ zargeant/
 ├── docs/
 │   ├── especificacion_harness_ai_tui.md    (251-line spec)
 │   ├── complemento-investigacion.md         (94-line research supplement)
-│   ├── investigation.txt                   (raw spec dump)
+│   ├── investigation-1.md                   (Deep Research part I — software design spec, Rust vs Zig)
+│   ├── investigation-2.md                   (Deep Research part II — architecture & security in Zig 0.16)
 │   ├── arquitectura.png                     (architecture diagram)
-│   └── zargeant-banner_001.jpg             (README hero, generated via mmx)
 └── .github/
     └── workflows/
         └── ci.yml                       (multi-OS build + test)
@@ -127,7 +187,8 @@ Long-form documentation lives in `docs/`:
 
 - [`especificacion_harness_ai_tui.md`](docs/especificacion_harness_ai_tui.md) — 251-line spec covering concurrency model, security boundary, observability requirements, and Non-Functional Requirements (RNF-01..05).
 - [`complemento-investigacion.md`](docs/complemento-investigacion.md) — 94-line research supplement covering Zig/Rust comparison, tool ecosystem, and the author's own critique of the plan.
-- [`investigación.txt`](docs/investigation.txt) — raw spec dump (the original source).
+- [`investigation-1.md`](docs/investigation-1.md) — Deep Research part I (software design specification): 448-line analysis of Rust vs Zig AI harness engineering — autonomy gap taxonomy, 11 harness responsibilities, stack evaluations, comparative analysis.
+- [`investigation-2.md`](docs/investigation-2.md) — Deep Research part II (architecture + security in Zig 0.16): 300-line deep-dive on build.zig diagnostics, sandbox syscall ordering (clone → capset → PR_SET_NO_NEW_PRIVS → Landlock → Seccomp), FD leakage mitigation, Landlock LSM hardening, and XDG directory hierarchy.
 - [`arquitectura.png`](docs/arquitectura.png) — architecture diagram.
 
 ## Road to v1.0
@@ -156,14 +217,13 @@ Each slice is its own SDD cycle, persisted in Engram. Strict TDD is enforced: te
 
 ## License
 
-TBD. Likely MIT or Apache-2.0.
+[The Unlicense](https://unlicense.org/)
 
 ## Acknowledgments
 
 - Built on [Zig](https://ziglang.org) — Andrew Kelley and the Zig core team.
 - Inspired by [ratatui](https://github.com/ratatui/ratatui) for the Rust TUI ecosystem (zargeant uses libvaxis to stay in Zig-native territory).
 - Powered by [MiniMax](https://MiniMax.chat) for the inference API.
-- Logo banner generated via `mmx image generate`.
 
 ---
 
