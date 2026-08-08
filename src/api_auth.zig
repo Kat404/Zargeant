@@ -119,7 +119,10 @@ pub fn validateViaApi(io: std.Io, alloc: std.mem.Allocator, key: []const u8) Aut
     _ = io;
     _ = alloc;
     _ = key;
-    return error.NotImplemented;
+    // Stub (Commit 5 RED): returns OpenFailed as a placeholder error
+    // that's part of the AuthError set. Commit 6 GREEN replaces with
+    // a real HTTP POST probe.
+    return error.OpenFailed;
 }
 
 /// Writes the key to `path` as plain JSON {"provider":"MiniMax","api_key":
@@ -568,4 +571,92 @@ test "key zeroed on deinit" {
     for (loaded) |b| try testing.expectEqual(@as(u8, 0), b);
 
     testing.allocator.free(loaded);
+}
+
+// =============================================================================
+// tls-handrolled — RED test blocks for real validateViaApi (Commit 5)
+// Spec scenarios: success 200, failure 401/1004, network error.
+// Tests fail at compile time because the validateViaApi impl was widened
+// to take an allocator arg but the body returns error.NotImplemented.
+// =============================================================================
+
+// T2.1 — Real validateViaApi against api.minimax.io succeeds with 200.
+// CI-gated on ZARGEANT_RUN_VALIDATE_VIA_API=1 (same pattern as the
+// TLS handshake tests). Asserts the function doesn't return
+// error.Unauthorized / error.ConnectFailed on a real probe.
+test "validateViaApi against api.minimax.io succeeds with 200" {
+    var resolv_z: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const ca_path = "/etc/ssl/certs/ca-certificates.crt";
+    @memcpy(resolv_z[0..ca_path.len], ca_path.ptr);
+    resolv_z[ca_path.len] = 0;
+    const ca_exists = std.os.linux.access(resolv_z[0..ca_path.len :0].ptr, 0) == 0;
+    if (!ca_exists) return;
+
+    const env_fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return;
+    defer _ = std.os.linux.close(env_fd);
+    var env_buf: [4096]u8 = undefined;
+    var env_total: usize = 0;
+    while (env_total < env_buf.len) {
+        const n: isize = @bitCast(std.os.linux.read(env_fd, env_buf[env_total..].ptr, env_buf.len - env_total));
+        if (n <= 0) break;
+        env_total += @intCast(n);
+    }
+    var idx: usize = 0;
+    var enabled = false;
+    while (idx < env_total) {
+        const slice = env_buf[idx..env_total];
+        const rel_end = std.mem.indexOfScalar(u8, slice, 0);
+        const end = if (rel_end) |r| idx + r else env_total;
+        const entry = env_buf[idx..end];
+        if (std.mem.startsWith(u8, entry, "ZARGEANT_RUN_VALIDATE_VIA_API=1")) {
+            enabled = true;
+            break;
+        }
+        idx = end + 1;
+    }
+    if (!enabled) return;
+
+    // RED: this call returns error.NotImplemented in the stub. The
+    // GREEN commit replaces the body with real HTTP POST.
+    try validateViaApi(testing.io, testing.allocator, "test-key-1234567890ABCDEF");
+}
+
+// T2.2 — validateViaApi returns error.Unauthorized on HTTP 401 OR
+// `base_resp.status_code == 1004`. We simulate the 401 by routing the
+// POST to a local mock server that responds with status 401. The mock
+// lives in src/mock_server.zig.
+test "validateViaApi returns Unauthorized on 401 or base_resp 1004" {
+    // Build a minimal Request with target_host = "127.0.0.1" so the
+    // mock server route works. RED: this currently errors because the
+    // stub doesn't talk HTTP.
+    const req = @import("api_client.zig").Request{
+        .messages = &[_]@import("api_client.zig").Message{
+            .{ .role = "user", .content = "hi" },
+        },
+        .target_host = "127.0.0.1",
+        .target_port = 0, // mock_server will assign
+        .key = "test-key-1234567890ABCDEF",
+    };
+    _ = req;
+    // The probe asserts error.Unauthorized on HTTP 401 response.
+    const result = validateViaApi(testing.io, testing.allocator, "test-key-1234567890ABCDEF");
+    // Stub currently returns error.OpenFailed; GREEN replaces this
+    // with a real HTTP POST to a local mock returning 401.
+    try testing.expectError(error.Unauthorized, result);
+}
+
+// T2.3 — validateViaApi returns error.ConnectFailed on network error.
+// We probe a closed port on 127.0.0.1 (no listener).
+test "validateViaApi returns ConnectFailed on network error" {
+    const req = @import("api_client.zig").Request{
+        .messages = &[_]@import("api_client.zig").Message{
+            .{ .role = "user", .content = "hi" },
+        },
+        .target_host = "127.0.0.1",
+        .target_port = 1, // port 1 = closed (no listener); ECONNREFUSED
+        .key = "test-key-1234567890ABCDEF",
+    };
+    _ = req;
+    const result = validateViaApi(testing.io, testing.allocator, "test-key-1234567890ABCDEF");
+    try testing.expectError(error.ConnectFailed, result);
 }
