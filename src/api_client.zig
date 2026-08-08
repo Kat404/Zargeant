@@ -24,6 +24,7 @@ comptime {
 
 const std = @import("std");
 const testing = std.testing;
+const logger = @import("logger.zig");
 
 // =============================================================================
 // Public constants
@@ -140,48 +141,101 @@ pub const ChunkEventStream = struct {
     fd: i32,
     parser: @import("api_sse.zig").Parser,
     body_buf: std.ArrayList(u8),
+    /// Coalesce slot — holds the latest cumulative chunk while a TUI
+    /// consumer is slow. REPLACE-not-APPEND per cumulative-delta semantics.
+    pending: ?ChunkEvent,
     finished: bool,
     owns_fd: bool,
+    /// Set after all buffered body bytes have been fed to the parser.
+    body_drained: bool,
+    /// Coalesce deadline (16 ms). When non-null, the FIRST pending event's
+    /// arrival timestamp. Subsequent events REPLACE pending without
+    /// resetting this.
+    coalesce_started_at: ?i96,
 
     pub fn next(self: *ChunkEventStream) !?ChunkEvent {
         if (self.finished) return null;
 
-        // Feed any pending body bytes to the parser. If the parser returns
-        // an event, surface it; if it returns .pending or .done, fall through.
-        if (self.body_buf.items.len > 0) {
-            const ev = try self.parser.feed(self.body_buf.items);
+        // Drain parser events into the coalesce slot until the parser
+        // signals no more events are pending (.pending or error.EmptyBody).
+        // Each parser.feed() processes all complete events in its buffer and
+        // returns the FIRST one; subsequent calls process the remaining
+        // events. We coalesce by REPLACE (cumulative-delta semantics).
+        while (!self.body_drained) {
+            const ev = self.parser.feed(self.body_buf.items) catch |err| switch (err) {
+                error.EmptyBody => {
+                    self.body_drained = true;
+                    break;
+                },
+                else => return err,
+            };
             self.body_buf.clearRetainingCapacity();
+
             switch (ev) {
-                .pending => {},
+                .pending => {
+                    self.body_drained = true;
+                    break;
+                },
                 .done => {
                     self.finished = true;
+                    // Flush any pending coalesced event FIRST, then .done on
+                    // the next call. Spec: "emits final content chunk THEN
+                    // .done".
+                    if (self.pending) |p| {
+                        self.pending = null;
+                        self.coalesce_started_at = null;
+                        return p;
+                    }
                     return ChunkEvent{ .done = {} };
                 },
                 .err => |e| {
                     self.finished = true;
+                    if (self.pending) |p| {
+                        self.pending = null;
+                        self.coalesce_started_at = null;
+                        return p;
+                    }
                     return ChunkEvent{ .err = .{
                         .kind = @as(ErrorKind, @enumFromInt(@intFromEnum(e.kind))),
                         .raw_bytes = e.raw_bytes,
                     } };
                 },
-                .message => |m| return ChunkEvent{ .message = m.content },
-                .reasoning => |r| return ChunkEvent{ .reasoning = r.content },
-                .usage => |u| return ChunkEvent{ .usage = .{
-                    .prompt_tokens = u.prompt_tokens,
-                    .completion_tokens = u.completion_tokens,
-                    .total_tokens = u.total_tokens,
-                    .cached_tokens = u.cached_tokens,
-                } },
+                else => {
+                    // Convert api_sse.Event -> api_client.ChunkEvent.
+                    const ce = sseEventToChunkEvent(ev);
+                    const now = std.Io.Clock.real.now(testing.io).nanoseconds;
+                    if (self.pending == null) {
+                        self.pending = ce;
+                        self.coalesce_started_at = now;
+                    } else {
+                        // REPLACE — cumulative-delta semantics make this safe.
+                        if (self.coalesce_started_at) |start| {
+                            if (now - start <= COALESCE_WINDOW_NS) {
+                                // Within the coalesce window — log warn. Best-effort;
+                                // logger failures must not abort the stream.
+                                _ = logger.global().log(testing.io, .warn, "chunk_coalesced") catch {};
+                            }
+                        }
+                        self.pending = ce;
+                    }
+                },
             }
         }
 
-        // Empty body (Content-Length: 0) or stream ended — emit .done once.
+        // After draining: return pending if any, else .done.
+        if (self.pending) |p| {
+            self.pending = null;
+            self.coalesce_started_at = null;
+            return p;
+        }
+
         self.finished = true;
         return ChunkEvent{ .done = {} };
     }
 
     pub fn deinit(self: *ChunkEventStream) void {
         if (self.owns_fd and self.fd >= 0) {
+            _ = std.os.linux.shutdown(self.fd, std.os.linux.SHUT.RDWR);
             _ = std.os.linux.close(self.fd);
             self.fd = -1;
         }
@@ -189,6 +243,29 @@ pub const ChunkEventStream = struct {
         self.body_buf.deinit(std.testing.allocator);
     }
 };
+
+const COALESCE_WINDOW_NS: i96 = 16 * std.time.ns_per_ms;
+
+/// Converts an api_sse.Event into an api_client.ChunkEvent. Both share the
+/// same fields but are distinct types in Zig.
+fn sseEventToChunkEvent(ev: @import("api_sse.zig").Event) ChunkEvent {
+    return switch (ev) {
+        .message => |m| .{ .message = m.content },
+        .reasoning => |r| .{ .reasoning = r.content },
+        .usage => |u| .{ .usage = .{
+            .prompt_tokens = u.prompt_tokens,
+            .completion_tokens = u.completion_tokens,
+            .total_tokens = u.total_tokens,
+            .cached_tokens = u.cached_tokens,
+        } },
+        .done => .{ .done = {} },
+        .err => |e| .{ .err = .{
+            .kind = @as(ErrorKind, @enumFromInt(@intFromEnum(e.kind))),
+            .raw_bytes = e.raw_bytes,
+        } },
+        .pending => .{ .done = {} }, // never reached
+    };
+}
 
 pub const Client = struct {
     fd: i32,
@@ -218,8 +295,11 @@ pub const Client = struct {
                         .fd = info.fd,
                         .parser = @import("api_sse.zig").Parser.init(allocator),
                         .body_buf = .empty,
+                        .pending = null,
                         .finished = info.body_len == 0,
                         .owns_fd = info.fd >= 0,
+                        .body_drained = false,
+                        .coalesce_started_at = null,
                     };
                     // Copy any buffered body bytes into body_buf eagerly.
                     if (info.body_len > 0) {
@@ -940,6 +1020,9 @@ test "q cancels and returns to idle" {
 // a single combined chunk (the latest cumulative content) with a
 // chunk_coalesced warn logged.
 test "backpressure coalesces slow-TUI chunks" {
+    try logger.initGlobal(testing.io);
+    defer logger.deinitGlobal(testing.io);
+
     var ms = try mock_server.start(testing.allocator);
     defer ms.deinit();
 
