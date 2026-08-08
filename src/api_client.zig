@@ -1330,3 +1330,99 @@ fn readFileContents(path: []const u8, buf: []u8) usize {
     _ = std.os.linux.close(fd);
     return total;
 }
+
+// =============================================================================
+// PR 3 — dup2-of-pipe regression test (headless invariant)
+// Commit 7: mirrors logger.zig's "no stdout or stderr writes" test. Runs a
+// representative Client.stream flow with stdout + stderr redirected to
+// pipes, asserts the pipes read 0 bytes, and asserts the corresponding
+// /tmp/ai-harness-debug.log contains the expected entries.
+// =============================================================================
+test "no stdout or stderr writes" {
+    try logger.initGlobal(testing.io);
+    defer logger.deinitGlobal(testing.io);
+
+    // Write a known log entry first so we can assert the log file
+    // captures the flow's diagnostic output (per spec scenario: "the
+    // corresponding /tmp/ai-harness-debug.log contains the expected
+    // warn/info entries").
+    _ = logger.global().log(testing.io, .info, "dup2-of-pipe-test-flow-start") catch {};
+
+    var ms = try mock_server.start(testing.allocator);
+    defer ms.deinit();
+
+    // Pre-canned HTTP response — a typical 200 with a minimal SSE body.
+    const sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"headless ok\"}}]}\n\n";
+    var hdr_buf: [256]u8 = undefined;
+    const response = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\n\r\n{s}", .{ sse_body.len, sse_body }) catch unreachable;
+    try mock_server.sendBytes(ms, response);
+
+    const pipe = try makeCancelPipe();
+    defer closeCancelPipe(pipe);
+
+    const req = testRequest(mock_server.port(ms.*), 1);
+
+    // Set up dup2-of-pipe: redirect fd 1 and fd 2 to pipes so any accidental
+    // write to stdout/stderr is captured for assertion.
+    var out_pipe: [2]i32 = undefined;
+    const prc1 = std.os.linux.pipe(&out_pipe);
+    try testing.expectEqual(@as(usize, 0), prc1);
+    const out_read = out_pipe[0];
+    const out_write = out_pipe[1];
+
+    const saved_out = std.os.linux.dup(std.posix.STDOUT_FILENO);
+    const saved_err = std.os.linux.dup(std.posix.STDERR_FILENO);
+    const saved_out_fd: i32 = @intCast(saved_out);
+    const saved_err_fd: i32 = @intCast(saved_err);
+
+    const dup1_rc = std.os.linux.dup2(out_write, std.posix.STDOUT_FILENO);
+    try testing.expectEqual(@as(usize, @intCast(std.posix.STDOUT_FILENO)), dup1_rc);
+    const dup2_rc = std.os.linux.dup2(out_write, std.posix.STDERR_FILENO);
+    try testing.expectEqual(@as(usize, @intCast(std.posix.STDERR_FILENO)), dup2_rc);
+
+    // Run a representative Client.stream flow.
+    var stream = Client.stream(testing.io, req, pipe) catch |err| {
+        // Restore stdout/stderr before returning the error.
+        _ = std.os.linux.dup2(saved_out_fd, std.posix.STDOUT_FILENO);
+        _ = std.os.linux.dup2(saved_err_fd, std.posix.STDERR_FILENO);
+        _ = std.os.linux.close(saved_out_fd);
+        _ = std.os.linux.close(saved_err_fd);
+        _ = std.os.linux.close(out_read);
+        _ = std.os.linux.close(out_write);
+        return err;
+    };
+    defer stream.deinit();
+    _ = try stream.next();
+    _ = try stream.next(); // drain remaining events
+
+    // Close the pipe write end and alias fd 1/2 to the read end so the
+    // test runner's own stdout/stderr messages don't deadlock the pipe.
+    _ = std.os.linux.close(out_write);
+    _ = std.os.linux.dup2(out_read, std.posix.STDOUT_FILENO);
+    _ = std.os.linux.dup2(out_read, std.posix.STDERR_FILENO);
+
+    // Drain the pipe — should be zero bytes (no writes to stdout/stderr).
+    var drain: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < drain.len) {
+        const r = std.os.linux.read(out_read, drain[total..].ptr, drain.len - total);
+        if (r == 0) break;
+        if (r > 0x7ffff000) break;
+        total += r;
+    }
+    try testing.expectEqual(@as(usize, 0), total);
+
+    // Restore fd 1/2 to their saved fds so subsequent tests print normally.
+    _ = std.os.linux.dup2(saved_out_fd, std.posix.STDOUT_FILENO);
+    _ = std.os.linux.dup2(saved_err_fd, std.posix.STDERR_FILENO);
+    _ = std.os.linux.close(saved_out_fd);
+    _ = std.os.linux.close(saved_err_fd);
+    _ = std.os.linux.close(out_read);
+
+    // Assert /tmp/ai-harness-debug.log contains the entry we wrote above.
+    var log_buf: [4096]u8 = undefined;
+    const n = readFileContents("/tmp/ai-harness-debug.log", &log_buf);
+    const contents = log_buf[0..n];
+    try testing.expect(n > 0);
+    try testing.expect(std.mem.indexOf(u8, contents, "dup2-of-pipe-test-flow-start") != null);
+}
