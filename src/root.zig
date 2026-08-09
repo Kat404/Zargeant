@@ -69,4 +69,3 @@ pub const validateViaApi = api_auth.validateViaApi;
 pub const Client = api_client.Client;
 pub const Request = api_client.Request;
 pub const tls_conn = api_client.tls_conn;
-pub const tlsHandshake = api_client.tlsHandshake;

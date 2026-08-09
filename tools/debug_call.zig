@@ -22,7 +22,7 @@
 //   $ zig build tools-debug
 // Run:
 //   $ echo "test-key-1234567890ABCDEF" | zig build tools-debug
-//   $ printf "%s" "$MINIMAX_API_KEY" | zig build tools-debug
+//   $ printf "%s" "$YOUR_API_KEY" | zig build tools-debug
 //
 // ponytail: minimal CLI; uses std.process.exit() for status codes rather
 // than returning from main() so the user's shell sees the right exit
@@ -133,8 +133,7 @@ fn contains(haystack: []const u8, needle: []const u8) bool {
 // NOTE: This test excludes the test block itself from the grep target
 // (we look at the preamble of the file — the main() function and
 // helpers — not the test declarations). Otherwise the test itself
-// would be flagged for mentioning the forbidden patterns (e.g., the
-// forbidden list literally contains "getenv").
+// would be flagged for mentioning the forbidden patterns by name.
 test "tools/debug_call.zig reads key from stdin only" {
     const forbidden = [_][]const u8{
         "getenv",

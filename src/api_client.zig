@@ -28,10 +28,9 @@
 // incompatible with a future Zig point release. No `-lcrypto` or
 // `-lssl` link is added in Path 2.
 //
-// The comptime touch `_ = api_client.tlsHandshake;` in src/root.zig:43
-// is preserved by keeping `tlsHandshake` as a thin wrapper around
-// `tls_conn.connect + tls_conn.handshake` (no-op body since the
-// handshake already ran inside connect).
+// Production code that needs cancellation should call
+// `tls_conn.connect(alloc, fd, host, cancel_pipe)` directly — the
+// `tlsHandshake` wrapper was removed in the Tier-1 cleanup (W9).
 
 // =============================================================================
 // Linux-only comptime guard. MUST be the FIRST executable statement so that
@@ -734,20 +733,6 @@ fn statusToError(status: u16) anyerror {
     };
 }
 
-/// TLS handshake. tls-handrolled (id=321): now a thin wrapper around
-/// `tls_conn.connect + tls_conn.handshake`. The handshake actually runs
-/// inside `tls_conn.connect` (since `std.crypto.tls.Client.init` is
-/// synchronous), so this wrapper's `handshake()` call is a no-op.
-///
-/// Preserved so that `_ = api_client.tlsHandshake;` in `src/root.zig:43`
-/// (the comptime touch) continues to compile. The cancel-pipe plumbing
-/// lives in `tls_conn.connect` directly; production code that needs
-/// cancellation should call `tls_conn.connect(alloc, fd, host, cancel_pipe)`
-/// rather than this wrapper.
-pub fn tlsHandshake(_: i32, _: []const u8) anyerror!void {
-    return error.TlsHandshakeFailed;
-}
-
 // =============================================================================
 // Public API (PR 1)
 // =============================================================================
@@ -1408,11 +1393,12 @@ test "TLS via system CA bundle succeeds" {
     try testing.expectEqualStrings("system", CA_BUNDLE_KIND);
 }
 
-// NFR-06 — Unknown CA returns TlsHandshakeFailed. tls-handrolled REWRITE:
-// the old stub `expectError(error.TlsHandshakeFailed, tlsHandshake(-1, ""))`
-// is replaced with assertions on the new tls_conn API + a compile-time
+// NFR-06 — Unknown CA returns TlsHandshakeFailed. tls-handrolled REWRITE
+// (cleanup W9): the old stub `expectError(error.TlsHandshakeFailed, tlsHandshake(-1, ""))`
+// was replaced with assertions on the new tls_conn API + a compile-time
 // guard that the source contains the SNI_HOSTNAME const + the
-// tls_conn.connect function definition (replaces the DEFER marker).
+// tls_conn.connect function definition. The `tlsHandshake` wrapper was
+// removed; tests now exercise `tls_conn` directly.
 test "unknown CA returns TlsHandshakeFailed" {
     // (1) Verify the API surface: tls_conn.connect and handshake are
     //     callable; the comptime consts are present.
