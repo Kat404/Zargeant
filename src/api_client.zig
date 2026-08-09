@@ -1847,7 +1847,7 @@ pub const tls_conn = struct {
     /// I/O. On cancel-pipe readability or cumulative timeout ≥
     /// `timeout_ms` (default 5_000 ms), returns `error.Cancelled` or
     /// `error.HandshakeTimeout` respectively and frees all resources.
-    pub fn connect(alloc: std.mem.Allocator, fd: i32, host: []const u8, cancel_pipe: [2]i32) !tls_conn {
+    pub fn connect(io: std.Io, alloc: std.mem.Allocator, fd: i32, host: []const u8, cancel_pipe: [2]i32) !tls_conn {
         // 1. Allocate read/write buffers (≥ max_ciphertext_record_len).
         const buf_len = std.crypto.tls.max_ciphertext_record_len;
         const read_buf = try alloc.alloc(u8, buf_len);
@@ -1857,8 +1857,8 @@ pub const tls_conn = struct {
 
         // 2. Load the system CA bundle.
         var bundle: std.crypto.Certificate.Bundle = .empty;
-        const now_ts = std.Io.Clock.real.now(testing.io);
-        std.crypto.Certificate.Bundle.rescan(&bundle, alloc, testing.io, now_ts) catch {
+        const now_ts = std.Io.Clock.real.now(io);
+        std.crypto.Certificate.Bundle.rescan(&bundle, alloc, io, now_ts) catch {
             return error.CaBundleNotFound;
         };
         errdefer bundle.deinit(alloc);
@@ -1917,14 +1917,14 @@ pub const tls_conn = struct {
         const bundle_ref: *std.crypto.Certificate.Bundle = &self.bundle;
 
         // 6. Run the handshake synchronously via std.crypto.tls.Client.init.
-        const realtime_now = std.Io.Clock.real.now(testing.io);
+        const realtime_now = std.Io.Clock.real.now(io);
         self.stream = std.crypto.tls.Client.init(
             &self.reader_state.interface,
             &self.writer_state.interface,
             .{
                 .ca = .{ .bundle = .{
                     .gpa = alloc,
-                    .io = testing.io,
+                    .io = io,
                     .lock = &lock,
                     .bundle = bundle_ref,
                 } },
@@ -2152,7 +2152,7 @@ test "TLS handshake vs api.minimax.io:443 succeeds" {
         _ = std.os.linux.close(pipe_fds[1]);
     }
 
-    var conn = tls_conn.connect(testing.allocator, fd, SNI_HOSTNAME, pipe_fds) catch |err| {
+    var conn = tls_conn.connect(testing.io, testing.allocator, fd, SNI_HOSTNAME, pipe_fds) catch |err| {
         if (err == error.ConnectionRefused or err == error.NetworkUnreachable or err == error.HandshakeTimeout or err == error.TlsHandshakeFailed or err == error.Cancelled) return;
         return err;
     };
@@ -2248,7 +2248,7 @@ test "TLS handshake honors cancel via cancel_pipe" {
     const connect_rc = std.os.linux.connect(fd, @ptrCast(&addrs[0]), @sizeOf(@TypeOf(addrs[0])));
     if (connect_rc != 0) return;
 
-    const result = tls_conn.connect(testing.allocator, fd, SNI_HOSTNAME, pipe_fds);
+    const result = tls_conn.connect(testing.io, testing.allocator, fd, SNI_HOSTNAME, pipe_fds);
     try testing.expectError(error.Cancelled, result);
 }
 
@@ -2309,7 +2309,7 @@ test "TLS handshake timeout after HANDSHAKE_TIMEOUT_MS" {
     const connect_rc = std.os.linux.connect(fd, @ptrCast(&addrs[0]), @sizeOf(@TypeOf(addrs[0])));
     if (connect_rc != 0) return;
 
-    const result = tls_conn.connect(testing.allocator, fd, SNI_HOSTNAME, pipe_fds);
+    const result = tls_conn.connect(testing.io, testing.allocator, fd, SNI_HOSTNAME, pipe_fds);
     if (result) |_| {
         return;
     } else |err| {

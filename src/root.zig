@@ -40,10 +40,33 @@ comptime {
     _ = api_client.Client;
     _ = api_client.Request;
     _ = api_client.ChunkEvent;
-    _ = api_client.tlsHandshake;
+    _ = api_client.tls_conn;
     _ = api_sse.Parser;
     _ = api_sse.Event;
     _ = api_auth.validateFormat;
     _ = mock_server.Handle;
     _ = fixtures_test;
 }
+
+// Re-export logger public API at the root namespace so that downstream
+// consumers (tools/debug_call.zig, the executable entry point) can call
+// `logger.initGlobal` / `logger.deinitGlobal` directly without each
+// consumer needing its own dedicated logger module wiring in build.zig.
+// tls-handrolled remediation: the build.zig imports wire `@import("logger")`
+// to lib_mod (src/root.zig), so these re-exports route the calls back to
+// src/logger.zig's actual implementation.
+pub const initGlobal = logger.initGlobal;
+pub const deinitGlobal = logger.deinitGlobal;
+pub const global = logger.global;
+
+// Re-export the auth API surface at the root namespace. Same rationale as
+// the logger re-exports above: tools/debug_call.zig imports `api_auth` and
+// expects `validateFormat` / `validateViaApi` to resolve.
+pub const validateFormat = api_auth.validateFormat;
+pub const validateViaApi = api_auth.validateViaApi;
+
+// Re-export the api_client API surface at the root namespace.
+pub const Client = api_client.Client;
+pub const Request = api_client.Request;
+pub const tls_conn = api_client.tls_conn;
+pub const tlsHandshake = api_client.tlsHandshake;

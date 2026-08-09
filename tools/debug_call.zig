@@ -49,46 +49,59 @@ const logger = @import("logger");
 const MAX_KEY_LEN: usize = 4096;
 
 pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    // Zig 0.16 removed std.heap.GeneralPurposeAllocator; std.heap.DebugAllocator
+    // is the direct replacement (leak detection + safety in Debug). The test
+    // mode uses std.testing.allocator instead, but main() runs as a real
+    // executable under `zig build tools-debug` and needs its own allocator.
+    var debug_alloc = std.heap.DebugAllocator(.{}).init;
+    defer _ = debug_alloc.deinit();
+    const alloc = debug_alloc.allocator();
+
+    // Initialize a real std.Io instance for exe-mode I/O. The test mode uses
+    // std.testing.io, but main() runs as a real executable and the logger
+    // requires a non-test Io. Threaded mode handles concurrent logging (we
+    // don't spawn threads here, but the logger API is the same).
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
     // Initialize the logger (writes to /tmp/ai-harness-debug.log).
-    try logger.initGlobal(std.testing.io);
-    defer logger.deinitGlobal(std.testing.io);
+    try logger.initGlobal(io);
+    defer logger.deinitGlobal(io);
 
     // Read the API key from stdin (fd 0) ONLY.
     var buf: [MAX_KEY_LEN + 1]u8 = undefined;
-    const stdin = std.fs.getStdIn();
-    const n = try stdin.read(&buf);
-    if (n == 0) {
-        logger.global().log(std.testing.io, .err, "debug_call: empty stdin") catch {};
+    // Zig 0.16 removed std.fs.getStdIn(); read fd 0 directly via the raw
+    // syscall. Stdin is the ONLY key source (hardcoded fd 0 = invariant).
+    const n: isize = @bitCast(std.os.linux.read(0, &buf, buf.len));
+    if (n <= 0) {
+        logger.global().log(io, .err, "debug_call: empty stdin") catch {};
         std.process.exit(3);
     }
-    if (n > MAX_KEY_LEN) {
-        logger.global().log(std.testing.io, .err, "debug_call: key exceeds MAX_KEY_LEN") catch {};
+    if (@as(usize, @intCast(n)) > MAX_KEY_LEN) {
+        logger.global().log(io, .err, "debug_call: key exceeds MAX_KEY_LEN") catch {};
         std.process.exit(1);
     }
-    const key = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    const key = std.mem.trim(u8, buf[0..@intCast(n)], " \t\r\n");
 
     // Format check first.
     if (!api_auth.validateFormat(key)) {
-        logger.global().log(std.testing.io, .warn, "debug_call: invalid_key_format") catch {};
+        logger.global().log(io, .warn, "debug_call: invalid_key_format") catch {};
         std.process.exit(1);
     }
 
     // Probe the API.
-    api_auth.validateViaApi(std.testing.io, alloc, key) catch |err| {
-        logger.global().log(std.testing.io, .err, "debug_call: validate_failed") catch {};
+    api_auth.validateViaApi(io, alloc, key) catch |err| {
+        logger.global().log(io, .err, "debug_call: validate_failed") catch {};
         switch (err) {
             error.Unauthorized => std.process.exit(2),
-            error.ConnectFailed, error.TlsHandshakeFailed, error.HandshakeTimeout => std.process.exit(3),
+            error.ConnectFailed, error.TlsHandshakeFailed => std.process.exit(3),
             else => std.process.exit(3),
         }
     };
 
     // Success.
-    logger.global().log(std.testing.io, .info, "debug_call: api_key_validated") catch {};
+    logger.global().log(io, .info, "debug_call: api_key_validated") catch {};
     std.process.exit(0);
 }
 

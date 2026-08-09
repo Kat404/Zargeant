@@ -120,14 +120,13 @@ pub fn validateFormat(key: []const u8) bool {
 ///
 /// Key bytes are NEVER logged (NFR-07 preserved from api-client PR 3).
 pub fn validateViaApi(io: std.Io, alloc: std.mem.Allocator, key: []const u8) AuthError!void {
-    _ = io;
-    return validateViaApiWithTarget(alloc, key, "api.minimax.io", 443);
+    return validateViaApiWithTarget(io, alloc, key, "api.minimax.io", 443);
 }
 
 /// Internal probe variant that accepts an explicit target host + port.
 /// Public so tests can route to a local mock server (e.g., 127.0.0.1:PORT)
 /// and assert the error mapping without standing up a real TLS stack.
-pub fn validateViaApiWithTarget(alloc: std.mem.Allocator, key: []const u8, target_host: []const u8, target_port: u16) AuthError!void {
+pub fn validateViaApiWithTarget(io: std.Io, alloc: std.mem.Allocator, key: []const u8, target_host: []const u8, target_port: u16) AuthError!void {
     const api_client = @import("api_client.zig");
 
     // Build minimal probe request: model=MiniMax-M3, 1 token, no stream.
@@ -164,7 +163,7 @@ pub fn validateViaApiWithTarget(alloc: std.mem.Allocator, key: []const u8, targe
             _ = std.os.linux.close(cancel_pipe[1]);
         }
         const api_host = std.mem.sliceTo(target_host, 0);
-        var conn = api_client.tls_conn.connect(alloc, fd, api_host, cancel_pipe) catch |err| switch (err) {
+        var conn = api_client.tls_conn.connect(io, alloc, fd, api_host, cancel_pipe) catch |err| switch (err) {
             error.TlsHandshakeFailed => return error.TlsHandshakeFailed,
             error.HandshakeTimeout => return error.TlsHandshakeFailed,
             error.CaBundleNotFound => return error.TlsHandshakeFailed,
@@ -738,7 +737,7 @@ test "validateViaApi returns Unauthorized on 401 or base_resp 1004" {
 
     // Probe the mock server (127.0.0.1:PORT). The probe sends a request;
     // the mock responds 401; the probe maps to error.Unauthorized.
-    const result = validateViaApiWithTarget(testing.allocator, "test-key-1234567890ABCDEF", "127.0.0.1", mock_server.port(ms.*));
+    const result = validateViaApiWithTarget(testing.io, testing.allocator, "test-key-1234567890ABCDEF", "127.0.0.1", mock_server.port(ms.*));
     try testing.expectError(error.Unauthorized, result);
 }
 
@@ -747,6 +746,6 @@ test "validateViaApi returns Unauthorized on 401 or base_resp 1004" {
 test "validateViaApi returns ConnectFailed on network error" {
     // Port 1 is reserved; ECONNREFUSED on connect. The probe maps to
     // error.ConnectFailed (NOT error.OpenFailed).
-    const result = validateViaApiWithTarget(testing.allocator, "test-key-1234567890ABCDEF", "127.0.0.1", 1);
+    const result = validateViaApiWithTarget(testing.io, testing.allocator, "test-key-1234567890ABCDEF", "127.0.0.1", 1);
     try testing.expectError(error.ConnectFailed, result);
 }
