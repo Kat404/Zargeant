@@ -108,6 +108,11 @@ pub const Request = struct {
     /// Target port. Default = 0 which means "infer from target_host"
     /// (443 for production host, mock-server-assigned for 127.0.0.1).
     target_port: u16 = 0,
+    /// When true, the request goes through `tls_conn` (TLS handshake + encrypted
+    /// I/O). Default = false so tests against the plain HTTP mock server keep
+    /// working. Production callers set this to true. Daylighting per CRITICAL-1
+    /// of the tls-handrolled remediation plan (engram id=331).
+    tls: bool = false,
     /// Override for the retry backoff base in milliseconds. Tests set this
     /// to 1 to keep retry tests fast; production leaves it at the default
     /// (500 ms per spec id=276).
@@ -295,8 +300,6 @@ pub const Client = struct {
     cancel_pipe: [2]i32,
 
     pub fn stream(io: std.Io, req: Request, cancel_pipe: [2]i32) !ChunkEventStream {
-        _ = io;
-
         // Pre-socket cancel check: if the cancel-pipe is already readable,
         // return error.Cancelled without opening a socket. Spec scenario
         // "Cancel before request sent".
@@ -305,7 +308,7 @@ pub const Client = struct {
         const allocator = std.testing.allocator;
         var attempt: u32 = 0;
         while (attempt < MAX_ATTEMPTS) : (attempt += 1) {
-            const outcome = tryOneAttempt(req, cancel_pipe, allocator) catch |err| switch (err) {
+            const outcome = tryOneAttempt(io, req, cancel_pipe, allocator) catch |err| switch (err) {
                 error.Cancelled => return error.Cancelled,
                 error.EmptyBody => return err,
                 else => return err,
@@ -431,7 +434,14 @@ fn randomBelow(bound: u64) u64 {
 
 /// Performs one HTTP attempt: open socket, connect, send, read response,
 /// classify. Returns the outcome for the retry decision.
-fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator) !AttemptOutcome {
+///
+/// When `req.tls == true`, the connection is wrapped in TLS via `tls_conn`
+/// (CRITICAL-1 of the tls-handrolled remediation plan, engram id=331). The
+/// TLS session is closed before returning (the response body is fully buffered
+/// into `resp_buf` so the streaming layer can parse it without keeping the
+/// socket open). When `req.tls == false`, the connection is plain HTTP (mock
+/// server tests) and the socket fd is left open on success for streaming.
+fn tryOneAttempt(io: std.Io, req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator) !AttemptOutcome {
     // 1. Resolve target port.
     const port: u16 = if (req.target_port != 0) req.target_port else 443;
 
@@ -457,7 +467,7 @@ fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator
         return error.ConnectionRefused;
     }
 
-    // 4. Build + send HTTP request.
+    // 4. Build HTTP request (shared by both branches).
     const headers = try buildHeaders(req.key, allocator);
     defer allocator.free(headers);
     const body = try serializeRequest(req, allocator);
@@ -468,19 +478,134 @@ fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator
     try req_buf.appendSlice(allocator, headers);
     try req_buf.appendSlice(allocator, body);
 
+    // 5. Branch on TLS. The TLS path keeps the connection alive only inside
+    //    this function (body is fully buffered); the plain HTTP path leaves
+    //    the socket open on success for the streaming layer.
+    if (req.tls) {
+        // 5a. TLS handshake over the connected fd.
+        var tls = tls_conn.connect(io, allocator, fd, req.target_host, cancel_pipe) catch |err| {
+            _ = std.os.linux.close(fd);
+            return switch (err) {
+                error.Cancelled => error.Cancelled,
+                error.HandshakeTimeout => error.HandshakeTimeout,
+                error.TlsHandshakeFailed, error.CaBundleNotFound => error.TlsHandshakeFailed,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        };
+        // Always close the TLS session before returning. The body is fully
+        // buffered into resp_buf; the caller (ChunkEventStream) parses the
+        // pre-buffered body without needing the live socket.
+        defer tls.deinit();
+
+        // 5b. Send encrypted request.
+        tls.writeAll(req_buf.items) catch return error.WriteFailed;
+
+        // 5c. Read response header.
+        var resp_buf: [16 * 1024]u8 = undefined;
+        var resp_len: usize = 0;
+        var header_end: usize = 0;
+
+        while (header_end == 0) {
+            const n = tls.readSome(resp_buf[resp_len..]) catch |err| switch (err) {
+                error.Cancelled => return error.Cancelled,
+                error.HandshakeTimeout => return error.HandshakeTimeout,
+                error.ConnectionClosed => return error.ReadFailed,
+                else => return error.ReadFailed,
+            };
+            resp_len += n;
+            if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |idx| {
+                header_end = idx + 4;
+            }
+        }
+
+        // 5d. Parse status line.
+        const status_line_end = std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n") orelse return error.MalformedResponse;
+        const status_line = resp_buf[0..status_line_end];
+        const status = parseStatusCode(status_line) orelse return error.MalformedResponse;
+
+        // 5e. Parse Retry-After if present.
+        var retry_after_ms: ?u64 = null;
+        const headers_slice = resp_buf[status_line_end + 2 .. header_end];
+        if (std.mem.indexOf(u8, headers_slice, "Retry-After:")) |idx| {
+            const after = headers_slice[idx + "Retry-After:".len ..];
+            const line_end = std.mem.indexOf(u8, after, "\r\n") orelse after.len;
+            const value = std.mem.trim(u8, after[0..line_end], " \t");
+            const parsed = std.fmt.parseInt(u64, value, 10) catch null;
+            if (parsed) |v| {
+                retry_after_ms = @min(v * 1000, RETRY_AFTER_CAP_MS);
+            }
+        }
+
+        // 5f. Classify (TLS: defer tls.deinit handles socket close).
+        if (status == 401 or status == 403) {
+            return AttemptOutcome{ .unauthorized = {} };
+        }
+
+        if (status == 200) {
+            const cl_idx = std.mem.indexOf(u8, headers_slice, "Content-Length:");
+            const content_length: usize = if (cl_idx) |idx| blk: {
+                const after = headers_slice[idx + "Content-Length:".len ..];
+                const line_end = std.mem.indexOf(u8, after, "\r\n") orelse after.len;
+                const value = std.mem.trim(u8, after[0..line_end], " \t");
+                break :blk std.fmt.parseInt(usize, value, 10) catch 0;
+            } else 0;
+
+            var total_read = resp_len - header_end;
+            while (total_read < content_length) {
+                const n2 = tls.readSome(resp_buf[resp_len..]) catch |err| switch (err) {
+                    error.Cancelled => return error.Cancelled,
+                    error.HandshakeTimeout => return error.HandshakeTimeout,
+                    error.ConnectionClosed => break,
+                    else => return error.ReadFailed,
+                };
+                if (n2 == 0) break;
+                resp_len += n2;
+                total_read += n2;
+            }
+
+            const body_actual = @min(content_length, total_read);
+
+            if (body_actual == 0 and content_length == 0) {
+                return AttemptOutcome{
+                    .success = .{
+                        .fd = -1,
+                        .body_bytes = &[_]u8{},
+                        .body_len = 0,
+                    },
+                };
+            }
+
+            const body_slice = resp_buf[header_end .. header_end + body_actual];
+            return AttemptOutcome{
+                .success = .{
+                    .fd = -1, // TLS session closed; caller owns body bytes only.
+                    .body_bytes = body_slice,
+                    .body_len = body_actual,
+                },
+            };
+        }
+
+        if (isRetryableStatus(status)) {
+            return AttemptOutcome{ .retryable = .{ .status = status, .retry_after_ms = retry_after_ms } };
+        }
+
+        return statusToError(status);
+    }
+
+    // 6. Plain HTTP path (mock server / no TLS). Leave socket open on success
+    //    so the streaming layer can read more from the same fd.
     const write_rc = std.os.linux.write(fd, req_buf.items.ptr, req_buf.items.len);
     if (write_rc != req_buf.items.len) {
         _ = std.os.linux.close(fd);
         return error.WriteFailed;
     }
 
-    // 5. Read response — status line + headers + Content-Length body.
+    // 6a. Read response header.
     var resp_buf: [16 * 1024]u8 = undefined;
     var resp_len: usize = 0;
     var header_end: usize = 0;
 
     while (header_end == 0) {
-        // Wait for data or cancel.
         if (pollWithCancel(fd, cancel_pipe)) {
             _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
             _ = std.os.linux.close(fd);
@@ -494,13 +619,12 @@ fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator
         }
         resp_len += @intCast(n);
 
-        // Look for end of headers "\r\n\r\n".
         if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |idx| {
             header_end = idx + 4;
         }
     }
 
-    // 6. Parse status line.
+    // 6b. Parse status line.
     const status_line_end = std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n") orelse {
         _ = std.os.linux.close(fd);
         return error.MalformedResponse;
@@ -511,7 +635,7 @@ fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator
         return error.MalformedResponse;
     };
 
-    // 7. Parse Retry-After if present.
+    // 6c. Parse Retry-After.
     var retry_after_ms: ?u64 = null;
     const headers_slice = resp_buf[status_line_end + 2 .. header_end];
     if (std.mem.indexOf(u8, headers_slice, "Retry-After:")) |idx| {
@@ -524,7 +648,7 @@ fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator
         }
     }
 
-    // 8. Classify.
+    // 6d. Classify.
     if (status == 401 or status == 403) {
         _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
         _ = std.os.linux.close(fd);
@@ -532,7 +656,6 @@ fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator
     }
 
     if (status == 200) {
-        // Read the rest of the body (Content-Length bytes after header_end).
         const cl_idx = std.mem.indexOf(u8, headers_slice, "Content-Length:");
         const content_length: usize = if (cl_idx) |idx| blk: {
             const after = headers_slice[idx + "Content-Length:".len ..];
@@ -541,7 +664,6 @@ fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator
             break :blk std.fmt.parseInt(usize, value, 10) catch 0;
         } else 0;
 
-        // Read remaining body bytes.
         var total_read = resp_len - header_end;
         while (total_read < content_length) {
             if (pollWithCancel(fd, cancel_pipe)) {
@@ -558,8 +680,6 @@ fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator
         const body_actual = @min(content_length, total_read);
 
         if (body_actual == 0 and content_length == 0) {
-            // Empty body — close socket; caller returns ChunkEventStream that
-            // emits .done on first next().
             _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
             _ = std.os.linux.close(fd);
             return AttemptOutcome{
@@ -571,8 +691,6 @@ fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator
             };
         }
 
-        // Body lives in resp_buf (stack). Caller copies into the stream's
-        // body_buf, which keeps the data alive after we return.
         const body_slice = resp_buf[header_end .. header_end + body_actual];
         return AttemptOutcome{ .success = .{
             .fd = fd,
@@ -587,7 +705,6 @@ fn tryOneAttempt(req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator
         return AttemptOutcome{ .retryable = .{ .status = status, .retry_after_ms = retry_after_ms } };
     }
 
-    // Other status codes → return their matching error.
     _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
     _ = std.os.linux.close(fd);
     return statusToError(status);
@@ -1007,6 +1124,36 @@ test "Esc cancels current stream" {
 
     const result = Client.stream(testing.io, req, pipe);
     try testing.expectError(error.Cancelled, result);
+}
+
+// T1.9 — Production path uses TLS when req.tls is true. Spec scenario
+// "Client.stream sends encrypted HTTP over TLS to api.minimax.io" (gated on
+// ZARGEANT_RUN_TLS_HANDSHAKE=1 for full real-server verification, but the
+// TLS-vs-plain discrimination runs in CI without the env var).
+//
+// This test connects to a plain HTTP mock server with req.tls = true. The
+// mock server has no TLS cert, so the TLS handshake must fail. If we ever
+// accidentally regress the wiring (e.g., forget to call tls_conn.connect),
+// the request would go out as plaintext HTTP and the mock server would
+// return 401, which would map to error.Unauthorized — making this test
+// FAIL. The PASS signal is `error.TlsHandshakeFailed` or `error.HandshakeTimeout`:
+// TLS is being attempted (the mock server, which doesn't speak TLS, makes
+// the handshake either fail outright or time out after HANDSHAKE_TIMEOUT_MS).
+test "Client.stream uses TLS when req.tls is true (mock server, no cert)" {
+    var ms = try mock_server.start(testing.allocator);
+    defer ms.deinit();
+
+    const pipe = try makeCancelPipe();
+    defer closeCancelPipe(pipe);
+
+    var req = testRequest(mock_server.port(ms.*), 1);
+    req.tls = true; // <-- the production-path toggle.
+
+    const result = Client.stream(testing.io, req, pipe);
+    // Accept either signal: the handshake either fails outright (mock server
+    // sends garbage that doesn't parse as TLS) or times out after
+    // HANDSHAKE_TIMEOUT_MS (5s). Both confirm TLS is being attempted.
+    try testing.expect(result == error.TlsHandshakeFailed or result == error.HandshakeTimeout);
 }
 
 // T3.6 — q cancels and returns to idle. In-flight cancel: Client.stream is
@@ -1954,6 +2101,29 @@ pub const tls_conn = struct {
         // std.crypto.tls.Client.init is synchronous and the Reader/Writer
         // adapters drive the cancel/timeout during init. This method is a
         // thin no-op so the public API matches the design contract.
+    }
+
+    /// Reads plaintext from the TLS stream into `dest`. Single read attempt;
+    /// returns the number of bytes read (0..dest.len). On TLS-layer
+    /// end-of-stream returns `error.ConnectionClosed`. On cancel-pipe or
+    /// cumulative timeout returns `error.Cancelled` / `error.HandshakeTimeout`.
+    /// Cancellation is enforced both before the read (cheap flag check) and
+    /// during the read (poll inside the underlying `reader_state.interface`).
+    pub fn readSome(self: *tls_conn, dest: []u8) !usize {
+        if (self.cancel_observed) return error.Cancelled;
+        if (self.timeout_observed) return error.HandshakeTimeout;
+        const n = self.stream.reader.readSliceShort(dest) catch return error.ReadFailed;
+        if (n == 0) return error.ConnectionClosed;
+        return n;
+    }
+
+    /// Writes plaintext from `src` through the TLS stream. Loops on
+    /// partial writes until `src` is fully transmitted. On cancel-pipe or
+    /// cumulative timeout returns `error.Cancelled` / `error.HandshakeTimeout`.
+    pub fn writeAll(self: *tls_conn, src: []const u8) !void {
+        if (self.cancel_observed) return error.Cancelled;
+        if (self.timeout_observed) return error.HandshakeTimeout;
+        try self.stream.writer.writeAll(src);
     }
 
     /// Closes the socket, frees the CA bundle, and frees the read/write
