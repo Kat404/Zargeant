@@ -10,6 +10,7 @@
 // 82deaf6 (RED backpressure+shaping), bc906f6 (GREEN stream+coalesce),
 // a88fb85 (RED NFRs), 3327317 (GREEN TLS deferral), cd57c99 (dup2-of-pipe).
 // See apply-progress id= for the merged PR 1 + PR 2 + PR 3 evidence.
+const std = @import("std");
 pub const harness = @import("harness.zig");
 pub const version = @import("version.zig");
 pub const logger = @import("logger.zig");
@@ -69,3 +70,19 @@ pub const validateViaApi = api_auth.validateViaApi;
 pub const Client = api_client.Client;
 pub const Request = api_client.Request;
 pub const tls_conn = api_client.tls_conn;
+
+test "root.zig re-exports are wired" {
+    // The re-export module is verified at compile time via the comptime
+    // block above. Symbols are pulled in when src/root.zig is the root
+    // of the test module. The strict-tdd CI check (ci.yml) requires
+    // every src/*.zig to have at least one test block; this asserts
+    // the re-exports resolve at runtime.
+    try std.testing.expect(initGlobal == logger.initGlobal);
+    try std.testing.expect(deinitGlobal == logger.deinitGlobal);
+    try std.testing.expect(global == logger.global);
+    try std.testing.expect(validateFormat == api_auth.validateFormat);
+    try std.testing.expect(validateViaApi == api_auth.validateViaApi);
+    try std.testing.expect(Client == api_client.Client);
+    try std.testing.expect(Request == api_client.Request);
+    try std.testing.expect(tls_conn == api_client.tls_conn);
+}
