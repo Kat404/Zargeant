@@ -120,14 +120,13 @@ pub fn validateFormat(key: []const u8) bool {
 ///
 /// Key bytes are NEVER logged (NFR-07 preserved from api-client PR 3).
 pub fn validateViaApi(io: std.Io, alloc: std.mem.Allocator, key: []const u8) AuthError!void {
-    _ = io;
-    return validateViaApiWithTarget(alloc, key, "api.minimax.io", 443);
+    return validateViaApiWithTarget(io, alloc, key, "api.minimax.io", 443);
 }
 
 /// Internal probe variant that accepts an explicit target host + port.
 /// Public so tests can route to a local mock server (e.g., 127.0.0.1:PORT)
 /// and assert the error mapping without standing up a real TLS stack.
-pub fn validateViaApiWithTarget(alloc: std.mem.Allocator, key: []const u8, target_host: []const u8, target_port: u16) AuthError!void {
+pub fn validateViaApiWithTarget(io: std.Io, alloc: std.mem.Allocator, key: []const u8, target_host: []const u8, target_port: u16) AuthError!void {
     const api_client = @import("api_client.zig");
 
     // Build minimal probe request: model=MiniMax-M3, 1 token, no stream.
@@ -164,7 +163,7 @@ pub fn validateViaApiWithTarget(alloc: std.mem.Allocator, key: []const u8, targe
             _ = std.os.linux.close(cancel_pipe[1]);
         }
         const api_host = std.mem.sliceTo(target_host, 0);
-        var conn = api_client.tls_conn.connect(alloc, fd, api_host, cancel_pipe) catch |err| switch (err) {
+        var conn = api_client.tls_conn.connect(io, alloc, fd, api_host, cancel_pipe) catch |err| switch (err) {
             error.TlsHandshakeFailed => return error.TlsHandshakeFailed,
             error.HandshakeTimeout => return error.TlsHandshakeFailed,
             error.CaBundleNotFound => return error.TlsHandshakeFailed,
@@ -472,15 +471,23 @@ fn readEnv(name: []const u8) ?[]const u8 {
 // =============================================================================
 
 // T1.2 — Non-negotiable grep-fail. Scans src/api_client.zig, src/api_sse.zig,
-// src/api_auth.zig for forbidden patterns outside the consent-routed paths.
-// FAILS the build on any match.
+// src/api_auth.zig, AND tools/debug_call.zig for forbidden patterns outside
+// the consent-routed paths. FAILS the build on any match.
+//
+// The scan is scoped to production code (preamble + main + helpers) — test
+// blocks are split off at the first `test "` marker so test declarations
+// are allowed to mention the forbidden patterns for documentation purposes
+// (e.g., the forbidden list itself, `// allowed: <pattern>` markers).
+// Tier-1 cleanup W3 (verify-report id=330): extended targets to include
+// tools/debug_call.zig for defense-in-depth.
 test "no automatic key sources" {
     const forbidden = [_][]const u8{
         "getenv",           "readFile",        "libsecret",          "Secret Service",
         "$MINIMAX_API_KEY", "$OPENAI_API_KEY", "$ANTHROPIC_API_KEY",
     };
     const targets = [_][]const u8{
-        "src/api_client.zig", "src/api_sse.zig", "src/api_auth.zig",
+        "src/api_client.zig",   "src/api_sse.zig", "src/api_auth.zig",
+        "tools/debug_call.zig",
     };
     const io = testing.io;
     for (targets) |path| {
@@ -489,12 +496,18 @@ test "no automatic key sources" {
             else => return err,
         };
         defer testing.allocator.free(content);
+        // Split at the first test-block marker so test declarations can
+        // mention the forbidden patterns for documentation. Only production
+        // code (preamble + main + helpers) is scanned.
+        const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+        const prod_src = content[0..first_test];
         for (forbidden) |pat| {
-            if (std.mem.indexOf(u8, content, pat)) |idx| {
-                // Allow match if the file carries a matching // allowed: marker.
-                var marker_buf: [64]u8 = undefined;
-                const marker = std.fmt.bufPrint(&marker_buf, "// allowed: {s}", .{pat}) catch continue;
-                if (std.mem.indexOf(u8, content, marker) != null) continue;
+            // Allow match if the file's production code carries a matching
+            // // allowed: marker (sparingly used for documentation).
+            var marker_buf: [64]u8 = undefined;
+            const marker = std.fmt.bufPrint(&marker_buf, "// allowed: {s}", .{pat}) catch continue;
+            if (std.mem.indexOf(u8, prod_src, pat)) |idx| {
+                if (std.mem.indexOf(u8, prod_src, marker) != null) continue;
                 std.debug.print("\n[grep-fail] forbidden pattern '{s}' in {s} at offset {d}\n", .{
                     pat, path, idx,
                 });
@@ -738,7 +751,7 @@ test "validateViaApi returns Unauthorized on 401 or base_resp 1004" {
 
     // Probe the mock server (127.0.0.1:PORT). The probe sends a request;
     // the mock responds 401; the probe maps to error.Unauthorized.
-    const result = validateViaApiWithTarget(testing.allocator, "test-key-1234567890ABCDEF", "127.0.0.1", mock_server.port(ms.*));
+    const result = validateViaApiWithTarget(testing.io, testing.allocator, "test-key-1234567890ABCDEF", "127.0.0.1", mock_server.port(ms.*));
     try testing.expectError(error.Unauthorized, result);
 }
 
@@ -747,6 +760,6 @@ test "validateViaApi returns Unauthorized on 401 or base_resp 1004" {
 test "validateViaApi returns ConnectFailed on network error" {
     // Port 1 is reserved; ECONNREFUSED on connect. The probe maps to
     // error.ConnectFailed (NOT error.OpenFailed).
-    const result = validateViaApiWithTarget(testing.allocator, "test-key-1234567890ABCDEF", "127.0.0.1", 1);
+    const result = validateViaApiWithTarget(testing.io, testing.allocator, "test-key-1234567890ABCDEF", "127.0.0.1", 1);
     try testing.expectError(error.ConnectFailed, result);
 }

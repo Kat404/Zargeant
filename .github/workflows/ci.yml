@@ -15,7 +15,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Linux-only: src/api_client.zig and tools/debug_call.zig use
+        # std.os.linux.* raw syscalls (Landlock + Seccomp-BPF for sandbox,
+        # direct socket calls for the MiniMax HTTP-SSE client). The
+        # comptime guards @compileError on non-Linux targets. README
+        # section "Requirements" + roadmap/decisions id=192 confirm this
+        # is intentional. macOS support is a roadmap follow-up (see
+        # "logger-macos-port" + "sandbox-macos" rows in the project table).
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout

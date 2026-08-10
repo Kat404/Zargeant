@@ -37,9 +37,11 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     // exe: tools/debug_call.zig (manual-only API key probe).
-    // tls-handrolled (sdd id=323, T3.5): wires the micro-CLI as a
-    // runnable step. Imports the same api_auth/api_client/logger
-    // modules the main zargeant exe uses (no code duplication).
+    // tls-handrolled (sdd id=323, T3.5): wires the micro-CLI as a runnable step.
+    // Imports point to lib_mod (src/root.zig); src/root.zig re-exports the
+    // necessary symbols (initGlobal, deinitGlobal, validateFormat, validateViaApi,
+    // etc.) so the imports resolve through the lib_mod namespace without forcing
+    // the source files to become independent module roots.
     const debug_call_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
