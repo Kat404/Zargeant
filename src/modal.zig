@@ -525,6 +525,46 @@ pub fn openErrorModal(state: *State, kind: ErrorKind, message: []const u8) void 
     } };
 }
 
+/// Render the AgentLoopView: cumulative LLM text on top + status bar
+/// (model name, token count, last-update timestamp) on the bottom row.
+pub fn drawAgentLoopView(win: *WindowMock, state: *State) !void {
+    win.clear();
+    const payload = &state.agent_loop;
+    // The cumulative text is owned by the AgentLoopState (ArrayList<u8>).
+    // We print up to one row of it (truncate if it overflows).
+    if (payload.cumulative.items.len > 0) {
+        const max: usize = @min(payload.cumulative.items.len, @as(usize, win.size().cols));
+        for (payload.cumulative.items[0..max], 0..) |c, i| {
+            win.cells[i] = .{ .ch = c, .style = .{} };
+        }
+    }
+    // Status bar (bottom row) — write into the last row.
+    if (win.rows > 0) {
+        const last_row: usize = @as(usize, win.rows - 1) * @as(usize, win.cols);
+        var status_buf: [128]u8 = undefined;
+        const status_str = std.fmt.bufPrint(
+            &status_buf,
+            "model={s} tokens={d} t={d}ms",
+            .{ payload.model, payload.tokens, payload.last_update_ms },
+        ) catch "model=? tokens=0 t=0ms";
+        const status_len: usize = @min(status_str.len, win.size().cols);
+        for (status_str[0..status_len], 0..) |c, i| {
+            if (last_row + i < win.cells.len) {
+                win.cells[last_row + i] = .{ .ch = c, .style = .{ .reverse = true } };
+            }
+        }
+    }
+}
+
+/// Append an SSE text chunk to the cumulative buffer. Caller (the TUI
+/// thread) fires this on every `Event.StreamChunk` arrival.
+pub fn appendStreamChunk(io: std.Io, state: *State, text: []const u8) !void {
+    const payload = &state.agent_loop;
+    try payload.cumulative.appendSlice(payload.allocator, text);
+    const ns = std.Io.Timestamp.now(io, .real).nanoseconds;
+    payload.last_update_ms = @intCast(ns);
+}
+
 // =============================================================================
 // Internal helpers (test-friendly, no Zig std direct use beyond `std.Io`).
 // =============================================================================
@@ -886,6 +926,87 @@ test "ErrorModal dismiss returns to prior state" {
     try testing.expectEqual(PriorKind.agent_loop, state.error_modal.prior);
     dismissErrorModal(&state);
     try testing.expect(std.meta.activeTag(state) == .agent_loop);
+}
+
+// =============================================================================
+// Tests — task 3.7: AgentLoopView streaming viz (2 RED→GREEN tests).
+// =============================================================================
+
+test "AgentLoopView cumulative text appends across chunks" {
+    // REQ-TUI-010 scenario 1 — 3 sequential chunks ("Hello", " world", "!")
+    // produce cumulative "Hello world!".
+    var state: State = .{ .agent_loop = .{
+        .allocator = testing.allocator,
+        .cumulative = .empty,
+        .last_update_ms = 0,
+        .model = "MiniMax-M3",
+        .tokens = 0,
+    } };
+    defer state.agent_loop.cumulative.deinit(testing.allocator);
+
+    try appendStreamChunk(testing.io, &state, "Hello");
+    try appendStreamChunk(testing.io, &state, " world");
+    try appendStreamChunk(testing.io, &state, "!");
+
+    try testing.expectEqualStrings("Hello world!", state.agent_loop.cumulative.items);
+
+    // Render to WindowMock — the cumulative text should appear in row 0.
+    const win = try WindowMock.init(testing.allocator, 80, 24);
+    defer win.deinit();
+    try drawAgentLoopView(win, &state);
+    const snap = win.snapshot();
+    for ("Hello world!", 0..) |c, i| {
+        try testing.expectEqual(@as(u21, c), snap[i].ch);
+    }
+}
+
+test "AgentLoopView status bar timestamp updates on chunk arrival" {
+    // REQ-TUI-010 scenario 2 — last_update_ms is updated by every chunk;
+    // the value monotonically grows (>= previous). We use a busy-wait
+    // between calls to ensure the clock advances (rather than nanoseconds
+    // being identical in a fast test).
+    var state: State = .{ .agent_loop = .{
+        .allocator = testing.allocator,
+        .cumulative = .empty,
+        .last_update_ms = 0,
+        .model = "MiniMax-M3",
+        .tokens = 7,
+    } };
+    defer state.agent_loop.cumulative.deinit(testing.allocator);
+
+    try appendStreamChunk(testing.io, &state, "a");
+    const ts1 = state.agent_loop.last_update_ms;
+    try testing.expect(ts1 > 0);
+
+    // Spin a few ms so the clock advances.
+    var sleep_ts = std.os.linux.timespec{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+    _ = std.os.linux.nanosleep(&sleep_ts, null);
+
+    try appendStreamChunk(testing.io, &state, "b");
+    const ts2 = state.agent_loop.last_update_ms;
+    try testing.expect(ts2 >= ts1);
+
+    // Render to WindowMock — the status bar (last row) contains the
+    // tokens count + timestamp text.
+    const win = try WindowMock.init(testing.allocator, 80, 24);
+    defer win.deinit();
+    try drawAgentLoopView(win, &state);
+    const last_row_offset: usize = @as(usize, win.rows - 1) * @as(usize, win.cols);
+    const snap = win.snapshot();
+    // First chars of last row should be "model=MiniMax-M3 tokens=7 t="
+    const expected_prefix = "model=MiniMax-M3 tokens=7";
+    var matched = true;
+    for (expected_prefix, 0..) |c, i| {
+        if (last_row_offset + i >= snap.len) {
+            matched = false;
+            break;
+        }
+        if (snap[last_row_offset + i].ch != c) {
+            matched = false;
+            break;
+        }
+    }
+    try testing.expect(matched);
 }
 
 // =============================================================================
