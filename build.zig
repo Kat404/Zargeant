@@ -8,11 +8,26 @@ pub fn build(b: *std.Build) void {
         "Prioritize performance, safety, or fast compilation (Debug, ReleaseSafe, ReleaseFast)",
     ) orelse .Debug;
 
+    // mibu dep (github.com/xyaman/mibu, MIT, Zig 0.16 tested). Pinned at
+    // 636a36a353614da2a537b060c33f17d608915eab per build.zig.zon. The
+    // module is wired into tui_mod (always), test_mod (always), and
+    // tui-recovery R-PR 2 added lib_mod + exe_mod so main.zig can
+    // transitively pull in src/tui.zig → @import("mibu"). R-PR 4
+    // formalizes this addition per design#408 §2.3.
+    const mibu_dep = b.dependency("mibu", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const mibu_mod = mibu_dep.module("mibu");
+
     // lib: harness (static library)
     const lib_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/root.zig"),
+        .imports = &.{
+            .{ .name = "mibu", .module = mibu_mod },
+        },
     });
     const lib = b.addLibrary(.{
         .name = "harness",
@@ -26,6 +41,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/root.zig"),
+        .imports = &.{
+            .{ .name = "mibu", .module = mibu_mod },
+        },
     });
     exe_mod.single_threaded = false;
     const exe = b.addExecutable(.{
@@ -69,12 +87,6 @@ pub fn build(b: *std.Build) void {
     // vendor/libvaxis/ in the squashed-away 5 libvaxis commits, now wiped
     // from this branch) because libvaxis v0.5.1 transitive deps don't
     // compile on Zig 0.16 -- see obs#399 for the full replacement research.
-    const mibu_dep = b.dependency("mibu", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const mibu_mod = mibu_dep.module("mibu");
-
     const tui_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -115,6 +127,21 @@ pub fn build(b: *std.Build) void {
     const tui_test_decl = b.step("test-tui", "Run tests/tui/ in-file tests");
     tui_test_decl.dependOn(&run_tui_test.step);
     test_decl.dependOn(&run_tui_test.step);
+
+    // test step: tests/tui/mibu_pin.zig (R-PR 4, REQ-TUI-020).
+    // Pin reproducibility assertion — reads build.zig.zon and asserts
+    // both the git SHA fragment + the Zig hash form. Hash drift fails
+    // the build before any code change happens.
+    const mibu_pin_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/tui/mibu_pin.zig"),
+    });
+    const mibu_pin_test_step = b.addTest(.{ .root_module = mibu_pin_test_mod });
+    const run_mibu_pin_test = b.addRunArtifact(mibu_pin_test_step);
+    const mibu_pin_test_decl = b.step("test-tui-mibu-pin", "Run tests/tui/mibu_pin.zig (REQ-TUI-020)");
+    mibu_pin_test_decl.dependOn(&run_mibu_pin_test.step);
+    test_decl.dependOn(&run_mibu_pin_test.step);
 
     // test step: tools/debug_call.zig in-file grep-fail tests.
     // tls-handrolled (sdd id=323, T3.5): the in-file tests in

@@ -15,7 +15,7 @@ Zargeant is a **terminal-native AI agent harness**: a TUI that lets you drive an
 - **Minimal binary.** Zig 0.16 + stdlib only; ~200 KB–1.5 MB stripped, cold start < 50 ms.
 - **Hardened by design.** Every tool subprocess runs in a sandboxed copy of the agent's profile: deny-by-default filesystem rules via Landlock, syscall allowlist via Seccomp-BPF, no `ptrace`, no `mount`, no `bpf`.
 - **Headless observability.** A mandatory `src/logger.zig` writes to `/tmp/ai-harness-debug.log` (mode `0600`). The TUI takes raw mode on the terminal; **no** writes to `stdout` or `stderr`.
-- **Strict TDD.** Every slice ships with tests written **before** implementation. 41 tests pass on Debug + ReleaseSafe + ReleaseFast at the time of writing.
+- **Strict TDD.** Every slice ships with tests written **before** implementation. 186 tests pass on Debug + ReleaseSafe + ReleaseFast as of the tui-recovery R-PR 4 merge.
 
 ## Architecture
 
@@ -49,25 +49,59 @@ Three threads:
 
 ## Status
 
-In development. Three of seven planned slices are shipped on `main`:
+In development. Five of seven planned slices are shipped on `main`:
 
-| Slice                                     | Status       | Lines | Tests   |
-| ----------------------------------------- | ------------ | ----- | ------- |
-| Build toolchain (`build.zig` + `zig.zon`) | ✓ shipped    | 78    | 1 smoke |
-| Logger (`/tmp/ai-harness-debug.log`)      | ✓ shipped    | 609   | 15      |
-| Sandbox Linux (Landlock + Seccomp-BPF)    | ✓ shipped    | 1,615 | 25      |
-| API Client (MiniMax HTTP-SSE)             | 🚧 next      | —     | —       |
-| TUI (libvaxis + agent loop)               | 📋 planned   | —     | —       |
-| logger-macos-port                         | 📋 follow-up | —     | —       |
-| sandbox-macos                             | 📋 follow-up | —     | —       |
+| Slice                                     | Status         | Lines | Tests   |
+| ----------------------------------------- | -------------- | ----- | ------- |
+| Build toolchain (`build.zig` + `zig.zon`) | ✓ shipped      | 78    | 1 smoke |
+| Logger (`/tmp/ai-harness-debug.log`)      | ✓ shipped      | 609   | 15      |
+| Sandbox Linux (Landlock + Seccomp-BPF)    | ✓ shipped      | 1,615 | 25      |
+| API Client (MiniMax HTTP-SSE)             | ✓ shipped      | ~900  | ~12     |
+| TLS handrolled                            | ✓ shipped      | ~700  | ~8      |
+| TUI (mibu + 3-thread orchestrator)        | 🚧 R-PR 1-4 ✓ | ~2,700 | 186    |
+| logger-macos-port                         | 📋 follow-up   | —     | —       |
+| sandbox-macos                             | 📋 follow-up   | —     | —       |
 
-**Total**: 41 tests pass on `zig build test` (Debug + ReleaseSafe + ReleaseFast) as of the sandbox-linux slice.
+**Total**: 186 tests pass on `zig build test` (Debug + ReleaseSafe + ReleaseFast) as of the tui-recovery R-PR 4 merge. Slice 5 (TUI) is on the `tui-recovery` chained PR stack; see [Slice status — TUI](#slice-status--tui) below.
 
 ## Requirements
 
 - **Zig 0.16.0** — exact toolchain pinned (post-0.16 `std.posix.*` wrappers stripped; we use `std.os.linux.*` raw syscalls).
 - **Linux 5.13+** — Landlock ABI v1 is the floor. Tested on Arch Linux (kernel 6.x).
-- **No external runtime deps.** `zig.zon` declares `dependencies = .{}`. Everything links statically.
+- **One approved third-party dep: mibu** (see [Dependencies](#dependencies) below). Everything else links statically.
+
+## Dependencies
+
+zargeant has one approved third-party dep, and the rest of the stack is in-tree. The full dep audit is in [CONTRIBUTING.md](CONTRIBUTING.md#tui-dependency-mibu); the short version:
+
+| Component             | Source                                        | License | Pin                                      |
+| --------------------- | --------------------------------------------- | ------- | ---------------------------------------- |
+| **TUI render**        | [mibu](https://github.com/xyaman/mibu)        | MIT     | commit `636a36a353614da2a537b060c33f17d608915eab` |
+| **HTTP**              | `src/api_client.zig` + `src/api_sse.zig` (internal) | — | — |
+| **Crypto / TLS**      | `src/tls_conn.zig` (handrolled)               | —       | —                                        |
+| **Sandbox**           | `src/sandbox_linux.zig` (Landlock LSM + Seccomp-BPF) | — | —                                    |
+| **Mock HTTP server**  | `src/mock_server.zig` (internal)              | —       | —                                        |
+| **Logger**            | `src/logger.zig` → `/tmp/ai-harness-debug.log` (mode `0600`) | — | —                |
+
+The mibu pin is enforced by `tests/tui/mibu_pin.zig` (REQ-TUI-020). CI fails loud if the hash drifts. The decision to use mibu over libvaxis is recorded in [ADR 0001](docs/decisions/0001-libvaxis-to-mibu.md).
+
+To add a new third-party dep, write a new ADR under `docs/decisions/` first; see [CONTRIBUTING.md](CONTRIBUTING.md#no-new-third-party-deps-without-an-adr).
+
+## Slice status — TUI
+
+The TUI slice ships as a 5-PR chained stack on top of the `feat/tui` tracker. Each R-PR is its own PR against the previous one (feature-branch-chain topology); once all 5 land on `feat/tui`, a final PR aggregates `feat/tui` → `main`.
+
+| R-PR     | Theme                                              | Status          | PR                                                       | LoC    |
+| -------- | -------------------------------------------------- | --------------- | -------------------------------------------------------- | ------ |
+| R-PR 1   | channels + 3-thread runtime + plumbing             | ✓ shipped       | [#3](https://github.com/Kat404/Zargeant/pull/3)           | ~851   |
+| R-PR 2   | `main.zig` CLI + cold-start + `password_input` stub | ✓ shipped       | [#4](https://github.com/Kat404/Zargeant/pull/4)           | ~377   |
+| R-PR 3   | modals + real `password_input` + `WindowMock`      | ✓ shipped       | [#5](https://github.com/Kat404/Zargeant/pull/5)           | ~700   |
+| R-PR 4   | mibu lifecycle + render + integration              | ✓ shipped       | [#6](https://github.com/Kat404/Zargeant/pull/6)           | ~787   |
+| R-PR 5   | docs (ADR 0001 + `CONTRIBUTING.md` + this README)  | 🚧 this PR      | (opening)                                                | ~200   |
+
+**What's next:** R-PR 5 (this PR) lands; the user merges the tui-recovery chain into `feat/tui`; the cycle is then ready for `sdd-verify` + `sdd-archive` (final integration PR `feat/tui` → `main`).
+
+The full task breakdown (32 tasks across 5 R-PRs) lives in `sdd/tui-recovery/tasks` (engram). The TUI design is in `sdd/tui-recovery/design` and the spec in `sdd/tui-recovery/spec`. The libvaxis → mibu decision is in [ADR 0001](docs/decisions/0001-libvaxis-to-mibu.md).
 
 ## Build
 
@@ -193,10 +227,9 @@ Long-form documentation lives in `docs/`:
 
 ## Road to v1.0
 
-1. **API Client** — MiniMax HTTP-SSE client with retry/backoff. Mock HTTP server for tests (`test/mock-server.zig`).
-2. **TUI** — libvaxis + agent loop. Three-thread orchestrator (TUI | Agent | Tools). Wire `src/sandbox.zig::spawnToolSubprocess` into the tool dispatcher.
-3. **Cross-platform** — macOS (amd64 + arm64) port for logger + sandbox. Linux arm64.
-4. **Release automation** — GitHub Actions release pipeline; signed binaries.
+1. **TUI merge** — merge the tui-recovery chained PR stack into `feat/tui`; open final `feat/tui` → `main` PR to close slice 5.
+2. **Cross-platform** — macOS (amd64 + arm64) port for logger + sandbox. Linux arm64.
+3. **Release automation** — GitHub Actions release pipeline; signed binaries.
 
 ## Development workflow
 
@@ -222,7 +255,8 @@ Each slice is its own SDD cycle, persisted in Engram. Strict TDD is enforced: te
 ## Acknowledgments
 
 - Built on [Zig](https://ziglang.org) — Andrew Kelley and the Zig core team.
-- Inspired by [ratatui](https://github.com/ratatui/ratatui) for the Rust TUI ecosystem (zargeant uses libvaxis to stay in Zig-native territory).
+- TUI render surface: [mibu](https://github.com/xyaman/mibu) by xyaman (MIT) — see [ADR 0001](docs/decisions/0001-libvaxis-to-mibu.md) for the libvaxis → mibu decision.
+- Inspired by [ratatui](https://github.com/ratatui/ratatui) for the Rust TUI ecosystem.
 - Powered by [MiniMax](https://MiniMax.chat) for the inference API.
 
 ---
