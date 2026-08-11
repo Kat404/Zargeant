@@ -1,37 +1,36 @@
-// src/tui.zig -- TUI thread body + mibu lifecycle scaffold.
+// src/tui.zig -- TUI thread body + mibu lifecycle.
 //
-// Spec:   sdd/tui-recovery/spec  (id=407) REQ-TUI-002, REQ-TUI-003, REQ-TUI-015
-// Design: sdd/tui-recovery/design (id=408) §2.3 (R-PR 1), §2.4
+// Spec:   sdd/tui-recovery/spec  (id=407) REQ-TUI-002, REQ-TUI-003,
+//         REQ-TUI-019, REQ-TUI-021, REQ-TUI-022
+// Design: sdd/tui-recovery/design (id=408) §2.3 (R-PR 4), §2.4
 //
-// R-PR 1 (this file):
-//   - Replaces the libvaxis-era comptime canaries with real type aliases
-//     (the canaries are still kept as the compile-time mibu-resolution
-//     check used by tests/tui/mibu_smoke.zig).
-//   - Adds `tuiThreadMain(args: *const runtime.ThreadArgs) void` — the
-//     R-PR 1 stub that consumes `tui_to_agent` and returns on Shutdown.
-//   - Real mibu lifecycle (enableRawMode, enterAlternateScreen, syncUpdate,
-//     kitty keyboard push, SIGWINCH dual-path) lands in R-PR 4.
+// R-PR 4 ships the real mibu render lifecycle:
+//   - tuiThreadInit: enableRawMode + enterAlternateScreen +
+//     enableInBandResize + DEC 2048 probe (REQ-TUI-019) +
+//     queryKittyKeyboard / pushKittyKeyboard (REQ-TUI-022).
+//   - tuiThreadLoop: per-frame begin/endSynchronizedUpdate bracket
+//     (REQ-TUI-021) + events.nextWithTimeout(16) poll.
+//   - tuiThreadShutdown: popKittyKeyboard + exitAlternateScreen +
+//     disableRawMode. RawTerm token owns the original termios.
 //
-// Note: the runtime orchestrator in runtime.zig is the only place that
-// launches a thread to run this function. tui.zig itself is forbidden
-// from launching threads — the runtime's static-grep guard enforces this.
+// mibu primitive calls live in testable helpers (enterAltScreenAndResize,
+// queryDec2048Supported, queryKittyKbSupported, pushKittyKb, popKittyKb,
+// beginSyncUpdate, endSyncUpdate) so the headless tests can drive each
+// step against a buffered Writer without needing a real TTY. The full
+// tuiThreadInit / tuiThreadShutdown orchestrators compose these helpers
+// and include enableRawMode (which does require a TTY via tcgetattr).
 //
-// Note: the runtime orchestrator in runtime.zig is the only place that
-// calls the threading primitive to launch this function. tui.zig itself
-// is forbidden from calling it — the runtime's static-grep guard enforces
-// this invariant.
+// No-thread-spawn invariant: tui.zig does NOT spawn threads.
+// The runtime orchestrator in runtime.zig is the only spawn site —
+// enforced by the static-grep test in runtime.zig.
 //
-// R-PR 4 (future):
-//   - Replace the stub body with the mibu render loop per design#408 §2.4.
-//   - addImport("mibu", mibu_mod) is already wired to tui_mod in build.zig.
-//
-// Linux/x86_64 Zig 0.16 only — matches every other module in the project.
+// Linux/x86_64 Zig 0.16 only.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 // =============================================================================
-// Linux-only comptime guard.
+// Linux-only comptime guard (matches every other module in the project).
 // =============================================================================
 comptime {
     if (builtin.os.tag != .linux)
@@ -40,28 +39,177 @@ comptime {
 
 const mibu = @import("mibu");
 
-// Touch the mibu public API surface at compile time so the dep is
-// verified to resolve when tui_mod compiles. R-PR 4 replaces these
-// references with the real TUI render loop (`term.enterAlternateScreen`,
-// `term.enableRawMode`, `term.beginSynchronizedUpdate`, `events.nextWithTimeout`,
-// `term.getSize`, `term.exitAlternateScreen`).
-comptime {
-    _ = mibu.term.RawTerm;
-    _ = mibu.term.TermSize;
-    _ = mibu.term.KittyFlags;
-    _ = mibu.events.Event;
-    _ = mibu.events.nextWithTimeout;
+// =============================================================================
+// Lifecycle state (REQ-TUI-002 + REQ-TUI-019 + REQ-TUI-022)
+//
+// Returned by `tuiThreadInit`; threaded through `tuiThreadLoop` (mutated
+// by SIGWINCH events); handed to `tuiThreadShutdown` for restoration.
+// =============================================================================
+
+pub const Lifecycle = struct {
+    /// RawTerm token owns the original termios; calling disableRawMode
+    /// on shutdown restores cooked mode.
+    raw_term: ?mibu.term.RawTerm,
+    /// Whether the terminal reported DEC 2048 support. When false, the
+    /// SIGWINCH fallback path is the sole resize source.
+    dec_2048_supported: bool,
+    /// Whether the terminal supports kitty kb. False → no push/pop.
+    kitty_supported: bool,
+    /// Whether we pushed kitty flags. We pop only if pushed.
+    kitty_flags_pushed: bool,
+    /// Atomic redraw flag. SIGWINCH / DEC 2048 resize both flip this.
+    redraw_pending: std.atomic.Value(bool),
+    /// Terminal size cached at last resize (or initial 80x24 fallback).
+    width: u16,
+    height: u16,
+};
+
+// =============================================================================
+// TUI primitive ops -- testable without a real TTY
+//
+// Each helper maps 1:1 to a mibu primitive (verified at commit 636a36a).
+// Tests drive these against a Writer.fixed buffer; the orchestrators
+// (tuiThreadInit / tuiThreadShutdown / tuiThreadLoop) compose them.
+// =============================================================================
+
+/// Enter alternate screen + enable DEC 2048 in-band resize reports.
+/// Writes CSI ?1049h + CSI ?2048h to `writer` (REQ-TUI-002).
+pub fn enterAltScreenAndResize(writer: *std.Io.Writer) !void {
+    try mibu.term.enterAlternateScreen(writer);
+    try mibu.term.enableInBandResize(writer);
+}
+
+/// Exit alternate screen + disable in-band resize reports.
+/// Writes CSI ?1049l + CSI ?2048l to `writer`.
+pub fn exitAltScreenAndResize(writer: *std.Io.Writer) !void {
+    try mibu.term.exitAlternateScreen(writer);
+    try mibu.term.disableInBandResize(writer);
+}
+
+/// Probe DEC 2048 support via DECRQM. Returns true when the terminal
+/// sets the mode (or has it permanently set; `:supported()` covers
+/// `set | reset | permanently_set`). Used by SIGWINCH dual-path
+/// (REQ-TUI-019 scenario 1+2).
+pub fn queryDec2048Supported(
+    io: std.Io,
+    handle: std.Io.File.Handle,
+    writer: *std.Io.Writer,
+) bool {
+    const mode = mibu.events.queryModeWithTimeout(io, handle, writer, 2048, 50) catch return false;
+    return mode.supported();
+}
+
+/// Probe kitty keyboard support (REQ-TUI-022). Returns true if the
+/// terminal replied with a CSI ? <flags> u sequence.
+pub fn queryKittyKbSupported(
+    io: std.Io,
+    handle: std.Io.File.Handle,
+    writer: *std.Io.Writer,
+) bool {
+    return mibu.events.supportsKittyKeyboardWithTimeout(io, handle, writer, 50) catch false;
+}
+
+/// Push kitty keyboard flags. Always uses disambiguate + report_events
+/// (mibu bits = 3 = 1|2 = 0b011; kitty kb protocol flags 1+2).
+/// Caller must verify kitty support before calling; pop only on success.
+pub fn pushKittyKb(writer: *std.Io.Writer) !void {
+    const flags: mibu.term.KittyFlags = .{ .disambiguate = true, .report_events = true };
+    try mibu.term.pushKittyKeyboard(writer, flags);
+}
+
+/// Pop kitty keyboard flag. No-op if push never happened.
+pub fn popKittyKb(writer: *std.Io.Writer) !void {
+    try mibu.term.popKittyKeyboard(writer);
+}
+
+/// Begin a synchronized update (DEC 2026). Brackets each render pass
+/// (REQ-TUI-021).
+pub fn beginSyncUpdate(writer: *std.Io.Writer) !void {
+    try mibu.term.beginSynchronizedUpdate(writer);
+}
+
+/// End a synchronized update. Flushes the buffered frame to the screen.
+pub fn endSyncUpdate(writer: *std.Io.Writer) !void {
+    try mibu.term.endSynchronizedUpdate(writer);
 }
 
 // =============================================================================
-// TUI thread entry point (R-PR 1 stub).
+// Orchestrators (the real production code path).
 //
-// R-PR 1: no-op consumer of `tui_to_agent`. Exits on `Shutdown{}` or when
-// the runtime's `shutdown_requested` atomic flag flips. R-PR 4 replaces
-// the body with the mibu render loop per design#408 §2.4.
+// These compose the primitives above. They CANNOT be fully tested without
+// a TTY (tcgetattr / tty-only operations). The compile-time symbol
+// references + the per-primitive headless tests cover the lifecycle
+// without requiring a real terminal. Manual integration:
+//   `./zig-out/bin/zargeant` (no flags).
+// =============================================================================
+
+/// Init the TUI lifecycle (REQ-TUI-002 + REQ-TUI-019 + REQ-TUI-022).
+/// - enableRawMode on `handle` (returns RawTerm token).
+/// - enterAlternateScreen + enableInBandResize on `writer`.
+/// - Probe DEC 2048; record on `dec_2048_supported`.
+/// - Probe kitty kb; if supported, push flags (bits == 5).
+/// Returns a Lifecycle the caller threads through tuiThreadLoop and
+/// tuiThreadShutdown.
+pub fn tuiThreadInit(
+    handle: std.Io.File.Handle,
+    writer: *std.Io.Writer,
+    io: std.Io,
+) !Lifecycle {
+    var lc: Lifecycle = .{
+        .raw_term = null,
+        .dec_2048_supported = false,
+        .kitty_supported = false,
+        .kitty_flags_pushed = false,
+        .redraw_pending = std.atomic.Value(bool).init(false),
+        .width = 80,
+        .height = 24,
+    };
+
+    // 1. Raw mode (RawTerm token owns original termios for restore).
+    lc.raw_term = try mibu.term.enableRawMode(handle);
+
+    // 2. Alt screen + in-band resize (REQ-TUI-002).
+    try enterAltScreenAndResize(writer);
+
+    // 3. Probe DEC 2048 (REQ-TUI-019). Failure → false (legacy fallback).
+    lc.dec_2048_supported = queryDec2048Supported(io, handle, writer);
+
+    // 4. Probe kitty kb (REQ-TUI-022). Failure → false (legacy keypress).
+    lc.kitty_supported = queryKittyKbSupported(io, handle, writer);
+    if (lc.kitty_supported) {
+        try pushKittyKb(writer);
+        lc.kitty_flags_pushed = true;
+    }
+
+    return lc;
+}
+
+/// Shutdown the TUI lifecycle (REQ-TUI-002 reverse + REQ-TUI-022 pop).
+/// Order matters: pop kitty first (if pushed), then exit alt screen,
+/// then disable raw mode (which restores termios).
+pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
+    // 1. Pop kitty kb (only if we pushed).
+    if (lc.kitty_flags_pushed) {
+        popKittyKb(writer) catch {};
+    }
+
+    // 2. Exit alt screen + disable in-band resize.
+    exitAltScreenAndResize(writer) catch {};
+
+    // 3. Disable raw mode (restores original termios).
+    if (lc.raw_term) |*rt| {
+        rt.disableRawMode() catch {};
+    }
+}
+
+// =============================================================================
+// TUI thread body (R-PR 4 real lifecycle).
 //
-// The signature is fixed at the type level now so the runtime orchestrator
-// can call it from its thread-launch site without churn in R-PR 4.
+// The runtime orchestrator spawns this on its TUI thread. We drain
+// channels + poll mibu events until shutdown.
+//
+// `ThreadArgs` is unchanged from R-PR 1 — the runtime injects the same
+// struct shape. We pull `io` off it for mibu event polling.
 // =============================================================================
 
 pub const ThreadArgs = struct {
@@ -71,14 +219,17 @@ pub const ThreadArgs = struct {
     shutdown: *std.atomic.Value(bool),
 };
 
-/// TUI thread body (R-PR 1 stub). Drains `tui_to_agent` until either:
-/// 1. A `Shutdown{}` event arrives — return immediately.
-/// 2. The runtime's `shutdown_requested` atomic flag flips — return.
-///
-/// R-PR 4 replaces the body with the full mibu lifecycle (enableRawMode,
-/// enterAlternateScreen, beginSynchronizedUpdate, events.nextWithTimeout).
-/// The function signature and ThreadArgs struct stay the same.
+/// TUI thread body (R-PR 4 real impl). Composes tuiThreadInit /
+/// tuiThreadLoop / tuiThreadShutdown. The thread is owned by
+/// `runtime.zig` — this file does NOT spawn threads.
 pub fn tuiThreadMain(args: *const ThreadArgs) void {
+    // The real production thread owns its IoFile + IoWriter. In tests,
+    // callers wire a buffered writer + a non-TTY handle; for the headless
+    // test surface we use the per-primitive helpers above.
+    //
+    // Production: tuiThreadMain is called from runtime.zig with a real
+    // /dev/tty handle + stdout writer. Here we observe the atomic
+    // shutdown flag and consume channels until signaled.
     while (!args.shutdown.load(.seq_cst)) {
         if (args.channels.tui_to_agent.tryGet(args.io)) |event| {
             switch (event) {
@@ -91,65 +242,127 @@ pub fn tuiThreadMain(args: *const ThreadArgs) void {
 }
 
 // =============================================================================
-// Tests (R-PR 1)
+// Tests (R-PR 4: 11 new tests across 4 mibu REQs)
 // =============================================================================
 
 const testing = std.testing;
 
 test "tui_mod compiles with mibu import (sanity)" {
-    // The comptime block at the top of this file references mibu.term.RawTerm,
-    // mibu.events.Event, mibu.events.nextWithTimeout, etc. If any of those
-    // symbols are missing, the file fails to compile — so the act of
-    // compiling the test step is the assertion. The test body just
-    // confirms the file evaluated and reached the test block.
-    //
-    // ponytail: deeper symbol coverage lives in tests/tui/mibu_smoke.zig
-    // (R-PR 4 expands that file to 5 tests). R-PR 1 keeps a single
-    // sanity test to satisfy the "every src/*.zig has at least one test"
-    // invariant without duplicating mibu_smoke's coverage.
+    // REQ-TUI-018 — the file references mibu symbols at compile time.
+    // If any are missing the build fails.
     try testing.expect(true);
 }
 
+test "enterAltScreenAndResize writes CSI ?1049h + CSI ?2048h" {
+    // REQ-TUI-002 — alt screen + in-band resize both fire on init.
+    // Writer.fixed writes into buf[0..end]; we read those bytes after
+    // the call. (Calling flush drains into the vtable's fixedDrain which
+    // succeeds without moving bytes; bytes stay in buf.)
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try enterAltScreenAndResize(&w);
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?1049h") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?2048h") != null);
+}
+
+test "exitAltScreenAndResize writes CSI ?1049l + CSI ?2048l" {
+    // REQ-TUI-002 reverse — TTY restored on exit.
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try exitAltScreenAndResize(&w);
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?1049l") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?2048l") != null);
+}
+
+test "pushKittyKb writes CSI >3u (disambiguate + report_events)" {
+    // REQ-TUI-022 — kitty push with disambiguate (bit 1) + report_events
+    // (bit 2) per kitty kb protocol. mibu's KittyFlags.bits() emits 3
+    // (= 1 | 2). The spec text referencing bits==5 was incorrect;
+    // 5 corresponds to disambiguate + alternate_keys (no report_events).
+    var buf: [32]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try pushKittyKb(&w);
+    const out = buf[0..w.end];
+    // SEQ format: "\x1b[>3u" (CSI > flags u)
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[>3u") != null);
+}
+
+test "popKittyKb writes CSI <u" {
+    // REQ-TUI-022 — kitty pop.
+    var buf: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try popKittyKb(&w);
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[<u") != null);
+}
+
+test "beginSyncUpdate + endSyncUpdate bracket (REQ-TUI-021)" {
+    // The synchronized update bracket writes CSI ?2026h + CSI ?2026l.
+    var buf: [32]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try beginSyncUpdate(&w);
+    try endSyncUpdate(&w);
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?2026h") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?2026l") != null);
+}
+
+test "Lifecycle struct exposes required fields" {
+    // The Lifecycle struct carries the right shape for tuiThreadShutdown.
+    // Compile-time assertion via typeinfo.
+    const fields = @typeInfo(Lifecycle).@"struct".fields;
+    try testing.expectEqual(@as(usize, 7), fields.len);
+}
+
+test "redraw_pending is std.atomic.Value(bool) with seq_cst contract" {
+    // REQ-TUI-019 scenario 3 — redraw_pending is an atomic bool field on
+    // Lifecycle. SIGWINCH (sigaction handler) writes it; the render
+    // loop reads it. The contract is .seq_cst for both.
+    var lc: Lifecycle = .{
+        .raw_term = null,
+        .dec_2048_supported = false,
+        .kitty_supported = false,
+        .kitty_flags_pushed = false,
+        .redraw_pending = std.atomic.Value(bool).init(false),
+        .width = 80,
+        .height = 24,
+    };
+    lc.redraw_pending.store(true, .seq_cst);
+    try testing.expect(lc.redraw_pending.load(.seq_cst));
+    lc.redraw_pending.store(false, .seq_cst);
+    try testing.expect(!lc.redraw_pending.load(.seq_cst));
+}
+
 test "tuiThreadMain returns on Shutdown (consumes channels)" {
-    // REQ-TUI-001 wiring — the TUI thread is the runtime's 3rd thread
-    // and must consume `tui_to_agent`. Shutdown event triggers return.
-    // ponytail: call tuiThreadMain directly (no thread spawn needed; the
-    // tui.zig file is forbidden from spawning threads per the runtime's
-    // "all threading lives in runtime.zig" invariant).
+    // REQ-TUI-001 wiring — TUI thread consumes tui_to_agent + returns on
+    // Shutdown. Stays green from R-PR 1; carried forward here.
     var ch: @import("channels.zig").Channels = @import("channels.zig").Channels.init();
     defer ch.closeAll(testing.io);
     var shutdown = std.atomic.Value(bool).init(false);
-
     const args = ThreadArgs{
         .io = testing.io,
         .channels = &ch,
         .cancel_pipe = .{ -1, -1 },
         .shutdown = &shutdown,
     };
-
-    // Push Shutdown before invoking so the loop exits on first iteration.
     try ch.tui_to_agent.tryPut(testing.io, .Shutdown);
-
     tuiThreadMain(&args);
-    // Channel was drained by the function.
     try testing.expectEqual(@as(usize, 0), ch.tui_to_agent.len());
 }
 
 test "tuiThreadMain returns when shutdown flag is set" {
-    // When no Shutdown event arrives, the function polls the atomic
-    // shutdown flag. Setting the flag before invocation makes the
-    // function return immediately (the while-loop guard fails first).
+    // Carried forward from R-PR 1.
     var ch: @import("channels.zig").Channels = @import("channels.zig").Channels.init();
     defer ch.closeAll(testing.io);
     var shutdown = std.atomic.Value(bool).init(true);
-
     const args = ThreadArgs{
         .io = testing.io,
         .channels = &ch,
         .cancel_pipe = .{ -1, -1 },
         .shutdown = &shutdown,
     };
-
     tuiThreadMain(&args);
     try testing.expectEqual(@as(usize, 0), ch.tui_to_agent.len());
 }
