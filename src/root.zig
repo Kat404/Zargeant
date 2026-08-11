@@ -11,7 +11,6 @@
 // a88fb85 (RED NFRs), 3327317 (GREEN TLS deferral), cd57c99 (dup2-of-pipe).
 // See apply-progress id= for the merged PR 1 + PR 2 + PR 3 evidence.
 const std = @import("std");
-pub const harness = @import("harness.zig");
 pub const version = @import("version.zig");
 pub const logger = @import("logger.zig");
 pub const sandbox = @import("sandbox.zig");
@@ -44,7 +43,6 @@ comptime {
     _ = logger.Level;
     _ = logger.Logger;
     _ = logger.defaultPath;
-    _ = harness.harness_placeholder;
     _ = sandbox.Sandbox;
     _ = sandbox.ToolSubprocess;
     _ = api_client.Client;
