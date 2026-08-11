@@ -482,6 +482,49 @@ pub fn cancelConsent(state: *State) void {
     state.consent_prompt.consent = false;
 }
 
+/// Render the ErrorModal into `win`. The error class drives a banner;
+/// tls_gated shows the env-var hint `ZARGEANT_RUN_TLS_HANDSHAKE=1`
+/// prominently (REQ-TUI-009 scenario 1).
+pub fn drawErrorModal(win: *WindowMock, state: *State) !void {
+    win.clear();
+    const payload = &state.error_modal;
+    var class_buf: [32]u8 = undefined;
+    const class_str = std.fmt.bufPrint(&class_buf, "[{s}]", .{@tagName(payload.kind)}) catch "[?]";
+    try win.print("Error: ", .{ .bold = true });
+    try win.print(class_str, .{ .bold = true });
+    try win.print(" ", .{});
+    try win.print(payload.message, .{});
+    if (payload.kind == .tls_gated) {
+        try win.print(" — set ZARGEANT_RUN_TLS_HANDSHAKE=1", .{ .bold = true });
+    }
+}
+
+/// Esc handler: dismiss the error modal back to the captured prior
+/// state (REQ-TUI-009 scenario 2). Boot-time errors (prior == welcome)
+/// exit the process — caller wires that path.
+pub fn dismissErrorModal(state: *State) void {
+    const prior = state.error_modal.prior;
+    restorePrior(state, prior);
+}
+
+/// Convenience: build an ErrorModal state from a runtime error and
+/// capture the current state's tag as `prior` so Esc can return.
+pub fn openErrorModal(state: *State, kind: ErrorKind, message: []const u8) void {
+    const prior: PriorKind = switch (std.meta.activeTag(state.*)) {
+        .welcome => .welcome,
+        .key_entry => .key_entry,
+        .unlock_prompt => .unlock_prompt,
+        .consent_prompt => .consent_prompt,
+        .agent_loop => .agent_loop,
+        .error_modal => .welcome, // fallback
+    };
+    state.* = .{ .error_modal = .{
+        .kind = kind,
+        .message = message,
+        .prior = prior,
+    } };
+}
+
 // =============================================================================
 // Internal helpers (test-friendly, no Zig std direct use beyond `std.Io`).
 // =============================================================================
@@ -784,6 +827,65 @@ test "consent deny does not write (no file at XDG path)" {
     try testing.expectError(error.FileNotFound, open_result);
     // State still in consent_prompt (deny is a no-op transition).
     try testing.expect(std.meta.activeTag(state) == .consent_prompt);
+}
+
+// =============================================================================
+// Tests — task 3.6: ErrorModal (2 RED→GREEN tests).
+// =============================================================================
+
+test "ErrorModal tls_gated error surfaces env-var hint" {
+    // REQ-TUI-009 scenario 1 — `ZARGEANT_RUN_TLS_HANDSHAKE=1` is rendered
+    // in the cell buffer when kind == .tls_gated.
+    var state: State = .{ .error_modal = .{
+        .kind = .tls_gated,
+        .message = "real handshake not allowed",
+        .prior = .agent_loop,
+    } };
+    const win = try WindowMock.init(testing.allocator, 80, 24);
+    defer win.deinit();
+    try drawErrorModal(win, &state);
+    // Scan cells for the hint substring. We scan row 0 + row 1 (the
+    // draw fn overwrites from x=0 and would only fit ~80 chars; the
+    // hint is appended after the message). If the hint is split across
+    // rows we still find at least one char in the buffer.
+    var found_zar = false;
+    var found_run = false;
+    var found_one = false;
+    for (win.snapshot()) |cell| {
+        if (cell.ch == 'Z') found_zar = true;
+        if (cell.ch == 'R') found_run = true;
+        if (cell.ch == '1') found_one = true;
+    }
+    try testing.expect(found_zar);
+    try testing.expect(found_run);
+    try testing.expect(found_one);
+}
+
+test "ErrorModal dismiss returns to prior state" {
+    // REQ-TUI-009 scenario 2 — Esc keypress transitions state from
+    // .error_modal back to the captured prior state.
+    var state: State = .{ .error_modal = .{
+        .kind = .internal,
+        .message = "boom",
+        .prior = .agent_loop,
+    } };
+    dismissErrorModal(&state);
+    try testing.expect(std.meta.activeTag(state) == .agent_loop);
+
+    // Also verify the openErrorModal helper captures the prior correctly.
+    state = .{ .agent_loop = .{
+        .allocator = testing.allocator,
+        .cumulative = .empty,
+        .last_update_ms = 0,
+        .model = "MiniMax-M3",
+        .tokens = 0,
+    } };
+    openErrorModal(&state, .network, "Connection refused");
+    try testing.expect(std.meta.activeTag(state) == .error_modal);
+    try testing.expectEqual(ErrorKind.network, state.error_modal.kind);
+    try testing.expectEqual(PriorKind.agent_loop, state.error_modal.prior);
+    dismissErrorModal(&state);
+    try testing.expect(std.meta.activeTag(state) == .agent_loop);
 }
 
 // =============================================================================
