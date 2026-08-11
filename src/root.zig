@@ -22,11 +22,13 @@ pub const mock_server = @import("mock_server.zig");
 pub const fixtures_test = @import("fixtures_test.zig");
 
 // tui-recovery R-PR 1: re-exports for the runtime surface modules. The
-// channels module is imported here so its in-file tests are picked up by
-// `zig build test` (test_mod root = src/root.zig). The remaining re-exports
-// (runtime, tui, modal, password_input, main_mod) land in the root.zig
-// re-exports commit at the end of R-PR 1.
+// channels and runtime modules are imported here so their in-file tests
+// are picked up by `zig build test` (test_mod root = src/root.zig). The
+// remaining re-exports (tui, modal, password_input, main_mod) land in
+// the root.zig re-exports commit at the end of R-PR 1.
 pub const channels = @import("channels.zig");
+pub const runtime = @import("runtime.zig");
+pub const tui = @import("tui.zig");
 
 // ponytail: stub main for the build-toolchain slice. exe.entry = .disabled
 // skips the entry-point link, but std.start.zig still needs root.main to exist
@@ -58,6 +60,11 @@ comptime {
     _ = channels.Channel;
     _ = channels.Channels;
     _ = channels.pushSseChunk;
+    _ = runtime.Runtime;
+    _ = runtime.Config;
+    _ = runtime.ThreadArgs;
+    _ = tui.tuiThreadMain;
+    _ = tui.ThreadArgs;
 }
 
 // Re-export logger public API at the root namespace so that downstream
