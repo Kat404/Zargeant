@@ -24,18 +24,19 @@ pub const fixtures_test = @import("fixtures_test.zig");
 // channels, runtime, and tui modules are imported here so their in-file
 // tests are picked up by `zig build test` (test_mod root = src/root.zig).
 //
+// R-PR 2 re-exports: main_mod (the new entry point). The password_input
+// scaffold lands in T2.3 of R-PR 2 with its own re-export commit.
 // Future re-exports (added in subsequent R-PRs when the modules exist):
-//   - src/modal.zig         → pub const modal          (R-PR 3)
-//   - src/password_input.zig → pub const password_input (R-PR 2 stub, R-PR 3 real)
-//   - src/main.zig          → pub const main_mod       (R-PR 2)
+//   - src/modal.zig → pub const modal (R-PR 3)
 pub const channels = @import("channels.zig");
 pub const runtime = @import("runtime.zig");
 pub const tui = @import("tui.zig");
+pub const main_mod = @import("main.zig");
 
-// ponytail: stub main for the build-toolchain slice. exe.entry = .disabled
-// skips the entry-point link, but std.start.zig still needs root.main to exist
-// at semantic-analysis time. The TUI slice replaces this with the real entry.
-pub fn main() void {}
+// R-PR 2 replaces the R-PR 0 build-toolchain placeholder main with the
+// real entry from src/main.zig. The exe is built with root.zig as the
+// root; re-exporting `main` here wires the binary entry to the real impl.
+pub const main = main_mod.main;
 
 // Touch logger/sandbox/api-client/api-sse/api-auth/mock-server types so the
 // test runner pulls in src/{logger,sandbox,api_client,api_sse,api_auth}.zig
@@ -66,6 +67,9 @@ comptime {
     _ = runtime.ThreadArgs;
     _ = tui.tuiThreadMain;
     _ = tui.ThreadArgs;
+    _ = main_mod.main;
+    _ = main_mod.parseArgs;
+    _ = main_mod.usage;
 }
 
 // Re-export logger public API at the root namespace so that downstream
@@ -108,4 +112,7 @@ test "root.zig re-exports are wired" {
     try std.testing.expect(channels == @import("channels.zig"));
     try std.testing.expect(runtime == @import("runtime.zig"));
     try std.testing.expect(tui == @import("tui.zig"));
+    // tui-recovery R-PR 2 re-exports (T2.1): main_mod + main alias.
+    try std.testing.expect(main_mod == @import("main.zig"));
+    try std.testing.expect(main == main_mod.main);
 }
