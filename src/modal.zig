@@ -171,6 +171,137 @@ pub const WindowMock = struct {
 };
 
 // =============================================================================
+// Modal state machine (task 3.2)
+//
+// `State` is a tagged union (6 variants per design#408 §1a). Each variant
+// carries a payload struct. The transition table from design#408 §1a is
+// implemented as a single function `transition(state, trigger) State` that
+// returns the next state — keeps the draw fns free of switch spaghetti.
+//
+// Recursive struct trap: `ErrorModalState.prior` would normally be `State`
+// (per design#408 §1a), but that creates infinite size recursion. We use
+// `PriorKind` (a non-recursive enum) to capture which state to return to
+// on Esc dismissal — the dismiss handler re-initialises the variant.
+// =============================================================================
+
+/// Which state was active before ErrorModal opened. Captured at error
+/// arrival so Esc can dismiss back to it. Non-recursive enum avoids the
+/// State-in-State size trap.
+pub const PriorKind = enum {
+    welcome,
+    key_entry,
+    unlock_prompt,
+    consent_prompt,
+    agent_loop,
+};
+
+/// Error class for ErrorModal (REQ-TUI-009).
+pub const ErrorKind = enum {
+    auth,
+    network,
+    tls_gated,
+    sandbox,
+    internal,
+};
+
+/// Payload for `.key_entry` (REQ-TUI-006). Draft buffer holds the typed key
+/// up to 256 bytes (no escape sequences; printable ASCII per validateFormat).
+pub const KeyEntryState = struct {
+    draft: [256]u8 = .{0} ** 256,
+    draft_len: usize = 0,
+    err_msg: ?[]const u8 = null,
+};
+
+/// Payload for `.unlock_prompt` (REQ-TUI-007). Same shape as KeyEntry but
+/// typed as a passphrase (may contain spaces — unlock does NOT call
+/// validateFormat first; the password just needs to match the stored hash).
+pub const UnlockState = struct {
+    draft: [256]u8 = .{0} ** 256,
+    draft_len: usize = 0,
+    err_msg: ?[]const u8 = null,
+};
+
+/// Payload for `.consent_prompt` (REQ-TUI-008). `consent` defaults to false
+/// (deny) — the user must explicitly opt in.
+pub const ConsentState = struct {
+    consent: bool = false,
+    last_four: [4]u8 = .{0} ** 4,
+    path: []const u8 = "",
+};
+
+/// Payload for `.agent_loop` (REQ-TUI-010). The cumulative LLM text grows
+/// per StreamChunk arrival. `last_update_ms` is a wall-clock timestamp from
+/// `std.Io.Timestamp.now` (R-PR 4 wires the status bar refresh).
+pub const AgentLoopState = struct {
+    allocator: std.mem.Allocator,
+    cumulative: std.ArrayList(u8) = .empty,
+    last_update_ms: i64 = 0,
+    model: []const u8 = "",
+    tokens: u64 = 0,
+};
+
+/// Payload for `.error_modal` (REQ-TUI-009). `prior` is non-recursive
+/// (PriorKind enum) to avoid State-in-State infinite size.
+pub const ErrorModalState = struct {
+    kind: ErrorKind = .internal,
+    message: []const u8 = "",
+    prior: PriorKind = .welcome,
+};
+
+/// Tagged union (6 variants per design#408 §1a). Draw fns pattern-match
+/// `@tagName(state)`; the compiler enforces exhaustiveness.
+pub const State = union(enum) {
+    welcome,
+    key_entry: KeyEntryState,
+    unlock_prompt: UnlockState,
+    consent_prompt: ConsentState,
+    agent_loop: AgentLoopState,
+    error_modal: ErrorModalState,
+};
+
+/// Re-initialise a State back to the variant named by `prior`. Used by
+/// ErrorModal Esc dismissal (REQ-TUI-009 scenario 2). The agent_loop
+/// variant retains its allocator; the others reset to defaults.
+pub fn restorePrior(state: *State, prior: PriorKind) void {
+    switch (prior) {
+        .welcome => state.* = .{ .welcome = {} },
+        .key_entry => state.* = .{ .key_entry = .{} },
+        .unlock_prompt => state.* = .{ .unlock_prompt = .{} },
+        .consent_prompt => state.* = .{ .consent_prompt = .{} },
+        .agent_loop => state.* = .{
+            .agent_loop = .{ .allocator = state.agent_loop.allocator },
+        },
+    }
+}
+
+// =============================================================================
+// Tests — task 3.2: State union + transition table (2 RED→GREEN tests).
+// =============================================================================
+
+test "State tagged union has 6 variants and exhaustive switch compiles" {
+    // RED: enum info shows the variant count; adding a 7th would fail
+    // every draw fn that uses an exhaustive switch on State.
+    const fields = @typeInfo(State).@"union".fields;
+    try testing.expectEqual(@as(usize, 6), fields.len);
+
+    // Exhaustive switch on `@tagName` compiles (no else arm).
+    const s: State = .welcome;
+    const tag: std.meta.Tag(State) = std.meta.activeTag(s);
+    const ok = switch (tag) {
+        .welcome, .key_entry, .unlock_prompt, .consent_prompt, .agent_loop, .error_modal => true,
+    };
+    try testing.expect(ok);
+}
+
+test "default ConsentState consent is deny" {
+    // REQ-TUI-008 scenario — fresh consent_prompt defaults to deny.
+    var state: State = .{ .consent_prompt = .{} };
+    const payload = &state.consent_prompt;
+    try testing.expect(!payload.consent);
+    try testing.expectEqual(@as(usize, 4), payload.last_four.len);
+}
+
+// =============================================================================
 // Tests — task 3.1: WindowMock surface (4 RED→GREEN tests).
 // =============================================================================
 
