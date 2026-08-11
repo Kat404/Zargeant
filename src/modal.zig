@@ -434,6 +434,54 @@ pub fn cancelUnlock(state: *State) void {
     state.* = .{ .key_entry = .{} };
 }
 
+/// Render the ConsentPrompt modal into `win`. Pure renderer — does NOT
+/// mutate state. Callers drive `consent_prompt → agent_loop` via
+/// `submitConsentGrant` (REQ-TUI-008).
+pub fn drawConsentPrompt(win: *WindowMock, state: *State) !void {
+    win.clear();
+    const payload = &state.consent_prompt;
+    try win.print("Store key at ", .{});
+    try win.print(payload.path, .{ .underline = true });
+    try win.print(" (mode 0o600, last-4 ", .{});
+    try win.print(&payload.last_four, .{ .bold = true });
+    try win.print(")?", .{});
+}
+
+/// On consent grant (user typed `yes`), call `api_auth.writeWithConsent`
+/// to persist the key with mode 0o600 (REQ-TUI-008 scenario 1).
+///
+/// On consent deny (user typed `no` or Esc): no file is written.
+///
+/// Caller passes the key bytes (typed in KeyEntry.draft before the
+/// transition). We zero them after the write.
+pub fn submitConsentGrant(io: std.Io, key: []const u8, state: *State) !void {
+    if (!state.consent_prompt.consent) {
+        // Deny: explicit no — leave state in consent_prompt with deny.
+        return;
+    }
+    const path = state.consent_prompt.path;
+    api_auth.writeWithConsent(io, key, path, true) catch |err| {
+        // Write failed: log via logger + stay in consent_prompt.
+        var buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "writeWithConsent failed: {s}", .{@errorName(err)}) catch "write failed";
+        logger.global().log(io, .warn, msg) catch {};
+        return;
+    };
+    // Advance to agent_loop.
+    state.* = .{ .agent_loop = .{
+        .allocator = io_allocator(io),
+        .cumulative = .empty,
+        .last_update_ms = 0,
+        .model = "MiniMax-M3",
+        .tokens = 0,
+    } };
+}
+
+/// Esc handler for the ConsentPrompt modal: deny + cancel (no write).
+pub fn cancelConsent(state: *State) void {
+    state.consent_prompt.consent = false;
+}
+
 // =============================================================================
 // Internal helpers (test-friendly, no Zig std direct use beyond `std.Io`).
 // =============================================================================
@@ -673,6 +721,69 @@ test "Unlock wrong passphrase redisplay" {
     try drawUnlock(win, &state);
     try testing.expect(std.meta.activeTag(state) == .unlock_prompt);
     try testing.expect(state.unlock_prompt.err_msg != null);
+}
+
+// =============================================================================
+// Tests — task 3.5: ConsentPrompt modal (2 RED→GREEN tests + 1 integration).
+// =============================================================================
+
+test "consent grant writes credentials.json 0o600 (modal integration)" {
+    // REQ-TUI-008 scenario 1 — full integration: consent grant triggers
+    // api_auth.writeWithConsent which writes a 0o600 file at the XDG path.
+    // We point the path at a tmp dir to keep the test hermetic.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &dir_buf);
+    const path = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds.json" });
+    defer testing.allocator.free(path);
+
+    var state: State = .{
+        .consent_prompt = .{
+            .consent = true,
+            .last_four = "CDEF".*,
+            .path = path,
+        },
+    };
+    try submitConsentGrant(testing.io, "test-key-1234567890ABCDEF", &state);
+
+    // File must exist with mode 0o600.
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
+    defer _ = std.os.linux.close(fd);
+    const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const stat = try std.Io.File.stat(file, testing.io);
+    const mode: u32 = @intCast(@as(std.posix.mode_t, @bitCast(stat.permissions.toMode())) & 0o777);
+    try testing.expectEqual(@as(u32, 0o600), mode);
+
+    // State advanced to .agent_loop.
+    try testing.expect(std.meta.activeTag(state) == .agent_loop);
+}
+
+test "consent deny does not write (no file at XDG path)" {
+    // REQ-TUI-008 scenario 2 — consent deny (consent=false) returns
+    // immediately; the file at the XDG path does NOT exist.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &dir_buf);
+    const path = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds.json" });
+    defer testing.allocator.free(path);
+
+    var state: State = .{
+        .consent_prompt = .{
+            .consent = false,
+            .last_four = "CDEF".*,
+            .path = path,
+        },
+    };
+    try submitConsentGrant(testing.io, "test-key-1234567890ABCDEF", &state);
+
+    // File must NOT exist.
+    const open_result = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
+    try testing.expectError(error.FileNotFound, open_result);
+    // State still in consent_prompt (deny is a no-op transition).
+    try testing.expect(std.meta.activeTag(state) == .consent_prompt);
 }
 
 // =============================================================================
