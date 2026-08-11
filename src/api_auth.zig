@@ -486,8 +486,13 @@ test "no automatic key sources" {
         "$MINIMAX_API_KEY", "$OPENAI_API_KEY", "$ANTHROPIC_API_KEY",
     };
     const targets = [_][]const u8{
-        "src/api_client.zig",   "src/api_sse.zig", "src/api_auth.zig",
+        // 4 original targets (per tui spec#379):
+        "src/api_client.zig",   "src/api_sse.zig",  "src/api_auth.zig",
         "tools/debug_call.zig",
+        // 6 new TUI targets (tui-recovery R-PR 1 per design#408 §2.3):
+        "src/channels.zig", "src/runtime.zig",
+        "src/tui.zig",          "src/main.zig",     "src/password_input.zig",
+        "src/modal.zig",
     };
     const io = testing.io;
     for (targets) |path| {
