@@ -1,0 +1,3 @@
+hello\x1B[2J world\x1B[31mRED\x1B[0m
+\x1B]0;injected title\x07harmless text
+malicious: \x1b(B \x1b)0 goodbye

@@ -128,6 +128,21 @@ pub fn build(b: *std.Build) void {
     tui_test_decl.dependOn(&run_tui_test.step);
     test_decl.dependOn(&run_tui_test.step);
 
+    // test step: tests/tui/mibu_pin.zig (R-PR 4, REQ-TUI-020).
+    // Pin reproducibility assertion — reads build.zig.zon and asserts
+    // both the git SHA fragment + the Zig hash form. Hash drift fails
+    // the build before any code change happens.
+    const mibu_pin_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/tui/mibu_pin.zig"),
+    });
+    const mibu_pin_test_step = b.addTest(.{ .root_module = mibu_pin_test_mod });
+    const run_mibu_pin_test = b.addRunArtifact(mibu_pin_test_step);
+    const mibu_pin_test_decl = b.step("test-tui-mibu-pin", "Run tests/tui/mibu_pin.zig (REQ-TUI-020)");
+    mibu_pin_test_decl.dependOn(&run_mibu_pin_test.step);
+    test_decl.dependOn(&run_mibu_pin_test.step);
+
     // test step: tools/debug_call.zig in-file grep-fail tests.
     // tls-handrolled (sdd id=323, T3.5): the in-file tests in
     // tools/debug_call.zig MUST be wired into a separate test step so
