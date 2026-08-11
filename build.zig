@@ -87,6 +87,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/root.zig"),
+        .imports = &.{
+            .{ .name = "mibu", .module = mibu_mod },
+        },
     });
     test_mod.addIncludePath(b.path("test"));
     const test_step = b.addTest(.{ .root_module = test_mod });
