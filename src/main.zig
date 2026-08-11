@@ -259,3 +259,49 @@ test "warnIfColdStartExceeded does not log when <=50ms" {
     defer testing.allocator.free(contents);
     try testing.expectEqual(@as(usize, 0), contents.len);
 }
+
+// =============================================================================
+// R-PR 4 tests — REQ-TUI-017 scenario 2/3 (--mock → mock_server, --tls-gated
+// → env var injection). The CLI parser produces ParsedArgs; we verify
+// the threading to runtime.Config shape.
+// =============================================================================
+
+const runtime_cfg = @import("runtime.zig").Config;
+
+test "Runtime.Config mock_mode threaded from --mock" {
+    // REQ-TUI-017 scenario 2 — --mock routes the Agent through
+    // mock_server.zig via the runtime.Config.mock_mode flag.
+    const argv = [_][]const u8{ "zargeant", "--mock" };
+    const parsed = try parseArgs(&argv);
+    const cfg: runtime_cfg = .{
+        .mock_mode = parsed.mock_mode,
+        .tls_gated = parsed.tls_gated,
+    };
+    try testing.expect(cfg.mock_mode);
+    try testing.expect(!cfg.tls_gated);
+}
+
+test "Runtime.Config tls_gated threaded from --tls-gated" {
+    // REQ-TUI-017 scenario 3 — --tls-gated sets ZARGEANT_RUN_TLS_HANDSHAKE=1
+    // via the runtime.Config.tls_gated flag (the Agent thread sets the env
+    // var at startup, see runtime.zig).
+    const argv = [_][]const u8{ "zargeant", "--tls-gated" };
+    const parsed = try parseArgs(&argv);
+    const cfg: runtime_cfg = .{
+        .mock_mode = parsed.mock_mode,
+        .tls_gated = parsed.tls_gated,
+    };
+    try testing.expect(cfg.tls_gated);
+    try testing.expect(!cfg.mock_mode);
+}
+
+test "Runtime.Config defaults when neither flag is set" {
+    const argv = [_][]const u8{"zargeant"};
+    const parsed = try parseArgs(&argv);
+    const cfg: runtime_cfg = .{
+        .mock_mode = parsed.mock_mode,
+        .tls_gated = parsed.tls_gated,
+    };
+    try testing.expect(!cfg.mock_mode);
+    try testing.expect(!cfg.tls_gated);
+}
