@@ -21,10 +21,13 @@ pub const mock_server = @import("mock_server.zig");
 pub const fixtures_test = @import("fixtures_test.zig");
 
 // tui-recovery R-PR 1: re-exports for the runtime surface modules. The
-// channels and runtime modules are imported here so their in-file tests
-// are picked up by `zig build test` (test_mod root = src/root.zig). The
-// remaining re-exports (tui, modal, password_input, main_mod) land in
-// the root.zig re-exports commit at the end of R-PR 1.
+// channels, runtime, and tui modules are imported here so their in-file
+// tests are picked up by `zig build test` (test_mod root = src/root.zig).
+//
+// Future re-exports (added in subsequent R-PRs when the modules exist):
+//   - src/modal.zig         → pub const modal          (R-PR 3)
+//   - src/password_input.zig → pub const password_input (R-PR 2 stub, R-PR 3 real)
+//   - src/main.zig          → pub const main_mod       (R-PR 2)
 pub const channels = @import("channels.zig");
 pub const runtime = @import("runtime.zig");
 pub const tui = @import("tui.zig");
@@ -101,4 +104,8 @@ test "root.zig re-exports are wired" {
     try std.testing.expect(Client == api_client.Client);
     try std.testing.expect(Request == api_client.Request);
     try std.testing.expect(tls_conn == api_client.tls_conn);
+    // tui-recovery R-PR 1 re-exports (REQ-ROOT-001):
+    try std.testing.expect(channels == @import("channels.zig"));
+    try std.testing.expect(runtime == @import("runtime.zig"));
+    try std.testing.expect(tui == @import("tui.zig"));
 }
