@@ -69,6 +69,8 @@ comptime {
     _ = tui.ThreadArgs;
     _ = main_mod.main;
     _ = main_mod.parseArgs;
+    _ = main_mod.warnIfColdStartExceeded;
+    _ = main_mod.COLD_START_BUDGET_NS;
     _ = main_mod.usage;
 }
 

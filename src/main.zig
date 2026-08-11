@@ -30,6 +30,15 @@ comptime {
 }
 
 // =============================================================================
+// Cold-start budget (REQ-TUI-014)
+// =============================================================================
+
+/// 50 ms cold-start budget per REQ-TUI-014. R-PR 4 adds a ReleaseFast
+/// benchmark test asserting p99 < 50 ms over 1000 iterations; R-PR 2
+/// ships the threshold check + warn logging.
+pub const COLD_START_BUDGET_NS: u64 = 50 * std.time.ns_per_ms;
+
+// =============================================================================
 // CLI usage (REQ-TUI-017)
 // =============================================================================
 
@@ -75,6 +84,28 @@ pub fn parseArgs(argv: []const []const u8) ParseError!ParsedArgs {
 }
 
 // =============================================================================
+// Cold-start timing (REQ-TUI-014)
+// =============================================================================
+
+/// Log `warn` if `elapsed_ns` exceeds `COLD_START_BUDGET_NS`. The budget
+/// covers: kernel check (`sandbox.Sandbox.checkKernelSupport`),
+/// `logger.initGlobal(io)`, and `Runtime.run()` entry. Caller passes the
+/// elapsed time since the cold-start anchor placed at the top of `main`.
+pub fn warnIfColdStartExceeded(io: std.Io, elapsed_ns: u64) !void {
+    if (elapsed_ns > COLD_START_BUDGET_NS) {
+        var buf: [128]u8 = undefined;
+        const elapsed_ms = elapsed_ns / std.time.ns_per_ms;
+        const budget_ms = COLD_START_BUDGET_NS / std.time.ns_per_ms;
+        const msg = std.fmt.bufPrint(
+            &buf,
+            "cold-start took {d}ms (budget {d}ms)",
+            .{ elapsed_ms, budget_ms },
+        ) catch return;
+        try logger.global().log(io, .warn, msg);
+    }
+}
+
+// =============================================================================
 // Main entry point (REQ-TUI-015, REQ-TUI-017)
 // =============================================================================
 
@@ -105,14 +136,23 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(0);
     }
 
+    // Cold-start anchor — placed at the start of the [kernel check,
+    // logger init, Runtime.run] boundary per REQ-TUI-014.
+    const cold_start = std.Io.Timestamp.now(init.io, .real);
+
     // Kernel check. Logger not yet initialized, so we can't log — exit 1
-    // on failure. Cold-start timing lands in T2.2 (separate commit).
+    // on failure.
     sandbox.Sandbox.checkKernelSupport() catch {
         std.process.exit(1);
     };
 
     // Logger init (REQ-TUI-015 — headless /tmp/ai-harness-debug.log).
     logger.initGlobal(init.io) catch {};
+
+    // Cold-start timing check (REQ-TUI-014). Warn if >50ms.
+    const now = std.Io.Timestamp.now(init.io, .real);
+    const elapsed_ns: u64 = @intCast(std.Io.Timestamp.durationTo(cold_start, now).nanoseconds);
+    warnIfColdStartExceeded(init.io, elapsed_ns) catch {};
 
     // Runtime.run() delegation. R-PR 2 ships the R-PR 1 Runtime stub;
     // R-PR 4 replaces the TUI thread body with the real mibu lifecycle.
@@ -127,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 // =============================================================================
-// Tests (REQ-TUI-017: 5 CLI tests)
+// Tests (REQ-TUI-017: 5 CLI tests; REQ-TUI-014: 2 cold-start tests)
 // =============================================================================
 
 const testing = std.testing;
@@ -175,4 +215,47 @@ test "parseArgs --bogus returns error.UnknownFlag" {
     // REQ-TUI-017 unknown flag → exit 2 with usage on stderr.
     const argv = [_][]const u8{ "zargeant", "--bogus" };
     try testing.expectError(error.UnknownFlag, parseArgs(&argv));
+}
+
+test "warnIfColdStartExceeded logs warn when >50ms" {
+    // REQ-TUI-014 scenario 1 — warn fires when cold-start >50ms.
+    // We pass an explicit elapsed_ns (the "mock clock" injects delay).
+    try logger.initGlobal(testing.io);
+    defer logger.deinitGlobal(testing.io);
+
+    const elapsed_ns = 51 * std.time.ns_per_ms;
+    try warnIfColdStartExceeded(testing.io, elapsed_ns);
+
+    // Read log file and verify the warn message.
+    const contents = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        logger.defaultPath,
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(contents);
+    try testing.expect(std.mem.indexOf(u8, contents, "[WARN]") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "cold-start took 51ms") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "(budget 50ms)") != null);
+}
+
+test "warnIfColdStartExceeded does not log when <=50ms" {
+    // REQ-TUI-014 — triangulation: when the budget is met, no warn is
+    // emitted. The log file is truncated at initGlobal() so the only
+    // bytes after the call should be empty.
+    try logger.initGlobal(testing.io);
+    defer logger.deinitGlobal(testing.io);
+
+    const elapsed_ns = 10 * std.time.ns_per_ms;
+    try warnIfColdStartExceeded(testing.io, elapsed_ns);
+
+    // Read the log file — should be empty (no entries written).
+    const contents = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        logger.defaultPath,
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(contents);
+    try testing.expectEqual(@as(usize, 0), contents.len);
 }
