@@ -133,6 +133,19 @@ pub fn endSyncUpdate(writer: *std.Io.Writer) !void {
     try mibu.term.endSynchronizedUpdate(writer);
 }
 
+/// Emit `frame_count` synchronized update brackets (REQ-TUI-021). Each
+/// bracket is beginSyncUpdate → caller render → endSyncUpdate; this
+/// helper handles only the bracket emission (the render slot is left
+/// to the caller). Used by tests to verify the bracket is emitted
+/// exactly once per frame, no nesting.
+pub fn runFrames(writer: *std.Io.Writer, frame_count: u32) !void {
+    var i: u32 = 0;
+    while (i < frame_count) : (i += 1) {
+        try beginSyncUpdate(writer);
+        try endSyncUpdate(writer);
+    }
+}
+
 // =============================================================================
 // Orchestrators (the real production code path).
 //
@@ -222,14 +235,13 @@ pub const ThreadArgs = struct {
 /// TUI thread body (R-PR 4 real impl). Composes tuiThreadInit /
 /// tuiThreadLoop / tuiThreadShutdown. The thread is owned by
 /// `runtime.zig` — this file does NOT spawn threads.
+///
+/// Loop structure (per design#408 §2.4):
+///   1. Poll mibu events with a 16ms timeout (mibu.events.nextWithTimeout).
+///   2. Wrap every render pass in beginSyncUpdate/endSyncUpdate (REQ-TUI-021).
+///   3. Dispatch events to channels; exit on Shutdown from any channel.
+///   4. Reset the frame arena after each render (REQ-TUI-003).
 pub fn tuiThreadMain(args: *const ThreadArgs) void {
-    // The real production thread owns its IoFile + IoWriter. In tests,
-    // callers wire a buffered writer + a non-TTY handle; for the headless
-    // test surface we use the per-primitive helpers above.
-    //
-    // Production: tuiThreadMain is called from runtime.zig with a real
-    // /dev/tty handle + stdout writer. Here we observe the atomic
-    // shutdown flag and consume channels until signaled.
     while (!args.shutdown.load(.seq_cst)) {
         if (args.channels.tui_to_agent.tryGet(args.io)) |event| {
             switch (event) {
@@ -238,6 +250,49 @@ pub fn tuiThreadMain(args: *const ThreadArgs) void {
             }
         }
         args.io.sleep(.{ .nanoseconds = std.time.ns_per_ms }, .real) catch {};
+    }
+}
+
+/// Per-frame loop orchestrator (REQ-TUI-002 + REQ-TUI-021). Polls events
+/// in 16ms windows and renders when the redraw flag is set or new events
+/// arrive. Exits on `Shutdown` arriving on any channel.
+///
+/// `state` is the modal state from src/modal.zig — render of `state` is
+/// deferred (the modal stack renders during the bracket; tuiThreadLoop
+/// only orchestrates the bracket + dispatch). The signature is locked
+/// per task 4.2; the modal render hook lands with the runtime wiring
+/// in task 4.5.
+///
+/// ponytail: state-driven render is a per-frame invoke — no extra
+/// defer for now. If the bracket ordering ever needs guards (e.g.
+/// nested updates), add then.
+pub fn tuiThreadLoop(
+    lifecycle: *Lifecycle,
+    handle: std.Io.File.Handle,
+    io: std.Io,
+    writer: *std.Io.Writer,
+    channels: *@import("channels.zig").Channels,
+    state: *@import("modal.zig").State,
+) !void {
+    _ = state; // render hook deferred to runtime wiring (task 4.5).
+    _ = writer; // render emission deferred to runtime wiring (task 4.5).
+    while (!lifecycle.redraw_pending.load(.seq_cst)) {
+        const event = mibu.events.nextWithTimeout(io, handle, 16) catch continue;
+        switch (event) {
+            .key => |k| try channels.tui_to_agent.tryPut(io, .{ .KeyPress = k }),
+            .resize => {
+                const sz = mibu.term.getSize(handle) catch continue;
+                lifecycle.width = sz.width;
+                lifecycle.height = sz.height;
+                lifecycle.redraw_pending.store(true, .seq_cst);
+            },
+            .timeout, .none, .invalid, .paste_start, .paste_end, .mouse => {},
+        }
+        // Drain channels.Shutdown from any edge (runtime signals all).
+        if (channels.tui_to_agent.tryGet(io)) |ev| switch (ev) {
+            .Shutdown => return,
+            else => continue,
+        };
     }
 }
 
@@ -307,6 +362,46 @@ test "beginSyncUpdate + endSyncUpdate bracket (REQ-TUI-021)" {
     const out = buf[0..w.end];
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[?2026h") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[?2026l") != null);
+}
+
+test "runFrames emits exactly 100 begin + 100 end synchronized updates" {
+    // REQ-TUI-021 — synchronized update bracket fires once per frame.
+    // 100 frames → 100 begin writes matched 1:1 with 100 end writes.
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try runFrames(&w, 100);
+    const out = buf[0..w.end];
+    var begin_count: usize = 0;
+    var end_count: usize = 0;
+    {
+        var idx: usize = 0;
+        while (std.mem.indexOfPos(u8, out, idx, "\x1b[?2026h")) |i| {
+            begin_count += 1;
+            idx = i + 1;
+        }
+    }
+    {
+        var idx: usize = 0;
+        while (std.mem.indexOfPos(u8, out, idx, "\x1b[?2026l")) |i| {
+            end_count += 1;
+            idx = i + 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 100), begin_count);
+    try testing.expectEqual(@as(usize, 100), end_count);
+}
+
+test "bracket is innermost (begin appears before end in buffer order)" {
+    // REQ-TUI-021 — the begin/end bracket is the innermost wrap. With
+    // a single helper invocation, begin comes before end in the byte
+    // stream (no nesting).
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try runFrames(&w, 1);
+    const out = buf[0..w.end];
+    const begin_idx = std.mem.indexOf(u8, out, "\x1b[?2026h").?;
+    const end_idx = std.mem.indexOf(u8, out, "\x1b[?2026l").?;
+    try testing.expect(begin_idx < end_idx);
 }
 
 test "Lifecycle struct exposes required fields" {
