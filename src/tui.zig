@@ -281,6 +281,15 @@ pub const ThreadArgs = struct {
     channels: *@import("channels.zig").Channels,
     cancel_pipe: [2]i32,
     shutdown: *std.atomic.Value(bool),
+    /// PR 1 (tui-runtime-integration #441, REQ-TUI-033): optional API key
+    /// for real-mode requests. Null in mock mode. Owned by the Agent thread;
+    /// zeroed on exit. New field — existing callers default to null.
+    key: ?[]const u8 = null,
+    /// PR 1 (tui-runtime-integration #441, REQ-TUI-033): optional mock
+    /// server handle for mock-mode runtime wiring. The TUI thread does NOT
+    /// touch it — it's threaded through so the Agent body can pull port()
+    /// and the runtime can call deinit on shutdown.
+    mock_handle: ?*@import("mock_server.zig").Handle = null,
 };
 
 /// TUI thread body (R-PR 4 real impl). Composes tuiThreadInit /
