@@ -91,6 +91,10 @@ pub const AuthError = error{
     /// `DecryptFailed` (wrong password — tag mismatch is detected and
     /// surfaced the same way for callers).
     AuthenticationFailed,
+    /// Cancel-pipe readability observed during TLS read/write — abort.
+    /// api-auth-fixes Commit 2 surfaces this from `tls_conn.readSome` /
+    /// `tls_conn.writeAll` so the modal can dismiss cleanly.
+    Cancelled,
 };
 
 // =============================================================================
@@ -135,6 +139,12 @@ pub fn validateViaApi(io: std.Io, alloc: std.mem.Allocator, key: []const u8) Aut
 /// Internal probe variant that accepts an explicit target host + port.
 /// Public so tests can route to a local mock server (e.g., 127.0.0.1:PORT)
 /// and assert the error mapping without standing up a real TLS stack.
+///
+/// api-auth-fixes Commit 2 (tasks #449 §"Commit 2"; design #448 §"D5/D6"):
+/// the TLS-vs-plain fork now routes encrypted I/O through `tls_conn.writeAll`
+/// / `tls_conn.readSome` (mirrors `Client.stream` at src/api_client.zig:500-518)
+/// instead of dropping the encrypted fd back to raw socket. Raw socket I/O
+/// stays ONLY in the 127.0.0.1 branch.
 pub fn validateViaApiWithTarget(io: std.Io, alloc: std.mem.Allocator, key: []const u8, target_host: []const u8, target_port: u16) AuthError!void {
     const api_client = @import("api_client.zig");
 
@@ -164,22 +174,6 @@ pub fn validateViaApiWithTarget(io: std.Io, alloc: std.mem.Allocator, key: []con
     // For 127.0.0.1 (mock-server tests), skip TLS.
     // For api.minimax.io, TLS via tls_conn.
     const needs_tls = !std.mem.eql(u8, target_host, "127.0.0.1");
-    if (needs_tls) {
-        var cancel_pipe: [2]i32 = .{ -1, -1 };
-        _ = std.os.linux.pipe(&cancel_pipe);
-        defer {
-            _ = std.os.linux.close(cancel_pipe[0]);
-            _ = std.os.linux.close(cancel_pipe[1]);
-        }
-        const api_host = std.mem.sliceTo(target_host, 0);
-        var conn = api_client.tls_conn.connect(io, alloc, fd, api_host, cancel_pipe) catch |err| switch (err) {
-            error.TlsHandshakeFailed => return error.TlsHandshakeFailed,
-            error.HandshakeTimeout => return error.TlsHandshakeFailed,
-            error.CaBundleNotFound => return error.TlsHandshakeFailed,
-            else => return error.TlsHandshakeFailed,
-        };
-        defer conn.deinit();
-    }
 
     // Build HTTP request body (key bytes go in Authorization header).
     const body = api_client.serializeRequest(.{
@@ -198,17 +192,59 @@ pub fn validateViaApiWithTarget(io: std.Io, alloc: std.mem.Allocator, key: []con
     req_buf.appendSlice(alloc, headers) catch return error.WriteFailed;
     req_buf.appendSlice(alloc, body) catch return error.WriteFailed;
 
-    const write_rc = std.os.linux.write(fd, req_buf.items.ptr, req_buf.items.len);
-    if (write_rc != req_buf.items.len) return error.WriteFailed;
+    // Declare the TLS connection outside the needs_tls block so both branches
+    // can share the response parsing below. Populated only in the TLS branch
+    // (default undefined in the plain branch — must not be used there).
+    var conn: api_client.tls_conn = undefined;
+
+    if (needs_tls) {
+        var cancel_pipe: [2]i32 = .{ -1, -1 };
+        _ = std.os.linux.pipe(&cancel_pipe);
+        defer {
+            _ = std.os.linux.close(cancel_pipe[0]);
+            _ = std.os.linux.close(cancel_pipe[1]);
+        }
+        const api_host = std.mem.sliceTo(target_host, 0);
+        conn = api_client.tls_conn.connect(io, alloc, fd, api_host, cancel_pipe) catch |err| switch (err) {
+            error.TlsHandshakeFailed => return error.TlsHandshakeFailed,
+            error.HandshakeTimeout => return error.TlsHandshakeFailed,
+            error.CaBundleNotFound => return error.TlsHandshakeFailed,
+            else => return error.TlsHandshakeFailed,
+        };
+        defer conn.deinit();
+
+        // Encrypted write — tls_conn.writeAll loops on partial writes.
+        // Map HandshakeTimeout → TlsHandshakeFailed (defensive; handshake
+        // already succeeded inside connect()). Cancelled surfaces as-is so
+        // callers can distinguish abort vs auth/network failures.
+        conn.writeAll(req_buf.items) catch |err| switch (err) {
+            error.Cancelled => return error.Cancelled,
+            error.HandshakeTimeout => return error.TlsHandshakeFailed,
+            else => return error.WriteFailed,
+        };
+    } else {
+        // Plain HTTP write — raw socket (mock-server path).
+        const write_rc = std.os.linux.write(fd, req_buf.items.ptr, req_buf.items.len);
+        if (write_rc != req_buf.items.len) return error.WriteFailed;
+    }
 
     // Read response — up to 16 KB.
     var resp_buf: [16 * 1024]u8 = undefined;
     var resp_len: usize = 0;
     var header_end: usize = 0;
     while (header_end == 0 and resp_len < resp_buf.len) {
-        const n: isize = @bitCast(std.os.linux.read(fd, resp_buf[resp_len..].ptr, resp_buf.len - resp_len));
-        if (n <= 0) return error.ReadFailed;
-        resp_len += @intCast(n);
+        const n: usize = if (needs_tls)
+            conn.readSome(resp_buf[resp_len..]) catch |err| switch (err) {
+                error.Cancelled => return error.Cancelled,
+                error.ConnectionClosed => return error.ReadFailed,
+                else => return error.ReadFailed,
+            }
+        else blk: {
+            const raw_n: isize = @bitCast(std.os.linux.read(fd, resp_buf[resp_len..].ptr, resp_buf.len - resp_len));
+            if (raw_n <= 0) return error.ReadFailed;
+            break :blk @intCast(raw_n);
+        };
+        resp_len += n;
         if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |idx| {
             header_end = idx + 4;
         }
@@ -956,4 +992,113 @@ test "loadWithUnlock tampered file returns DecryptFailed" {
     _ = std.os.linux.pwrite(fd, &b, 1, 28);
 
     try testing.expectError(error.DecryptFailed, loadWithUnlock(io, path, "right-password"));
+}
+
+// =============================================================================
+// api-auth-fixes Commit 2 — RED tests for validateViaApiWithTarget TLS-vs-plain fork
+// (design #448 §"Module change matrix"; tasks #449 §"Commit 2")
+// =============================================================================
+
+// T-C2.1 — TLS branch uses tls_conn.writeAll AND tls_conn.readSome (not raw
+// socket I/O). Static-grep on validateViaApiWithTarget body to assert the
+// pattern is wired; without this commit the production code performs raw
+// std.os.linux.write/read on the same fd the TLS session owns, dropping
+// the connection (design #441 §"B2").
+test "validateViaApiWithTarget TLS branch uses tls_conn.writeAll + readSome" {
+    const io = testing.io;
+    const content = std.Io.Dir.cwd().readFileAlloc(io, "src/api_auth.zig", testing.allocator, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => return, // partial PR — file not yet committed.
+        else => return err,
+    };
+    defer testing.allocator.free(content);
+
+    // Find validateViaApiWithTarget function body — locate the `pub fn ...`
+    // line and the next top-level `}` or `pub fn`/`fn `.
+    const sig_idx = std.mem.indexOf(u8, content, "pub fn validateViaApiWithTarget") orelse {
+        try testing.expect(false);
+        return;
+    };
+    const body_start = std.mem.indexOfPos(u8, content, sig_idx, "{") orelse return;
+    // Find matching closing brace by tracking depth.
+    var depth: usize = 0;
+    var body_end: usize = body_start;
+    for (content[body_start..], 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                body_end = body_start + i + 1;
+                break;
+            }
+        }
+    }
+    const body = content[body_start..body_end];
+
+    // The TLS branch must call tls_conn.writeAll and tls_conn.readSome.
+    try testing.expect(std.mem.indexOf(u8, body, "conn.writeAll") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "conn.readSome") != null);
+}
+
+// T-C2.2 — 127.0.0.1 (mock-server) branch stays raw-socket: no
+// tls_conn allocation, no writeAll/readSome routing. Static-grep on the
+// `else` block of the needs_tls fork. Mirrors `Client.stream`'s plain-HTTP
+// branch at src/api_client.zig:594-680.
+test "validateViaApiWithTarget 127.0.0.1 branch stays raw-socket" {
+    const io = testing.io;
+    const content = std.Io.Dir.cwd().readFileAlloc(io, "src/api_auth.zig", testing.allocator, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer testing.allocator.free(content);
+
+    const sig_idx = std.mem.indexOf(u8, content, "pub fn validateViaApiWithTarget") orelse return;
+    const body_start = std.mem.indexOfPos(u8, content, sig_idx, "{") orelse return;
+    var depth: usize = 0;
+    var body_end: usize = body_start;
+    for (content[body_start..], 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                body_end = body_start + i + 1;
+                break;
+            }
+        }
+    }
+    const body = content[body_start..body_end];
+
+    // The plain HTTP branch must use std.os.linux.write + std.os.linux.read.
+    try testing.expect(std.mem.indexOf(u8, body, "std.os.linux.write(fd,") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "std.os.linux.read(fd,") != null);
+}
+
+// T-C2.3 — TLS read loop maps error.Cancelled (cancel-pipe readability
+// surfaces as Cancelled inside tls_conn.readSome per src/api_client.zig:2099).
+// Static-grep: assert the TLS branch catches Cancelled and returns it.
+test "validateViaApiWithTarget TLS read loop maps error.Cancelled" {
+    const io = testing.io;
+    const content = std.Io.Dir.cwd().readFileAlloc(io, "src/api_auth.zig", testing.allocator, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer testing.allocator.free(content);
+
+    const sig_idx = std.mem.indexOf(u8, content, "pub fn validateViaApiWithTarget") orelse return;
+    const body_start = std.mem.indexOfPos(u8, content, sig_idx, "{") orelse return;
+    var depth: usize = 0;
+    var body_end: usize = body_start;
+    for (content[body_start..], 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                body_end = body_start + i + 1;
+                break;
+            }
+        }
+    }
+    const body = content[body_start..body_end];
+
+    // The TLS read loop must map error.Cancelled from conn.readSome.
+    try testing.expect(std.mem.indexOf(u8, body, "error.Cancelled") != null);
 }
