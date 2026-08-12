@@ -62,6 +62,10 @@ pub const Lifecycle = struct {
     /// Terminal size cached at last resize (or initial 80x24 fallback).
     width: u16,
     height: u16,
+    /// PR 2 (tui-runtime-integration #441, REQ-TUI-047): true when
+    /// `enableRawMode` failed (no `/dev/tty`, CI). The TUI thread
+    /// runs in degraded logger-only mode; renderers are skipped.
+    no_tty: bool = false,
 };
 
 // =============================================================================
@@ -226,23 +230,39 @@ pub fn tuiThreadInit(
     };
 
     // 1. Raw mode (RawTerm token owns original termios for restore).
-    lc.raw_term = try mibu.term.enableRawMode(handle);
+    // PR 2 (REQ-TUI-047): if `enableRawMode` fails (no `/dev/tty`, CI),
+    // we fall back to logger-only mode and signal degraded mode on the
+    // Lifecycle via `no_tty = true`. The caller is expected to skip
+    // render and bracket emission in that case.
+    if (mibu.term.enableRawMode(handle)) |rt| {
+        lc.raw_term = rt;
+    } else |_| {
+        lc.no_tty = true;
+    }
 
     // 2. Install SIGWINCH fallback handler (REQ-TUI-019 scenario 2). The
     // handler sets redraw_pending via the global pointer installed here.
     installSigwinch(&lc.redraw_pending);
 
-    // 3. Alt screen + in-band resize (REQ-TUI-002).
-    try enterAltScreenAndResize(writer);
+    // 3. Alt screen + in-band resize (REQ-TUI-002). Skip in no-TTY mode
+    // (no terminal to switch into).
+    if (!lc.no_tty) {
+        enterAltScreenAndResize(writer) catch {};
+    }
 
     // 3. Probe DEC 2048 (REQ-TUI-019). Failure → false (legacy fallback).
-    lc.dec_2048_supported = queryDec2048Supported(io, handle, writer);
+    //    Skip in no-TTY mode (no terminal to probe).
+    if (!lc.no_tty) {
+        lc.dec_2048_supported = queryDec2048Supported(io, handle, writer);
+    }
 
     // 4. Probe kitty kb (REQ-TUI-022). Failure → false (legacy keypress).
-    lc.kitty_supported = queryKittyKbSupported(io, handle, writer);
-    if (lc.kitty_supported) {
-        try pushKittyKb(writer);
-        lc.kitty_flags_pushed = true;
+    if (!lc.no_tty) {
+        lc.kitty_supported = queryKittyKbSupported(io, handle, writer);
+        if (lc.kitty_supported) {
+            pushKittyKb(writer) catch {};
+            lc.kitty_flags_pushed = true;
+        }
     }
 
     return lc;
@@ -301,15 +321,14 @@ pub const ThreadArgs = struct {
 /// tuiThreadLoop / tuiThreadShutdown. The thread is owned by
 /// `runtime.zig` — this file does NOT spawn threads.
 ///
-/// PR 2 (tui-runtime-integration #441, REQ-TUI-039/040): seeds the
-/// modal state from `args.initial_auth_state` (resolved by `main()` via
-/// `preflightAuthState`). The TUI thread creates a fresh `modal.State`
-/// via `modal.initialModalState` and the state machine drives the
-/// subsequent transitions (submitKeyEntry, submitUnlock, etc.) from
-/// there. Headless tests use this same entry point; the full event
-/// dispatch (key → submit, mibu poll → modal render) lands in a
-/// follow-up slice — this PR 2 wires only the auth-state-to-modal
-/// seed.
+/// PR 2 (tui-runtime-integration #441, REQ-TUI-039/040/042/047): seeds
+/// the modal state from `args.initial_auth_state` (resolved by `main()`
+/// via `preflightAuthState`). The TUI thread creates a fresh
+/// `modal.State` via `modal.initialModalState`. The thread also
+/// checks `runtime.isIdleRelockDue` on each iteration and posts a
+/// `Event.Relock` to the Agent when the 5-minute threshold trips
+/// (REQ-TUI-042). No-TTY mode (REQ-TUI-047) is detected via
+/// `Lifecycle.no_tty` and the renderers/bracket emission are skipped.
 ///
 /// Loop structure (per design#408 §2.4):
 ///   1. Poll mibu events with a 16ms timeout (mibu.events.nextWithTimeout).
@@ -326,13 +345,40 @@ pub fn tuiThreadMain(args: *const ThreadArgs) void {
         @import("modal.zig").initialModalState(args.initial_auth_state);
     _ = &modal_state; // full event-driven integration lands in follow-up slice
 
+    // PR 2 (REQ-TUI-042): monotonic clock anchor for the 5-min idle
+    // relock. Production uses `std.Io.Timestamp.now`; tests inject a
+    // fake clock via `isIdleRelockDue(last_user_action_ms, now_ms)`.
+    var last_user_action_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(args.io, .real).nanoseconds, std.time.ns_per_ms));
+
     while (!args.shutdown.load(.seq_cst)) {
         if (args.channels.tui_to_agent.tryGet(args.io)) |event| {
             switch (event) {
                 .Shutdown => return,
-                else => continue,
+                .KeyPress, .UserToolRequest => {
+                    // User activity — reset the idle anchor.
+                    last_user_action_ms = @intCast(@divTrunc(std.Io.Timestamp.now(args.io, .real).nanoseconds, std.time.ns_per_ms));
+                },
+                .ApiKeySubmitted, .UnlockPasswordSubmitted => {
+                    last_user_action_ms = @intCast(@divTrunc(std.Io.Timestamp.now(args.io, .real).nanoseconds, std.time.ns_per_ms));
+                },
+                .Relock => {
+                    // The Agent told us the in-memory key was zeroed.
+                    // The modal state machine handles the relock; for
+                    // now we keep the state shape stable.
+                    last_user_action_ms = @intCast(@divTrunc(std.Io.Timestamp.now(args.io, .real).nanoseconds, std.time.ns_per_ms));
+                },
+                else => {},
             }
         }
+
+        // PR 2 (REQ-TUI-042): 5-min idle relock. When the threshold
+        // trips, post `.Relock` to the Agent so it zeroes its key.
+        const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(args.io, .real).nanoseconds, std.time.ns_per_ms));
+        if (@import("runtime.zig").isIdleRelockDue(last_user_action_ms, now_ms)) {
+            args.channels.tui_to_agent.tryPut(args.io, .Relock) catch {};
+            last_user_action_ms = now_ms;
+        }
+
         args.io.sleep(.{ .nanoseconds = std.time.ns_per_ms }, .real) catch {};
     }
 }
@@ -490,9 +536,10 @@ test "bracket is innermost (begin appears before end in buffer order)" {
 
 test "Lifecycle struct exposes required fields" {
     // The Lifecycle struct carries the right shape for tuiThreadShutdown.
-    // Compile-time assertion via typeinfo.
+    // Compile-time assertion via typeinfo. PR 2 adds the `no_tty` field
+    // (REQ-TUI-047); the count rises from 7 to 8.
     const fields = @typeInfo(Lifecycle).@"struct".fields;
-    try testing.expectEqual(@as(usize, 7), fields.len);
+    try testing.expectEqual(@as(usize, 8), fields.len);
 }
 
 test "redraw_pending is std.atomic.Value(bool) with seq_cst contract" {

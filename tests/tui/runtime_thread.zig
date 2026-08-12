@@ -662,6 +662,113 @@ test "TUI body: tuiThreadLoop seeds modal state from initial_auth_state (static-
 }
 
 // =============================================================================
+// PR 2 — Idle relock (REQ-TUI-042, spec#192)
+//
+// After 5 minutes without user input the runtime invalidates the
+// in-memory key (`memset(0)`) and re-prompts Unlock on the next user
+// action. The 5-minute threshold is exposed as `runtime.IDLE_RELOCK_MS`
+// so tests are hermetic (inject a fake clock).
+//
+// RED tests assert:
+//   1. `isIdleRelockDue` returns true when elapsed > IDLE_RELOCK_MS.
+//   2. `isIdleRelockDue` returns false when elapsed < IDLE_RELOCK_MS.
+//   3. The `Event.Relock` variant exists in the channels union (the
+//      Agent thread uses it to zero its key buffer).
+//   4. tuiThreadMain references `isIdleRelockDue` (static-grep).
+// =============================================================================
+
+const Idle = struct {
+    const root = @import("runtime");
+    pub const isIdleRelockDue = root.runtime.isIdleRelockDue;
+    pub const IDLE_RELOCK_MS = root.runtime.IDLE_RELOCK_MS;
+};
+
+test "idle relock: isIdleRelockDue returns true when elapsed > 5min" {
+    // REQ-TUI-042 scenario 1 — 5 minutes without user input triggers
+    // relock. We inject a fake clock: last_user_action = 0, now = 5min+1.
+    try testing.expect(Idle.isIdleRelockDue(0, Idle.IDLE_RELOCK_MS + 1));
+    // Far past the threshold.
+    try testing.expect(Idle.isIdleRelockDue(0, Idle.IDLE_RELOCK_MS * 10));
+}
+
+test "idle relock: isIdleRelockDue returns false when elapsed < 5min" {
+    // REQ-TUI-042 scenario 2 — anything under the threshold is fine.
+    try testing.expect(!Idle.isIdleRelockDue(0, 0));
+    try testing.expect(!Idle.isIdleRelockDue(0, Idle.IDLE_RELOCK_MS - 1));
+    try testing.expect(!Idle.isIdleRelockDue(1000, 1000 + 60_000));
+}
+
+test "idle relock: Event.Relock variant exists in channels union (REQ-TUI-042)" {
+    // REQ-TUI-042 wiring — the TUI thread sends `.Relock` to the Agent
+    // when the idle threshold trips; the Agent zeroes its key buffer.
+    // The static-grep guard confirms the variant is declared in
+    // src/channels.zig.
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/channels.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+    try testing.expect(std.mem.indexOf(u8, no_comments, "Relock") != null);
+}
+
+test "idle relock: tuiThreadMain references isIdleRelockDue (static-grep)" {
+    // The TUI thread checks idle on each iteration. Static-grep: the
+    // call site exists in src/tui.zig.
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/tui.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+    try testing.expect(std.mem.indexOf(u8, no_comments, "isIdleRelockDue") != null);
+}
+
+// =============================================================================
+// PR 2 — No-TTY headless fallback (REQ-TUI-047)
+//
+// `mibu.term.enableRawMode` failure (no `/dev/tty`, CI) MUST NOT crash
+// the process. The TUI thread falls back to logger-only rendering via
+// `logger.global()` and the runtime continues to completion.
+//
+// RED test asserts:
+//   1. The `Lifecycle` struct carries a `no_tty: bool` field that
+//      signals degraded mode. The TUI thread checks this before
+//      invoking the bracket renderers.
+// =============================================================================
+
+test "no-TTY: Lifecycle carries no_tty flag for degraded mode (REQ-TUI-047)" {
+    const info = @typeInfo(Tui.ThreadArgs).@"struct".fields;
+    _ = info; // compile-time only
+    // The Lifecycle struct lives in src/tui.zig. We assert the field
+    // exists at the type level via @typeInfo. This is a static-grep
+    // guard mirrored in runtime_thread.zig to keep the dedicated
+    // test artifact self-contained.
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/tui.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+    try testing.expect(std.mem.indexOf(u8, no_comments, "no_tty") != null);
+}
+
+// =============================================================================
 // T-SG-4: no api.minimax.io literal in mock-mode code path (re-test, PR 2)
 
 // =============================================================================

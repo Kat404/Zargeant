@@ -39,6 +39,24 @@ comptime {
 /// tests may pass a smaller value.
 pub const DEFAULT_SHUTDOWN_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 
+/// 5-minute idle relock threshold (REQ-TUI-042, spec#192). After
+/// `IDLE_RELOCK_MS` of no user input the runtime invalidates the
+/// in-memory key and re-prompts Unlock on the next user action.
+/// Exposed as a constant so tests inject a fake clock.
+pub const IDLE_RELOCK_MS: i64 = 5 * 60 * 1000;
+
+/// Pure helper: returns true when the elapsed time since the last user
+/// action exceeds the 5-minute idle threshold. The caller (the TUI
+/// thread) supplies both timestamps from an injectable monotonic
+/// clock — production uses `std.Io.Timestamp.now`, tests pass fake
+/// values directly. Negative elapsed values (clock skew) are treated as
+/// "not yet due" (return false).
+pub fn isIdleRelockDue(last_user_action_ms: i64, now_ms: i64) bool {
+    if (now_ms < last_user_action_ms) return false;
+    const elapsed = now_ms - last_user_action_ms;
+    return elapsed >= IDLE_RELOCK_MS;
+}
+
 // =============================================================================
 // Public API
 // =============================================================================
