@@ -246,6 +246,7 @@ pub const Runtime = struct {
     pub fn run(self: *Runtime, io: std.Io) !void {
         const tui_args = ThreadArgs{
             .io = io,
+            .allocator = std.heap.page_allocator,
             .channels = &self.channels,
             .cancel_pipe = self.cancel_pipe,
             .shutdown = &self.shutdown_requested,
@@ -430,7 +431,7 @@ fn agentThreadLoop(args: *const ThreadArgs) void {
                 // shipped `tls_handrolled` path (tls_conn.connect inside
                 // Client.stream, src/api_client.zig:485). No openssl,
                 // no rustls, no other TLS dependency (REQ-TUI-044).
-                const stream = api_client.Client.stream(args.io, req, args.cancel_pipe) catch |err| {
+                const stream = api_client.Client.stream(args.allocator, args.io, req, args.cancel_pipe) catch |err| {
                     const payload = mapChunkError(switch (err) {
                         error.Unauthorized => api_client.ErrorKind.Unauthorized,
                         error.TlsHandshakeFailed => api_client.ErrorKind.TlsHandshakeFailed,

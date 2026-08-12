@@ -54,6 +54,14 @@ pub fn build(b: *std.Build) void {
     exe.root_module.strip = optimize == .ReleaseFast;
     b.installArtifact(exe);
 
+    // run step: `zig build run -- --mock` (or with no args for production mode).
+    // Mirrors the tools-debug pattern (line 78-80). Args after `--` are forwarded
+    // to the zargeant executable via addRunArtifact's args plumbing.
+    const run_exe = b.addRunArtifact(exe);
+    const run_step = b.step("run", "Run zargeant (pass args after `--`, e.g. `zig build run -- --mock`)");
+    run_step.dependOn(&run_exe.step);
+    if (b.args) |args| run_exe.addArgs(args);
+
     // exe: tools/debug_call.zig (manual-only API key probe).
     // tls-handrolled (sdd id=323, T3.5): wires the micro-CLI as a runnable step.
     // Imports point to lib_mod (src/root.zig); src/root.zig re-exports the

@@ -298,6 +298,11 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
 
 pub const ThreadArgs = struct {
     io: std.Io,
+    /// Allocator used by the Agent thread for api_client.Client.stream
+    /// (production: `std.heap.page_allocator` from `main()`; tests: `testing.allocator`).
+    /// PR 2 followup (R5 of verify-report-pr2): added so the runtime can
+    /// pass a real allocator instead of std.testing.allocator to Client.stream.
+    allocator: std.mem.Allocator,
     channels: *@import("channels.zig").Channels,
     cancel_pipe: [2]i32,
     shutdown: *std.atomic.Value(bool),
@@ -664,6 +669,7 @@ test "tuiThreadMain returns on Shutdown (consumes channels)" {
     var shutdown = std.atomic.Value(bool).init(false);
     const args = ThreadArgs{
         .io = testing.io,
+        .allocator = testing.allocator,
         .channels = &ch,
         .cancel_pipe = .{ -1, -1 },
         .shutdown = &shutdown,
@@ -680,6 +686,7 @@ test "tuiThreadMain returns when shutdown flag is set" {
     var shutdown = std.atomic.Value(bool).init(true);
     const args = ThreadArgs{
         .io = testing.io,
+        .allocator = testing.allocator,
         .channels = &ch,
         .cancel_pipe = .{ -1, -1 },
         .shutdown = &shutdown,

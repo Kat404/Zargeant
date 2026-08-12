@@ -338,6 +338,7 @@ test "TUI body: ThreadArgs carries key + mock_handle (null defaults)" {
     // default to null so existing Runtime.spawn(.{}) callers compile.
     _ = Rt.ThreadArgs{
         .io = testing.io,
+        .allocator = testing.allocator,
         .channels = undefined,
         .cancel_pipe = .{ -1, -1 },
         .shutdown = undefined,
@@ -580,6 +581,7 @@ test "main preflight: ThreadArgs (tui.zig canonical) carries initial_auth_state"
     // .needs_first_entry; tuiThreadLoop reads it before the first poll.
     _ = Tui.ThreadArgs{
         .io = testing.io,
+        .allocator = testing.allocator,
         .channels = undefined,
         .cancel_pipe = .{ -1, -1 },
         .shutdown = undefined,
