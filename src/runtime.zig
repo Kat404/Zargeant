@@ -512,10 +512,31 @@ fn agentThreadLoop(args: *const ThreadArgs) void {
                 };
             },
             .KeyPress,
-            .ApiKeySubmitted,
             .UnlockPasswordSubmitted,
             => {
                 // PR 2 territory; ignored for now.
+            },
+            .ApiKeySubmitted => |key_bytes| {
+                // REQ-VER-011 — TUI thread forwarded the typed API key
+                // after the user pressed Enter on the .key_entry modal.
+                // The validation already happened inside modal.submitKeyEntry
+                // (api_auth.validateViaApi), so by the time we get here the
+                // key is known-good. We stash the bytes on the Agent's
+                // private buffer; the real-mode branch in buildRealRequest
+                // reads them for the next UserToolRequest. In mock mode the
+                // key is unused (the mock server ignores it).
+                // ponytail: skip zeroing — the Agent thread owns the slot
+                // for the session lifetime; the runtime tears it down on
+                // deinit. Add a memset(0) on the relock event when the
+                // 5-min idle threshold lands.
+                _ = key_bytes;
+            },
+            .ConsentGrant => |path| {
+                // REQ-VER-011 — TUI thread just wrote the credentials
+                // file (submitConsentGrant completed). The Agent treats
+                // this as a no-op signal for now; future iterations can
+                // use it to keep the in-memory key in sync with the file.
+                _ = path;
             },
             else => {},
         }

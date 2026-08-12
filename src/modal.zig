@@ -215,11 +215,18 @@ pub const KeyEntryState = struct {
 /// Payload for `.unlock_prompt` (REQ-TUI-007). Same shape as KeyEntry but
 /// typed as a passphrase (may contain spaces — unlock does NOT call
 /// validateFormat first; the password just needs to match the stored hash).
+/// `attempts` counts failed unlock submissions; submitUnlock transitions
+/// to `.error_modal` once the cap (3) is reached (REQ-VER-012).
 pub const UnlockState = struct {
     draft: [256]u8 = .{0} ** 256,
     draft_len: usize = 0,
     err_msg: ?[]const u8 = null,
+    attempts: u8 = 0,
 };
+
+/// 3-attempt cap (REQ-VER-012). After 3 wrong passphrases the unlock
+/// prompt transitions to .error_modal; the user must Esc back to retry.
+pub const UNLOCK_MAX_ATTEMPTS: u8 = 3;
 
 /// Payload for `.consent_prompt` (REQ-TUI-008). `consent` defaults to false
 /// (deny) — the user must explicitly opt in.
@@ -402,10 +409,15 @@ pub fn drawUnlock(win: *WindowMock, state: *State) !void {
 
 /// Submit handler for the Unlock modal. Tries `api_auth.loadWithUnlock`.
 /// On success: advance to `.agent_loop` (REQ-TUI-007 scenario 1).
-/// On failure: stay in `.unlock_prompt` with err_msg set.
+/// On failure: stay in `.unlock_prompt` with err_msg set; after 3
+/// failed attempts (REQ-VER-012) transition to `.error_modal`.
 pub fn submitUnlock(io: std.Io, state: *State) !void {
     const payload = &state.unlock_prompt;
     const draft = payload.draft[0..payload.draft_len];
+    // REQ-VER-012 — 3-attempt cap. Increment on entry; on the Nth
+    // failure transition to .error_modal so the user must Esc back
+    // to .unlock_prompt to retry.
+    const next_attempts: u8 = payload.attempts + 1;
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     // Storage path is conventionally the same XDG location the consent
     // prompt writes to. We compute it lazily here via api_auth (R-PR 4
@@ -416,18 +428,37 @@ pub fn submitUnlock(io: std.Io, state: *State) !void {
                 .draft = payload.draft,
                 .draft_len = payload.draft_len,
                 .err_msg = "No storage path",
+                .attempts = next_attempts,
             },
         };
+        if (next_attempts >= UNLOCK_MAX_ATTEMPTS) {
+            state.* = .{ .error_modal = .{
+                .kind = .auth,
+                .message = "Too many failed unlock attempts",
+                .prior = .unlock_prompt,
+            } };
+        }
         return;
     };
     const key = api_auth.loadWithUnlock(io, path, draft) catch |err| {
         var buf: [64]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "Unlock failed: {s}", .{@errorName(err)}) catch "Unlock failed";
+        if (next_attempts >= UNLOCK_MAX_ATTEMPTS) {
+            // REQ-VER-012 — 3rd (or later) wrong passphrase escalates
+            // to .error_modal; user must Esc back to retry.
+            state.* = .{ .error_modal = .{
+                .kind = .auth,
+                .message = msg,
+                .prior = .unlock_prompt,
+            } };
+            return;
+        }
         state.* = .{
             .unlock_prompt = .{
                 .draft = payload.draft,
                 .draft_len = payload.draft_len,
                 .err_msg = msg,
+                .attempts = next_attempts,
             },
         };
         return;

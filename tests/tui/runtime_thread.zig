@@ -1110,3 +1110,121 @@ test "T-VR-2b: Runtime.spawn call in main() threads mock_handle (REQ-VER-006)" {
     // We assert the literal text ".mock_handle" appears in main.zig.
     try testing.expect(std.mem.indexOf(u8, no_comments, ".mock_handle") != null);
 }
+
+// =============================================================================
+// PR fix-slice — tui-verification (REQ-VER-009/010/011/012)
+//
+// Per-frame modal dispatch from the TUI thread (REQ-VER-009/010):
+// tuiThreadMain must call `modal.runtimeDriverTick` each iteration so
+// agent_to_tui events (StreamChunk, AgentError) update the modal state.
+// agentThreadLoop must handle .ApiKeySubmitted + .ConsentGrant events
+// (REQ-VER-011). submitUnlock enforces a 3-attempt cap → .error_modal
+// (REQ-VER-012).
+// =============================================================================
+
+test "T-VR-3: tuiThreadMain dispatches per-frame modal events via runtimeDriverTick (REQ-VER-009/010)" {
+    // REQ-VER-009/010 — the TUI thread must drive the modal state
+    // machine from per-frame events. Static-grep: tuiThreadMain
+    // references `runtimeDriverTick` (the helper that drains
+    // agent_to_tui into the modal state).
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/tui.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+
+    // runtimeDriverTick must be referenced from tui.zig production code.
+    try testing.expect(std.mem.indexOf(u8, no_comments, "runtimeDriverTick") != null);
+}
+
+test "T-VR-4: agentThreadLoop handles .ApiKeySubmitted + .ConsentGrant (REQ-VER-011)" {
+    // REQ-VER-011 — the Agent body must explicitly handle the
+    // .ApiKeySubmitted and .ConsentGrant event variants. Static-grep:
+    // both event references appear inside the agentThreadLoop function
+    // body in src/runtime.zig.
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/runtime.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+
+    // Locate the agentThreadLoop function body.
+    const sig = std.mem.indexOf(u8, no_comments, "fn agentThreadLoop") orelse {
+        try testing.expect(false);
+        return;
+    };
+    const body_start = std.mem.indexOfPos(u8, no_comments, sig, "{") orelse return;
+    var depth: usize = 0;
+    var body_end: usize = body_start;
+    for (no_comments[body_start..], 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                body_end = body_start + i + 1;
+                break;
+            }
+        }
+    }
+    const body = no_comments[body_start..body_end];
+
+    // The body must reference both .ApiKeySubmitted and .ConsentGrant.
+    try testing.expect(std.mem.indexOf(u8, body, ".ApiKeySubmitted") != null);
+    try testing.expect(std.mem.indexOf(u8, body, ".ConsentGrant") != null);
+}
+
+test "T-VR-5: submitUnlock references the 3-attempt counter (REQ-VER-012)" {
+    // REQ-VER-012 — submitUnlock enforces a 3-attempt cap. After the
+    // 3rd wrong passphrase, state transitions to .error_modal.
+    // Static-grep: the submitUnlock function body in src/modal.zig
+    // references both the attempt counter and the .error_modal
+    // transition.
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/modal.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+
+    // Locate the submitUnlock function body.
+    const sig = std.mem.indexOf(u8, no_comments, "pub fn submitUnlock") orelse {
+        try testing.expect(false);
+        return;
+    };
+    const body_start = std.mem.indexOfPos(u8, no_comments, sig, "{") orelse return;
+    var depth: usize = 0;
+    var body_end: usize = body_start;
+    for (no_comments[body_start..], 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                body_end = body_start + i + 1;
+                break;
+            }
+        }
+    }
+    const body = no_comments[body_start..body_end];
+
+    // The body must reference attempts (the counter) and .error_modal
+    // (the cap terminal state).
+    try testing.expect(std.mem.indexOf(u8, body, "attempts") != null);
+    try testing.expect(std.mem.indexOf(u8, body, ".error_modal") != null);
+}

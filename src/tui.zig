@@ -350,7 +350,6 @@ pub fn tuiThreadMain(args: *const ThreadArgs) void {
     // thread owns; the Agent thread never touches it.
     var modal_state: @import("modal.zig").State =
         @import("modal.zig").initialModalState(args.initial_auth_state);
-    _ = &modal_state; // full event-driven integration lands in follow-up slice
 
     // PR 2 (REQ-TUI-042): monotonic clock anchor for the 5-min idle
     // relock. Production uses `std.Io.Timestamp.now`; tests inject a
@@ -358,6 +357,15 @@ pub fn tuiThreadMain(args: *const ThreadArgs) void {
     var last_user_action_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(args.io, .real).nanoseconds, std.time.ns_per_ms));
 
     while (!args.shutdown.load(.seq_cst)) {
+        // Per-frame modal dispatch (REQ-VER-009/010): drain agent_to_tui
+        // events (StreamChunk, AgentError, Shutdown) into the modal
+        // state. Returns true when Shutdown is observed.
+        _ = @import("modal.zig").runtimeDriverTick(
+            args.io,
+            &modal_state,
+            .{ .agent_to_tui = &args.channels.agent_to_tui },
+        ) catch {};
+
         if (args.channels.tui_to_agent.tryGet(args.io)) |event| {
             switch (event) {
                 .Shutdown => return,
