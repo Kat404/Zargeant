@@ -170,15 +170,17 @@ pub const ChunkEventStream = struct {
     body_buf: std.ArrayList(u8),
     /// Coalesce slot — holds the latest cumulative chunk while a TUI
     /// consumer is slow. REPLACE-not-APPEND per cumulative-delta semantics.
+    /// PR 2 (tui-runtime-integration #441, REQ-TUI-025): the 16ms
+    /// REPLACE-on-newer coalesce is owned by `channels.pushSseChunk`
+    /// (the channel layer). The api-client stream is a thin feed that
+    /// returns parser events; the runtime Agent body always routes
+    /// them through `pushSseChunk` so we never run a second coalesce
+    /// window on this path.
     pending: ?ChunkEvent,
     finished: bool,
     owns_fd: bool,
     /// Set after all buffered body bytes have been fed to the parser.
     body_drained: bool,
-    /// Coalesce deadline (16 ms). When non-null, the FIRST pending event's
-    /// arrival timestamp. Subsequent events REPLACE pending without
-    /// resetting this.
-    coalesce_started_at: ?i96,
 
     pub fn next(self: *ChunkEventStream) !?ChunkEvent {
         if (self.finished) return null;
@@ -187,7 +189,9 @@ pub const ChunkEventStream = struct {
         // signals no more events are pending (.pending or error.EmptyBody).
         // Each parser.feed() processes all complete events in its buffer and
         // returns the FIRST one; subsequent calls process the remaining
-        // events. We coalesce by REPLACE (cumulative-delta semantics).
+        // events. We coalesce by REPLACE (cumulative-delta semantics) —
+        // the Agent body further routes every `ChunkEvent` through
+        // `channels.pushSseChunk` (16ms window, channel-layer-owned).
         while (!self.body_drained) {
             const ev = self.parser.feed(self.body_buf.items) catch |err| switch (err) {
                 error.EmptyBody => {
@@ -210,7 +214,6 @@ pub const ChunkEventStream = struct {
                     // .done".
                     if (self.pending) |p| {
                         self.pending = null;
-                        self.coalesce_started_at = null;
                         return p;
                     }
                     return ChunkEvent{ .done = {} };
@@ -219,7 +222,6 @@ pub const ChunkEventStream = struct {
                     self.finished = true;
                     if (self.pending) |p| {
                         self.pending = null;
-                        self.coalesce_started_at = null;
                         return p;
                     }
                     return ChunkEvent{ .err = .{
@@ -230,21 +232,10 @@ pub const ChunkEventStream = struct {
                 else => {
                     // Convert api_sse.Event -> api_client.ChunkEvent.
                     const ce = sseEventToChunkEvent(ev);
-                    const now = std.Io.Clock.real.now(testing.io).nanoseconds;
-                    if (self.pending == null) {
-                        self.pending = ce;
-                        self.coalesce_started_at = now;
-                    } else {
-                        // REPLACE — cumulative-delta semantics make this safe.
-                        if (self.coalesce_started_at) |start| {
-                            if (now - start <= COALESCE_WINDOW_NS) {
-                                // Within the coalesce window — log warn. Best-effort;
-                                // logger failures must not abort the stream.
-                                _ = logger.global().log(testing.io, .warn, "chunk_coalesced") catch {};
-                            }
-                        }
-                        self.pending = ce;
-                    }
+                    // REPLACE — cumulative-delta semantics make this safe.
+                    // The 16ms window is owned by the channel layer; the
+                    // api-client stream is a thin passthrough.
+                    self.pending = ce;
                 },
             }
         }
@@ -252,7 +243,6 @@ pub const ChunkEventStream = struct {
         // After draining: return pending if any, else .done.
         if (self.pending) |p| {
             self.pending = null;
-            self.coalesce_started_at = null;
             return p;
         }
 
@@ -324,7 +314,6 @@ pub const Client = struct {
                         .finished = info.body_len == 0,
                         .owns_fd = info.fd >= 0,
                         .body_drained = false,
-                        .coalesce_started_at = null,
                     };
                     // Copy any buffered body bytes into body_buf eagerly.
                     if (info.body_len > 0) {
@@ -341,12 +330,6 @@ pub const Client = struct {
             }
         }
         return error.RetryBudgetExhausted;
-    }
-
-    pub fn validateKey(io: std.Io, key: []const u8) !void {
-        _ = io;
-        _ = key;
-        return error.NotImplemented;
     }
 };
 

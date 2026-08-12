@@ -827,6 +827,50 @@ test "Agent body: real-mode branch exists in agentThreadLoop (static-grep)" {
 }
 
 // =============================================================================
+// PR 2 — Remove internal coalesce + Client.validateKey stub
+// (REQ-TUI-025 single-window + REQ-TUI-045 stub removal)
+//
+// The `api_client.ChunkEventStream.coalesce_started_at` field is REMOVED —
+// the channel layer's `channels.pushSseChunk` owns the 16ms REPLACE
+// coalesce (single window, no double coalescing per design #441 §WARN
+// risk). The `Client.validateKey` stub is REMOVED — real validation is
+// `api_auth.validateViaApi` (api-auth-fixes PR #9).
+//
+// RED test asserts: neither symbol appears in src/api_client.zig
+// production code.
+// =============================================================================
+
+test "api_client: coalesce_started_at field REMOVED from ChunkEventStream (REQ-TUI-025)" {
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/api_client.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+    try testing.expect(std.mem.indexOf(u8, no_comments, "coalesce_started_at") == null);
+}
+
+test "api_client: Client.validateKey stub REMOVED (REQ-TUI-045)" {
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/api_client.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+    try testing.expect(std.mem.indexOf(u8, no_comments, "validateKey") == null);
+}
+
+// =============================================================================
 // T-SG-4: no api.minimax.io literal in mock-mode code path (re-test, PR 2)
 
 // =============================================================================
