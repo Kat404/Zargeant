@@ -274,6 +274,22 @@ pub fn restorePrior(state: *State, prior: PriorKind) void {
     }
 }
 
+/// Convert an `api_auth.AuthState` into the modal `State` that should
+/// open on app launch. The TUI thread calls this once before its first
+/// poll (REQ-TUI-039 + REQ-TUI-040):
+///   - `.needs_first_entry` → `.key_entry` (first-launch path)
+///   - `.has_disk_file`     → `.unlock_prompt` (subsequent-launch path)
+///   - `.has_memory_key`    → `.welcome` (defensive — not normally
+///     produced by `initialState` per drift D-1, but kept safe for
+///     in-session use)
+pub fn initialModalState(auth_state: api_auth.AuthState) State {
+    return switch (auth_state) {
+        .needs_first_entry => .{ .key_entry = .{} },
+        .has_disk_file => .{ .unlock_prompt = .{} },
+        .has_memory_key => .{ .welcome = {} },
+    };
+}
+
 // =============================================================================
 // Modal draw fns (tasks 3.3 - 3.7)
 //

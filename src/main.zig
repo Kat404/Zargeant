@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 const logger = @import("logger.zig");
 const sandbox = @import("sandbox.zig");
 const runtime = @import("runtime.zig");
+const api_auth = @import("api_auth.zig");
 
 // =============================================================================
 // Linux-only comptime guard (matches every other module in the project).
@@ -81,6 +82,25 @@ pub fn parseArgs(argv: []const []const u8) ParseError!ParsedArgs {
         }
     }
     return args;
+}
+
+// =============================================================================
+// Auth preflight (REQ-TUI-038, drift D-1)
+//
+// `preflightAuthState` resolves the auth state via `api_auth.initialState`
+// (which is `fstatat`-only — never reads file content). Wrapped here so
+// tests in `tests/tui/runtime_thread.zig` can assert the call site + the
+// fstatat-only contract through a static-grep guard. The TUI thread uses
+// the result to seed its initial modal state (key_entry vs unlock_prompt).
+// =============================================================================
+
+/// Resolve the auth state before `Runtime.run()`. Thin wrapper around
+/// `api_auth.initialState` (which fstatats the XDG credentials path).
+/// Returns `needs_first_entry` when no credentials file exists, or
+/// `has_disk_file` when one does. The `has_memory_key` variant is a
+/// post-unlock session state, NOT an `initialState()` return.
+pub fn preflightAuthState() api_auth.AuthState {
+    return api_auth.initialState();
 }
 
 // =============================================================================
@@ -154,11 +174,18 @@ pub fn main(init: std.process.Init) !void {
     const elapsed_ns: u64 = @intCast(std.Io.Timestamp.durationTo(cold_start, now).nanoseconds);
     warnIfColdStartExceeded(init.io, elapsed_ns) catch {};
 
+    // Auth preflight (REQ-TUI-038) — resolve the starting AuthState
+    // (fstatat-only) before Runtime.run() and thread it through Config.
+    // The TUI thread uses it to seed the modal state (.key_entry vs
+    // .unlock_prompt).
+    const auth_state = preflightAuthState();
+
     // Runtime.run() delegation. R-PR 2 ships the R-PR 1 Runtime stub;
     // R-PR 4 replaces the TUI thread body with the real mibu lifecycle.
     var rt = runtime.Runtime.spawn(.{
         .mock_mode = parsed.mock_mode,
         .tls_gated = parsed.tls_gated,
+        .initial_auth_state = auth_state,
     }) catch {
         std.process.exit(1);
     };

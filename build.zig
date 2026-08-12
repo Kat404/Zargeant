@@ -159,8 +159,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/tui/runtime_thread.zig"),
         .imports = &.{
             .{ .name = "mibu", .module = mibu_mod },
+            .{ .name = "api_auth", .module = lib_mod },
             .{ .name = "api_client", .module = lib_mod },
             .{ .name = "channels", .module = lib_mod },
+            .{ .name = "main", .module = lib_mod },
             .{ .name = "modal", .module = lib_mod },
             .{ .name = "mock_server", .module = lib_mod },
             .{ .name = "runtime", .module = lib_mod },
