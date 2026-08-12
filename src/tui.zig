@@ -290,6 +290,11 @@ pub const ThreadArgs = struct {
     /// touch it — it's threaded through so the Agent body can pull port()
     /// and the runtime can call deinit on shutdown.
     mock_handle: ?*@import("mock_server.zig").Handle = null,
+    /// PR 2 (tui-runtime-integration #441, REQ-TUI-038): preflight auth
+    /// state resolved by `main()` before `Runtime.run()`. The TUI thread
+    /// seeds the modal state from this field — `.needs_first_entry` →
+    /// `.key_entry`, `.has_disk_file` → `.unlock_prompt`.
+    initial_auth_state: @import("api_auth.zig").AuthState = .needs_first_entry,
 };
 
 /// TUI thread body (R-PR 4 real impl). Composes tuiThreadInit /

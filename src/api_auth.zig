@@ -286,12 +286,29 @@ pub fn writeWithConsent(io: std.Io, key: []const u8, password: []const u8, path:
 
 /// Returns the auth state. `initialState` only stats the file — NEVER
 /// reads the file content. Returns .has_disk_file if the file exists per
-/// fstatat, .needs_first_entry otherwise.
+/// statx, .needs_first_entry otherwise.
 pub fn initialState() AuthState {
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = xdgCredentialsPath(&path_buf) orelse return .needs_first_entry;
-    var stat: std.posix.Stat = undefined;
-    const rc = std.os.linux.fstatat(std.posix.AT.FDCWD, path.ptr, &stat, 0);
+    // ponytail: std.os.linux.fstatat was removed in Zig 0.16; use the
+    // statx syscall (number 332 on x86_64) directly. We only care whether
+    // the file exists (rc == 0), not the stat data — so the Statx buffer
+    // is never read. Copy into a separate buffer that has room for the
+    // null terminator (the `path` slice is exactly `path.len` bytes —
+    // the `:0` cast would write a zero out of bounds).
+    var path_z_buf: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= path_z_buf.len) return .needs_first_entry;
+    @memcpy(path_z_buf[0..path.len], path);
+    path_z_buf[path.len] = 0;
+    var statx_buf: std.os.linux.Statx = undefined;
+    const path_z: [:0]const u8 = path_z_buf[0..path.len :0];
+    const rc = std.os.linux.statx(
+        std.posix.AT.FDCWD,
+        path_z.ptr,
+        0,
+        .{ .TYPE = true },
+        &statx_buf,
+    );
     return if (rc == 0) .has_disk_file else .needs_first_entry;
 }
 

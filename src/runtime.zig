@@ -52,6 +52,11 @@ pub const Config = struct {
     /// PR 1 (tui-runtime-integration #441, REQ-TUI-033): optional mock
     /// server handle threaded into the Agent body so it can pull the port.
     mock_handle: ?*@import("mock_server.zig").Handle = null,
+    /// PR 2 (tui-runtime-integration #441, REQ-TUI-038): preflight auth
+    /// state resolved by `main()` before `Runtime.run()`. The TUI thread
+    /// reads it via ThreadArgs to seed the modal state (`.key_entry` when
+    /// `.needs_first_entry`, `.unlock_prompt` when `.has_disk_file`).
+    initial_auth_state: @import("api_auth.zig").AuthState = .needs_first_entry,
 };
 
 /// Agent-thread owned classification of ChunkEvent.err results (REQ-TUI-026).

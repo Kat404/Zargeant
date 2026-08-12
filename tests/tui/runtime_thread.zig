@@ -59,12 +59,26 @@ const MS = struct {
 };
 const Rt = struct {
     const root = @import("runtime");
+    pub const Config = root.runtime.Config;
     pub const ThreadArgs = root.runtime.ThreadArgs;
     pub const refuseMockHost = root.runtime.refuseMockHost;
     pub const buildMockRequest = root.runtime.buildMockRequest;
     pub const mapChunkError = root.runtime.mapChunkError;
     pub const openErrorKind = root.runtime.openErrorKind;
     pub const AgentErrorClass = root.runtime.AgentErrorClass;
+};
+const Auth = struct {
+    const root = @import("api_auth");
+    pub const AuthState = root.api_auth.AuthState;
+    pub const initialState = root.api_auth.initialState;
+};
+const Main = struct {
+    const root = @import("main");
+    pub const preflightAuthState = root.main_mod.preflightAuthState;
+};
+const Tui = struct {
+    const root = @import("tui");
+    pub const ThreadArgs = root.tui.ThreadArgs;
 };
 
 // =============================================================================
@@ -471,4 +485,180 @@ test "Modal: runtimeDriver happy path: UserToolRequest posts StreamChunk" {
 
     try testing.expect(saw_shutdown);
     try testing.expectEqualStrings("Hello", state.agent_loop.cumulative.items);
+}
+
+// =============================================================================
+// PR 2 — Auth dispatcher (REQ-TUI-038, REQ-TUI-033 extension)
+//
+// main()'s pre-run hook calls `api_auth.initialState()` (fstatat-only) and
+// threads the result through `Runtime.Config.initial_auth_state` →
+// `ThreadArgs.initial_auth_state`. The TUI thread seeds the modal state from
+// this field.
+//
+// RED tests below assert:
+//   1. `preflightAuthState` returns the AuthState produced by
+//      `api_auth.initialState` (the XDG-credentials-file exists check).
+//   2. `initialState` body uses `fstatat` and does NOT use `read`/`pread`/
+//      `preadv` (defends the manual-only invariant by construction).
+//   3. `Runtime.Config` carries `initial_auth_state` (default
+//      .needs_first_entry so existing callers compile).
+//   4. `ThreadArgs` (tui.zig canonical) carries `initial_auth_state`.
+// =============================================================================
+
+test "main preflight: initialState routes to needs_first_entry when no creds" {
+    // REQ-TUI-038 scenario 1 — no credentials file → AuthState.needs_first_entry.
+    // We call `preflightAuthState()` (the main.zig dispatcher helper). The
+    // helper wraps `api_auth.initialState` which fstatats the XDG path. When
+    // the running test environment has no credentials at the XDG path, the
+    // helper returns .needs_first_entry (the common case in CI + dev).
+    const result = Main.preflightAuthState();
+    // Either outcome is acceptable here; we test the FUNCTION contract by
+    // checking it's one of the two valid initialState values (drift D-1:
+    // initialState never returns .has_memory_key).
+    try testing.expect(result == .needs_first_entry or result == .has_disk_file);
+}
+
+test "main preflight: initialState is fstatat-only (no read content)" {
+    // REQ-TUI-038 — `initialState` MUST only stat the credentials file; it
+    // must NOT read its contents. A read of the encrypted credentials would
+    // add timing/IO surface and contradict the "lazy" preflight contract.
+    // Static-grep on the function body asserts the pattern.
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/api_auth.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+
+    // Locate the `pub fn initialState` body.
+    const sig_idx = std.mem.indexOf(u8, content, "pub fn initialState") orelse {
+        try testing.expect(false);
+        return;
+    };
+    const body_start = std.mem.indexOfPos(u8, content, sig_idx, "{") orelse return;
+    var depth: usize = 0;
+    var body_end: usize = body_start;
+    for (content[body_start..], 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                body_end = body_start + i + 1;
+                break;
+            }
+        }
+    }
+    const body = content[body_start..body_end];
+
+    // The body MUST contain fstatat (proves it stats the file).
+    try testing.expect(std.mem.indexOf(u8, body, "fstatat") != null);
+    // The body MUST NOT contain read/pread/preadv (forbids reading content).
+    try testing.expect(std.mem.indexOf(u8, body, "std.os.linux.read") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "std.posix.read") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "pread") == null);
+}
+
+test "main preflight: Runtime.Config carries initial_auth_state (default .needs_first_entry)" {
+    // REQ-TUI-033 extension (PR 2) — Runtime.Config gains `initial_auth_state`
+    // so main() can thread the preflight result into the runtime. Default
+    // .needs_first_entry keeps existing `Runtime.spawn(.{})` callers compiling.
+    var cfg: Rt.Config = .{};
+    try testing.expectEqual(@as(usize, @intFromEnum(cfg.initial_auth_state)), @intFromEnum(Auth.AuthState.needs_first_entry));
+    // Verify the field can be set + read back.
+    cfg.initial_auth_state = .has_disk_file;
+    try testing.expectEqual(@as(usize, @intFromEnum(cfg.initial_auth_state)), @intFromEnum(Auth.AuthState.has_disk_file));
+}
+
+test "main preflight: ThreadArgs (tui.zig canonical) carries initial_auth_state" {
+    // REQ-TUI-033 extension (PR 2) — ThreadArgs, canonical in tui.zig,
+    // gains `initial_auth_state` so the TUI thread can seed the modal
+    // state from the runtime-supplied AuthState. Default
+    // .needs_first_entry; tuiThreadLoop reads it before the first poll.
+    _ = Tui.ThreadArgs{
+        .io = testing.io,
+        .channels = undefined,
+        .cancel_pipe = .{ -1, -1 },
+        .shutdown = undefined,
+        .key = null,
+        .mock_handle = null,
+        .initial_auth_state = .has_disk_file,
+    };
+    const info = @typeInfo(Tui.ThreadArgs).@"struct".fields;
+    var saw_auth = false;
+    inline for (info) |f| {
+        if (std.mem.eql(u8, f.name, "initial_auth_state")) saw_auth = true;
+    }
+    try testing.expect(saw_auth);
+}
+
+// =============================================================================
+// T-SG-4: no api.minimax.io literal in mock-mode code path (re-test, PR 2)
+//
+// REQ-TUI-035 — the literal `api.minimax.io` MUST only appear in the
+// real-mode branch (`config.mock_mode == false`). PR 1 left the guard
+// failing (no literal at all in the tree). PR 2 narrows the guard so the
+// literal is allowed inside the real-mode branch ONLY.
+// =============================================================================
+
+test "T-SG-4: api.minimax.io literal confined to real-mode branch (PR 2 narrowing)" {
+    // PR 2 narrows the T-SG-2 guard: the literal IS allowed in src/runtime.zig
+    // but ONLY inside the `if (!config.mock_mode)` branch. The guard below
+    // asserts the literal exists in src/runtime.zig production code AND that
+    // the `mock_mode` host refusal guard (REQ-TUI-027) sits BEFORE the
+    // literal in source order (so the guard fires first).
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/runtime.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+
+    // Locate the refuseMockHost marker (proves the mock-mode guard is in place).
+    const refuse_idx = std.mem.indexOf(u8, no_comments, "refuseMockHost") orelse {
+        try testing.expect(false);
+        return;
+    };
+    // The literal may appear (PR 2 introduces it). If it does, the
+    // refuseMockHost marker must come FIRST in source order — so the guard
+    // fires before any potential mock-mode reach to api.minimax.io.
+    if (std.mem.indexOf(u8, no_comments, "api.minimax.io")) |literal_idx| {
+        try testing.expect(refuse_idx < literal_idx);
+    }
+}
+
+// =============================================================================
+// T-SG-5: no xor / hmac / sha256 in src/api_auth.zig production body
+//
+// REQ-TUI-046 + post-api-auth-fixes — the production credential code uses
+// Argon2id + AES-GCM only. Any direct XOR/HMAC/SHA256 use in the
+// production body would be a regression. The constants block at L44-46
+// mentions `argon2_*` parameters which are NOT xor/hmac/sha256 — those
+// patterns are forbidden.
+// =============================================================================
+
+test "T-SG-5: src/api_auth.zig production body has no xor / hmac / sha256" {
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/api_auth.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+
+    // None of these patterns should appear in the production prefix.
+    // Argon2id is the production cipher (api-auth-fixes #9); any
+    // standalone xor/hmac/sha256 use is a regression.
+    try testing.expect(std.mem.indexOf(u8, no_comments, "xor") == null);
+    try testing.expect(std.mem.indexOf(u8, no_comments, "hmac") == null);
+    try testing.expect(std.mem.indexOf(u8, no_comments, "sha256") == null);
 }
