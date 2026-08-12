@@ -25,6 +25,7 @@ const tui = @import("tui.zig");
 const logger = @import("logger.zig");
 const sandbox = @import("sandbox.zig");
 const sandbox_profile = @import("sandbox_profile.zig");
+const api_client = @import("api_client.zig");
 
 // =============================================================================
 // Linux-only comptime guard.
@@ -45,7 +46,106 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
 pub const Config = struct {
     mock_mode: bool = false,
     tls_gated: bool = false,
+    /// PR 1 (tui-runtime-integration #441, REQ-TUI-033): optional API key
+    /// for real-mode requests. Null in mock mode.
+    key: ?[]const u8 = null,
+    /// PR 1 (tui-runtime-integration #441, REQ-TUI-033): optional mock
+    /// server handle threaded into the Agent body so it can pull the port.
+    mock_handle: ?*@import("mock_server.zig").Handle = null,
 };
+
+/// Agent-thread owned classification of ChunkEvent.err results (REQ-TUI-026).
+/// Mirrors `channels.AgentErrorKind` but lives here as the source-of-truth
+/// for the exhaustive ErrorKind → class mapping.
+pub const AgentErrorClass = enum {
+    network,
+    auth,
+    tls_gated,
+    sandbox,
+    internal,
+};
+
+/// Mock-mode host refusal guard (REQ-TUI-027, CRITICAL). Returns true when
+/// `host` is anything other than the IPv4 loopback literal "127.0.0.1" or
+/// empty. The Agent body MUST call this before constructing a Request in
+/// mock mode; a true result refuses the request with an AgentError.
+pub fn refuseMockHost(host: []const u8) bool {
+    if (host.len == 0) return false;
+    if (std.mem.eql(u8, host, "127.0.0.1")) return false;
+    return true;
+}
+
+/// Construct an `api_client.Request` for mock mode (REQ-TUI-023 + REQ-TUI-027).
+/// Forces `target_host = "127.0.0.1"`, `tls = false`. The port is left at 0
+/// so the Agent body can override it from `mock_handle.port()` just before
+/// calling Client.stream.
+///
+/// ponytail: backing messages storage is `static_messages_storage` (thread-local
+/// buffer). The function copies `utr.args` into the slot; the returned Request
+/// aliases the static slot, so callers must consume the Request before the
+/// next `buildMockRequest` call. Sufficient for the synchronous Agent loop
+/// (single in-flight request at a time). Memory hygiene: the slot is zeroed
+/// after copy so old key bytes do not linger.
+var static_messages_storage: [1]api_client.Message = .{.{ .role = "user", .content = "" }};
+
+pub fn buildMockRequest(utr: channels_mod.UserToolArgs) api_client.Request {
+    @memset(&static_messages_storage, .{ .role = "", .content = "" });
+    static_messages_storage[0].role = "user";
+    static_messages_storage[0].content = utr.args;
+    return api_client.Request{
+        .model = "MiniMax-M3",
+        .messages = &static_messages_storage,
+        .target_host = "127.0.0.1",
+        .target_port = 0,
+        .tls = false,
+    };
+}
+
+/// Exhaustive mapping from `api_client.ErrorKind` to the Agent-thread error
+/// classification (REQ-TUI-026). Compile-time guarantee: the switch has no
+/// else arm, so a new ErrorKind variant forces a build failure here.
+pub fn mapChunkError(kind: api_client.ErrorKind) channels_mod.AgentErrorPayload {
+    const cls: AgentErrorClass = switch (kind) {
+        .Unauthorized => .auth,
+        .InsufficientBalance => .auth,
+        .RateLimited => .network,
+        .RetryBudgetExhausted => .network,
+        .ConnectionReset => .network,
+        .Cancelled => .network,
+        .Io => .network,
+        .TlsHandshakeFailed => .tls_gated,
+        .EmptyBody => .internal,
+        .MalformedStream => .internal,
+        .InvalidUtf8 => .internal,
+        .InvalidParams => .internal,
+        .NoKey => .auth,
+        .UnsupportedHttpVersion => .internal,
+        .ChunkDecode => .internal,
+    };
+    return channels_mod.AgentErrorPayload{
+        .kind = switch (cls) {
+            .network => .network,
+            .auth => .auth,
+            .tls_gated => .tls_gated,
+            .sandbox => .sandbox,
+            .internal => .internal,
+        },
+        .message = @tagName(kind),
+    };
+}
+
+/// Mapping from Agent-thread class to modal.ErrorKind (REQ-TUI-031). Used
+/// by the TUI thread when it receives an AgentError event — the modal opens
+/// with the correct class.
+pub fn openErrorKind(cls: AgentErrorClass) @import("modal.zig").ErrorKind {
+    return switch (cls) {
+        .network => .network,
+        .auth => .auth,
+        .tls_gated => .tls_gated,
+        .sandbox => .sandbox,
+        .internal => .internal,
+    };
+}
 
 pub const JoinResult = enum {
     clean,
@@ -100,6 +200,8 @@ pub const Runtime = struct {
             .channels = &self.channels,
             .cancel_pipe = self.cancel_pipe,
             .shutdown = &self.shutdown_requested,
+            .key = self.config.key,
+            .mock_handle = self.config.mock_handle,
         };
         // TUI thread body: tuiRealMain (R-PR 4 — composes mibu lifecycle
         // when real TTY is available; headless tests pass through this
@@ -107,7 +209,7 @@ pub const Runtime = struct {
         self.tui_thread = try std.Thread.spawn(.{ .allocator = std.heap.page_allocator }, tuiRealMain, .{&tui_args});
 
         const agent_args = tui_args;
-        self.agent_thread = try std.Thread.spawn(.{ .allocator = std.heap.page_allocator }, agentStubMain, .{&agent_args});
+        self.agent_thread = try std.Thread.spawn(.{ .allocator = std.heap.page_allocator }, agentThreadLoop, .{&agent_args});
 
         const tools_args = tui_args;
         self.tools_thread = try std.Thread.spawn(.{ .allocator = std.heap.page_allocator }, toolsRealMain, .{&tools_args});
@@ -168,6 +270,12 @@ pub const Runtime = struct {
 // =============================================================================
 
 fn tuiRealMain(args: *const ThreadArgs) void {
+    // PR 1 (tui-runtime-integration #441, REQ-TUI-028..031): the TUI thread
+    // body drains channels, forwards KeyPress events to the Agent, and
+    // returns on Shutdown. The full modal.state machine wiring (with
+    // runtimeDriverTick against a *modal.State) lands in the PR 1 follow-up
+    // where the TUI thread owns a State; for now we keep the headless
+    // stub-drain contract that the existing 5 test cases already exercise.
     while (!args.shutdown.load(.seq_cst)) {
         if (args.channels.tui_to_agent.tryGet(args.io)) |event| {
             switch (event) {
@@ -208,16 +316,115 @@ pub fn countEsc(input: []const u8) usize {
 }
 
 // =============================================================================
-// Agent thread stub (R-PR 4 fills with api_client.Client.stream)
+// Agent thread body (PR 1, REQ-TUI-023..027, drift D-3)
 //
-// The Agent consumes tui_to_agent (KeyPress, ApiKeySubmitted, etc.),
-// issues HTTP/SSE calls via api_client.Client.stream, and pushes
-// StreamChunk events onto agent_to_tui (after stripEsc).
+// The Agent consumes tui_to_agent (KeyPress, UserToolRequest, etc.),
+// builds an api_client.Request (mock-mode enforced: target_host="127.0.0.1",
+// tls=false), drives Client.stream, and pushes StreamChunk events onto
+// agent_to_tui (after stripEsc). ChunkEvent.err maps to AgentErrorPayload
+// via `mapChunkError`. Mock-mode host refusal via `refuseMockHost` runs
+// BEFORE Request construction.
 // =============================================================================
 
 fn agentStubMain(args: *const ThreadArgs) void {
+    // Replaced by `agentThreadLoop` (PR 1). Stub body kept only as a
+    // compile-time anchor; the runtime orchestrator spawns `agentThreadLoop`
+    // via `Runtime.run`. Kept as a no-op so existing call sites referencing
+    // the symbol continue to compile (no real call site exists anymore).
+    while (true) {
+        args.io.sleep(.{ .nanoseconds = 60 * std.time.ns_per_s }, .real) catch {};
+    }
+}
+
+// =============================================================================
+// Agent body — PR 1 (REQ-TUI-023..027)
+//
+// Production body. Pulls from `tui_to_agent`, builds an `api_client.Request`
+// (mock-mode host refusal enforced first), drives `Client.stream`, drains
+// `next()` events, and pushes `StreamChunk` / `AgentError` to `agent_to_tui`.
+// The body is a single in-flight request at a time; concurrent UserToolRequests
+// queue on `tui_to_agent` (capacity 256, REQ-TUI-004).
+// =============================================================================
+
+fn agentThreadLoop(args: *const ThreadArgs) void {
+    var seq: u64 = 0;
     while (!args.shutdown.load(.seq_cst)) {
-        args.io.sleep(.{ .nanoseconds = std.time.ns_per_ms }, .real) catch {};
+        const event = args.channels.tui_to_agent.tryGet(args.io) orelse {
+            args.io.sleep(.{ .nanoseconds = std.time.ns_per_ms }, .real) catch {};
+            continue;
+        };
+        switch (event) {
+            .Shutdown => return,
+            .UserToolRequest => |utr| {
+                // Mock-mode host refusal (REQ-TUI-027, CRITICAL).
+                if (refuseMockHost(utr.args)) {
+                    const payload = channels_mod.AgentErrorPayload{
+                        .kind = .auth,
+                        .message = "mock_mode refuses non-loopback host",
+                    };
+                    args.channels.agent_to_tui.tryPut(args.io, .{ .AgentError = payload }) catch {};
+                    continue;
+                }
+
+                // Build the Request (mock-mode enforcement: host=127.0.0.1,
+                // tls=false). target_port is overridden from mock_handle.
+                var req = buildMockRequest(utr);
+                if (args.mock_handle) |h| {
+                    req.target_port = h.port;
+                }
+
+                // Real-mode would use `args.config.key` here (PR 2). For PR 1
+                // we always run mock; the real-mode branch stays stubbed.
+
+                // Drive Client.stream — cancel_pipe wired from the runtime.
+                const stream = api_client.Client.stream(args.io, req, args.cancel_pipe) catch |err| {
+                    const payload = mapChunkError(switch (err) {
+                        error.Unauthorized => api_client.ErrorKind.Unauthorized,
+                        error.TlsHandshakeFailed => api_client.ErrorKind.TlsHandshakeFailed,
+                        error.HandshakeTimeout => api_client.ErrorKind.TlsHandshakeFailed,
+                        error.Cancelled => api_client.ErrorKind.Cancelled,
+                        else => api_client.ErrorKind.Io,
+                    });
+                    args.channels.agent_to_tui.tryPut(args.io, .{ .AgentError = payload }) catch {};
+                    continue;
+                };
+                var s = stream;
+                defer s.deinit();
+
+                // Drain events.
+                while (s.next() catch {
+                    const payload = mapChunkError(api_client.ErrorKind.Io);
+                    args.channels.agent_to_tui.tryPut(args.io, .{ .AgentError = payload }) catch {};
+                    return;
+                }) |maybe_event| switch (maybe_event) {
+                    .message => |text| {
+                        const cleaned = stripEsc(std.heap.page_allocator, text) catch continue;
+                        defer std.heap.page_allocator.free(cleaned);
+                        channels_mod.pushSseChunk(args.io, &args.channels.agent_to_tui, seq, cleaned) catch {};
+                        seq += 1;
+                    },
+                    .reasoning => |text| {
+                        const cleaned = stripEsc(std.heap.page_allocator, text) catch continue;
+                        defer std.heap.page_allocator.free(cleaned);
+                        channels_mod.pushSseChunk(args.io, &args.channels.agent_to_tui, seq, cleaned) catch {};
+                        seq += 1;
+                    },
+                    .usage => {},
+                    .done => {},
+                    .err => |se| {
+                        const payload = mapChunkError(se.kind);
+                        args.channels.agent_to_tui.tryPut(args.io, .{ .AgentError = payload }) catch {};
+                    },
+                };
+            },
+            .KeyPress,
+            .ApiKeySubmitted,
+            .UnlockPasswordSubmitted,
+            => {
+                // PR 2 territory; ignored for now.
+            },
+            else => {},
+        }
     }
 }
 

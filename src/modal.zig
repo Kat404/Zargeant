@@ -619,11 +619,72 @@ pub fn drawAgentLoopView(win: *WindowMock, state: *State) !void {
 
 /// Append an SSE text chunk to the cumulative buffer. Caller (the TUI
 /// thread) fires this on every `Event.StreamChunk` arrival.
+///
+/// PR 1 (tui-runtime-integration #441, REQ-TUI-030 + design §"Cumulative
+/// content"): the api_client emits CUMULATIVE snapshots ("Hello",
+/// "Hello world", "Hello world!"). The naive `appendSlice` would duplicate
+/// text. We detect the case where the new text starts with the existing
+/// cumulative prefix and append only the suffix ("Hello world" → " world").
 pub fn appendStreamChunk(io: std.Io, state: *State, text: []const u8) !void {
     const payload = &state.agent_loop;
-    try payload.cumulative.appendSlice(payload.allocator, text);
+    const suffix_start = commonPrefixLen(payload.cumulative.items, text);
+    if (suffix_start < text.len) {
+        try payload.cumulative.appendSlice(payload.allocator, text[suffix_start..]);
+    }
     const ns = std.Io.Timestamp.now(io, .real).nanoseconds;
     payload.last_update_ms = @intCast(ns);
+}
+
+/// Length of the longest common prefix between `a` and `b`. ponytail: inline
+/// scan; SSE chunks are short (<16 KiB), so an O(min(a,b)) loop is fine.
+fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+    const limit = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < limit and a[i] == b[i]) : (i += 1) {}
+    return i;
+}
+
+// =============================================================================
+// runtimeDriver — PR 1 (REQ-TUI-028)
+//
+// Headless state-machine orchestrator. Drains `agent_to_tui` and dispatches
+// events onto the modal `state`:
+//   .StreamChunk → appendStreamChunk (cumulative-delta aware)
+//   .AgentError → openErrorModal (class routed from AgentErrorPayload.kind)
+//   .Shutdown → returns true (caller exits loop)
+// Returns false when more events are pending (call again).
+// ponytail: PR 1 keeps the helper sync (single drain pass) — the TUI
+// thread invokes it once per 16ms poll cycle alongside mibu event polling.
+// =============================================================================
+
+/// Channels accessor alias for the runtime driver (avoids a heavy import).
+pub const RuntimeDriverChannels = struct {
+    agent_to_tui: *@import("channels.zig").Channel(@import("channels.zig").Event),
+};
+
+/// Drain one tick of agent_to_tui events into `state`. Returns true when
+/// `Shutdown` is observed (caller must exit the loop).
+pub fn runtimeDriverTick(io: std.Io, state: *State, channels: RuntimeDriverChannels) !bool {
+    while (channels.agent_to_tui.tryGet(io)) |event| {
+        switch (event) {
+            .StreamChunk => |sc| try appendStreamChunk(io, state, sc.text),
+            .AgentError => |ae| {
+                const kind: ErrorKind = switch (ae.kind) {
+                    .network => .network,
+                    .auth => .auth,
+                    .tls_gated => .tls_gated,
+                    .sandbox => .sandbox,
+                    .internal => .internal,
+                };
+                openErrorModal(state, kind, ae.message);
+            },
+            .Shutdown => return true,
+            .ToolResult => |tr| try appendStreamChunk(io, state, tr.output),
+            .ToolError => |te| openErrorModal(state, .sandbox, te.message),
+            else => {},
+        }
+    }
+    return false;
 }
 
 // =============================================================================

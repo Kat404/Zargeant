@@ -143,6 +143,39 @@ pub fn build(b: *std.Build) void {
     mibu_pin_test_decl.dependOn(&run_mibu_pin_test.step);
     test_decl.dependOn(&run_mibu_pin_test.step);
 
+    // test step: tests/tui/runtime_thread.zig (tui-runtime-integration PR 1,
+    // design#441 drift D-5). Dedicated artifact for runtime × mock_server
+    // end-to-end + static-grep guards (T-SG-1..T-SG-3). Wired as a
+    // separate step to keep the mibu import resolution isolated from the
+    // main test runner (mirrors tests/tui/mibu_smoke.zig pattern).
+    //
+    // The test module imports the lib_mod (root.zig re-exports) once
+    // under each alias name so the test file can use natural module names
+    // like `@import("runtime")`. The build system rejects multiple modules
+    // sharing the same source file, so we route everything through root.
+    const runtime_thread_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/tui/runtime_thread.zig"),
+        .imports = &.{
+            .{ .name = "mibu", .module = mibu_mod },
+            .{ .name = "api_client", .module = lib_mod },
+            .{ .name = "channels", .module = lib_mod },
+            .{ .name = "modal", .module = lib_mod },
+            .{ .name = "mock_server", .module = lib_mod },
+            .{ .name = "runtime", .module = lib_mod },
+            .{ .name = "tui", .module = lib_mod },
+        },
+    });
+    const runtime_thread_test_step = b.addTest(.{ .root_module = runtime_thread_test_mod });
+    const run_runtime_thread_test = b.addRunArtifact(runtime_thread_test_step);
+    const runtime_thread_test_decl = b.step(
+        "test-tui-runtime-thread",
+        "Run tests/tui/runtime_thread.zig (tui-runtime-integration PR 1)",
+    );
+    runtime_thread_test_decl.dependOn(&run_runtime_thread_test.step);
+    test_decl.dependOn(&run_runtime_thread_test.step);
+
     // test step: tools/debug_call.zig in-file grep-fail tests.
     // tls-handrolled (sdd id=323, T3.5): the in-file tests in
     // tools/debug_call.zig MUST be wired into a separate test step so
