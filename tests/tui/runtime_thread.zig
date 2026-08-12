@@ -593,6 +593,78 @@ test "main preflight: ThreadArgs (tui.zig canonical) carries initial_auth_state"
 }
 
 // =============================================================================
+// PR 2 — Auth flow (REQ-TUI-039, REQ-TUI-040)
+//
+// The TUI thread seeds its modal state from `ThreadArgs.initial_auth_state`.
+// `modal.initialModalState(auth_state)` converts the AuthState to a fresh
+// modal.State. The TUI thread calls this once on startup, before its
+// first poll. Subsequent submit handlers (submitKeyEntry, submitUnlock,
+// submitConsentGrant) drive the state machine from there.
+//
+// RED tests below assert:
+//   1. initialModalState(.needs_first_entry) → .key_entry
+//   2. initialModalState(.has_disk_file) → .unlock_prompt
+//   3. initialModalState(.has_memory_key) → .welcome (defensive — not
+//      normally produced by `initialState` but kept safe for in-session
+//      use).
+// =============================================================================
+
+const ModalAuth = struct {
+    const root = @import("modal");
+    pub const initialModalState = root.modal.initialModalState;
+};
+
+test "modal: initialModalState(.needs_first_entry) returns .key_entry" {
+    // REQ-TUI-039 — first-launch path opens KeyEntry so the user can type
+    // their API key. The state must be a fresh .key_entry with no draft.
+    const state = ModalAuth.initialModalState(Auth.AuthState.needs_first_entry);
+    try testing.expect(std.meta.activeTag(state) == .key_entry);
+    try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
+    try testing.expect(state.key_entry.err_msg == null);
+}
+
+test "modal: initialModalState(.has_disk_file) returns .unlock_prompt" {
+    // REQ-TUI-040 — subsequent-launch path opens Unlock so the user
+    // types the passphrase for the existing credentials file.
+    const state = ModalAuth.initialModalState(Auth.AuthState.has_disk_file);
+    try testing.expect(std.meta.activeTag(state) == .unlock_prompt);
+    try testing.expectEqual(@as(usize, 0), state.unlock_prompt.draft_len);
+    try testing.expect(state.unlock_prompt.err_msg == null);
+}
+
+test "modal: initialModalState(.has_memory_key) returns .welcome (defensive)" {
+    // Defensive — `has_memory_key` is a session-only state set after
+    // successful unlock. It should NOT be produced by `initialState` (drift
+    // D-1), but the conversion is safe and returns .welcome so the TUI
+    // thread doesn't crash if it ever appears.
+    const state = ModalAuth.initialModalState(Auth.AuthState.has_memory_key);
+    try testing.expect(std.meta.activeTag(state) == .welcome);
+}
+
+test "TUI body: tuiThreadLoop seeds modal state from initial_auth_state (static-grep)" {
+    // REQ-TUI-039/040 wiring — tuiThreadLoop must call
+    // `modal.initialModalState(args.initial_auth_state)` to seed the
+    // modal state before the first poll. Static-grep: the call site
+    // exists in src/tui.zig.
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/tui.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+    try testing.expect(std.mem.indexOf(u8, no_comments, "initialModalState") != null);
+    try testing.expect(std.mem.indexOf(u8, no_comments, "initial_auth_state") != null);
+}
+
+// =============================================================================
+// T-SG-4: no api.minimax.io literal in mock-mode code path (re-test, PR 2)
+
+// =============================================================================
 // T-SG-4: no api.minimax.io literal in mock-mode code path (re-test, PR 2)
 //
 // REQ-TUI-035 — the literal `api.minimax.io` MUST only appear in the

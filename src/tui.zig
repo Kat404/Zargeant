@@ -301,12 +301,31 @@ pub const ThreadArgs = struct {
 /// tuiThreadLoop / tuiThreadShutdown. The thread is owned by
 /// `runtime.zig` — this file does NOT spawn threads.
 ///
+/// PR 2 (tui-runtime-integration #441, REQ-TUI-039/040): seeds the
+/// modal state from `args.initial_auth_state` (resolved by `main()` via
+/// `preflightAuthState`). The TUI thread creates a fresh `modal.State`
+/// via `modal.initialModalState` and the state machine drives the
+/// subsequent transitions (submitKeyEntry, submitUnlock, etc.) from
+/// there. Headless tests use this same entry point; the full event
+/// dispatch (key → submit, mibu poll → modal render) lands in a
+/// follow-up slice — this PR 2 wires only the auth-state-to-modal
+/// seed.
+///
 /// Loop structure (per design#408 §2.4):
 ///   1. Poll mibu events with a 16ms timeout (mibu.events.nextWithTimeout).
 ///   2. Wrap every render pass in beginSyncUpdate/endSyncUpdate (REQ-TUI-021).
 ///   3. Dispatch events to channels; exit on Shutdown from any channel.
 ///   4. Reset the frame arena after each render (REQ-TUI-003).
 pub fn tuiThreadMain(args: *const ThreadArgs) void {
+    // PR 2: seed modal state from preflight auth state. .needs_first_entry
+    // → .key_entry (first-launch path; user types API key + consent).
+    // .has_disk_file → .unlock_prompt (subsequent-launch; user types
+    // passphrase). The seed is a stack-allocated State that the TUI
+    // thread owns; the Agent thread never touches it.
+    var modal_state: @import("modal.zig").State =
+        @import("modal.zig").initialModalState(args.initial_auth_state);
+    _ = &modal_state; // full event-driven integration lands in follow-up slice
+
     while (!args.shutdown.load(.seq_cst)) {
         if (args.channels.tui_to_agent.tryGet(args.io)) |event| {
             switch (event) {
