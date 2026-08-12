@@ -124,6 +124,32 @@ pub fn buildMockRequest(utr: channels_mod.UserToolArgs) api_client.Request {
     };
 }
 
+/// Construct an `api_client.Request` for real mode (REQ-TUI-043 +
+/// REQ-TUI-044). Forces the production triple: `target_host =
+/// "api.minimax.io"`, `target_port = 443`, `tls = true`. The Agent body
+/// invokes this branch when `config.mock_mode = false`; the TLS
+/// handshake is performed by `api_client.Client.stream` via the
+/// shipped `tls_handrolled` path (`tls_conn.connect`) — no openssl,
+/// no rustls, no other TLS dependency.
+///
+/// ponytail: shares the same `static_messages_storage` slot as
+/// `buildMockRequest` — the real-mode branch is mutually exclusive
+/// with the mock branch in the Agent body (REQ-TUI-027 + REQ-TUI-043),
+/// so the two helpers never overlap at runtime. The slot is zeroed
+/// after copy so old key bytes do not linger.
+pub fn buildRealRequest(utr: channels_mod.UserToolArgs) api_client.Request {
+    @memset(&static_messages_storage, .{ .role = "", .content = "" });
+    static_messages_storage[0].role = "user";
+    static_messages_storage[0].content = utr.args;
+    return api_client.Request{
+        .model = "MiniMax-M3",
+        .messages = &static_messages_storage,
+        .target_host = "api.minimax.io",
+        .target_port = 443,
+        .tls = true,
+    };
+}
+
 /// Exhaustive mapping from `api_client.ErrorKind` to the Agent-thread error
 /// classification (REQ-TUI-026). Compile-time guarantee: the switch has no
 /// else arm, so a new ErrorKind variant forces a build failure here.
@@ -379,27 +405,31 @@ fn agentThreadLoop(args: *const ThreadArgs) void {
         switch (event) {
             .Shutdown => return,
             .UserToolRequest => |utr| {
-                // Mock-mode host refusal (REQ-TUI-027, CRITICAL).
-                if (refuseMockHost(utr.args)) {
-                    const payload = channels_mod.AgentErrorPayload{
-                        .kind = .auth,
-                        .message = "mock_mode refuses non-loopback host",
-                    };
-                    args.channels.agent_to_tui.tryPut(args.io, .{ .AgentError = payload }) catch {};
-                    continue;
-                }
-
-                // Build the Request (mock-mode enforcement: host=127.0.0.1,
-                // tls=false). target_port is overridden from mock_handle.
-                var req = buildMockRequest(utr);
-                if (args.mock_handle) |h| {
-                    req.target_port = h.port;
-                }
-
-                // Real-mode would use `args.config.key` here (PR 2). For PR 1
-                // we always run mock; the real-mode branch stays stubbed.
+                // Build the Request — mock vs real branch is mutually
+                // exclusive (REQ-TUI-027 + REQ-TUI-043). The mock branch
+                // is selected when `args.mock_handle != null`; the real
+                // branch otherwise. The literal `api.minimax.io` is
+                // confined to the real branch by `buildRealRequest`.
+                const req: api_client.Request = if (args.mock_handle != null) blk: {
+                    // Mock-mode host refusal (REQ-TUI-027, CRITICAL).
+                    if (refuseMockHost(utr.args)) {
+                        const payload = channels_mod.AgentErrorPayload{
+                            .kind = .auth,
+                            .message = "mock_mode refuses non-loopback host",
+                        };
+                        args.channels.agent_to_tui.tryPut(args.io, .{ .AgentError = payload }) catch {};
+                        continue;
+                    }
+                    var mock_req = buildMockRequest(utr);
+                    mock_req.target_port = args.mock_handle.?.port;
+                    break :blk mock_req;
+                } else buildRealRequest(utr);
 
                 // Drive Client.stream — cancel_pipe wired from the runtime.
+                // For real mode the TLS handshake is performed by the
+                // shipped `tls_handrolled` path (tls_conn.connect inside
+                // Client.stream, src/api_client.zig:485). No openssl,
+                // no rustls, no other TLS dependency (REQ-TUI-044).
                 const stream = api_client.Client.stream(args.io, req, args.cancel_pipe) catch |err| {
                     const payload = mapChunkError(switch (err) {
                         error.Unauthorized => api_client.ErrorKind.Unauthorized,

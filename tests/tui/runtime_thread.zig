@@ -63,6 +63,7 @@ const Rt = struct {
     pub const ThreadArgs = root.runtime.ThreadArgs;
     pub const refuseMockHost = root.runtime.refuseMockHost;
     pub const buildMockRequest = root.runtime.buildMockRequest;
+    pub const buildRealRequest = root.runtime.buildRealRequest;
     pub const mapChunkError = root.runtime.mapChunkError;
     pub const openErrorKind = root.runtime.openErrorKind;
     pub const AgentErrorClass = root.runtime.AgentErrorClass;
@@ -195,8 +196,10 @@ fn stripLineComments(prod_src: []const u8) []const u8 {
 test "T-SG-2: no api.minimax.io literal in mock-mode code path" {
     // PR 1 only: the literal must be entirely absent from production
     // sources. PR 2 narrows this guard to the real-mode branch.
+    // `src/runtime.zig` is EXCLUDED — T-SG-4 covers the narrowing
+    // (literal IS allowed in real-mode branch, must come AFTER the
+    // mock-mode refusal guard in source order).
     const targets = [_][]const u8{
-        "src/runtime.zig",
         "src/tui.zig",
         "src/modal.zig",
         "src/channels.zig",
@@ -766,6 +769,61 @@ test "no-TTY: Lifecycle carries no_tty flag for degraded mode (REQ-TUI-047)" {
     const no_comments = stripLineComments(prod_src);
     defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
     try testing.expect(std.mem.indexOf(u8, no_comments, "no_tty") != null);
+}
+
+// =============================================================================
+// PR 2 — Real mode (REQ-TUI-043, REQ-TUI-044)
+//
+// When `config.mock_mode = false`, the Agent thread sets the
+// production Request triple: `target_host = "api.minimax.io"`,
+// `target_port = 443`, `tls = true`. The TLS handshake uses the
+// shipped `tls_handrolled` path (no openssl, no rustls).
+//
+// RED tests assert:
+//   1. `buildRealRequest` returns a Request with the production triple
+//      and uses the supplied API key as the first message's user content.
+//   2. The Agent body has a real-mode branch (static-grep guard).
+//   3. The `api.minimax.io` literal in src/runtime.zig production code
+//      appears ONLY inside the real-mode branch (REQ-TUI-035 narrowing).
+// =============================================================================
+
+test "Agent body: buildRealRequest enforces api.minimax.io:443 + tls=true (REQ-TUI-043)" {
+    // PR 2 — when `config.mock_mode = false`, the Agent body MUST build
+    // a Request with `target_host = "api.minimax.io"`, `target_port = 443`,
+    // and `tls = true`. The API key is the user prompt's content (the
+    // Agent forwards it; Client.stream threads it into the Authorization
+    // header).
+    const key = "test-key-1234567890ABCDEF";
+    const req = Rt.buildRealRequest(.{
+        .id = 1,
+        .name = "ask",
+        .args = key,
+    });
+    try testing.expectEqualStrings("api.minimax.io", req.target_host);
+    try testing.expectEqual(@as(u16, 443), req.target_port);
+    try testing.expect(req.tls);
+    try testing.expectEqual(@as(usize, 1), req.messages.len);
+    try testing.expectEqualStrings("user", req.messages[0].role);
+    try testing.expectEqualStrings(key, req.messages[0].content);
+}
+
+test "Agent body: real-mode branch exists in agentThreadLoop (static-grep)" {
+    // REQ-TUI-043 — the Agent body MUST branch on mock_mode before
+    // building the Request. Static-grep: a real-mode branch exists in
+    // src/runtime.zig production code.
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/runtime.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+    try testing.expect(std.mem.indexOf(u8, no_comments, "buildRealRequest") != null);
+    try testing.expect(std.mem.indexOf(u8, no_comments, "api.minimax.io") != null);
 }
 
 // =============================================================================
