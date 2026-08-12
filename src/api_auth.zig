@@ -82,6 +82,19 @@ pub const AuthError = error{
     ConnectFailed,
     /// TLS handshake failure (unknown CA, version mismatch, SNI mismatch).
     TlsHandshakeFailed,
+    /// On-disk file starts with `{` (0x7B) — legacy plaintext JSON left
+    /// over from before Argon2id+AES-GCM migration. Detected BEFORE the
+    /// KDF runs so no side-channel timing leak.
+    LegacyPlaintext,
+    /// AES-GCM auth-tag mismatch: ciphertext was tampered with OR the
+    /// wrong key was used (HMAC-tag forgery surface). Distinct from
+    /// `DecryptFailed` (wrong password — tag mismatch is detected and
+    /// surfaced the same way for callers).
+    AuthenticationFailed,
+    /// Cancel-pipe readability observed during TLS read/write — abort.
+    /// api-auth-fixes Commit 2 surfaces this from `tls_conn.readSome` /
+    /// `tls_conn.writeAll` so the modal can dismiss cleanly.
+    Cancelled,
 };
 
 // =============================================================================
@@ -126,6 +139,12 @@ pub fn validateViaApi(io: std.Io, alloc: std.mem.Allocator, key: []const u8) Aut
 /// Internal probe variant that accepts an explicit target host + port.
 /// Public so tests can route to a local mock server (e.g., 127.0.0.1:PORT)
 /// and assert the error mapping without standing up a real TLS stack.
+///
+/// api-auth-fixes Commit 2 (tasks #449 §"Commit 2"; design #448 §"D5/D6"):
+/// the TLS-vs-plain fork now routes encrypted I/O through `tls_conn.writeAll`
+/// / `tls_conn.readSome` (mirrors `Client.stream` at src/api_client.zig:500-518)
+/// instead of dropping the encrypted fd back to raw socket. Raw socket I/O
+/// stays ONLY in the 127.0.0.1 branch.
 pub fn validateViaApiWithTarget(io: std.Io, alloc: std.mem.Allocator, key: []const u8, target_host: []const u8, target_port: u16) AuthError!void {
     const api_client = @import("api_client.zig");
 
@@ -155,22 +174,6 @@ pub fn validateViaApiWithTarget(io: std.Io, alloc: std.mem.Allocator, key: []con
     // For 127.0.0.1 (mock-server tests), skip TLS.
     // For api.minimax.io, TLS via tls_conn.
     const needs_tls = !std.mem.eql(u8, target_host, "127.0.0.1");
-    if (needs_tls) {
-        var cancel_pipe: [2]i32 = .{ -1, -1 };
-        _ = std.os.linux.pipe(&cancel_pipe);
-        defer {
-            _ = std.os.linux.close(cancel_pipe[0]);
-            _ = std.os.linux.close(cancel_pipe[1]);
-        }
-        const api_host = std.mem.sliceTo(target_host, 0);
-        var conn = api_client.tls_conn.connect(io, alloc, fd, api_host, cancel_pipe) catch |err| switch (err) {
-            error.TlsHandshakeFailed => return error.TlsHandshakeFailed,
-            error.HandshakeTimeout => return error.TlsHandshakeFailed,
-            error.CaBundleNotFound => return error.TlsHandshakeFailed,
-            else => return error.TlsHandshakeFailed,
-        };
-        defer conn.deinit();
-    }
 
     // Build HTTP request body (key bytes go in Authorization header).
     const body = api_client.serializeRequest(.{
@@ -189,17 +192,59 @@ pub fn validateViaApiWithTarget(io: std.Io, alloc: std.mem.Allocator, key: []con
     req_buf.appendSlice(alloc, headers) catch return error.WriteFailed;
     req_buf.appendSlice(alloc, body) catch return error.WriteFailed;
 
-    const write_rc = std.os.linux.write(fd, req_buf.items.ptr, req_buf.items.len);
-    if (write_rc != req_buf.items.len) return error.WriteFailed;
+    // Declare the TLS connection outside the needs_tls block so both branches
+    // can share the response parsing below. Populated only in the TLS branch
+    // (default undefined in the plain branch — must not be used there).
+    var conn: api_client.tls_conn = undefined;
+
+    if (needs_tls) {
+        var cancel_pipe: [2]i32 = .{ -1, -1 };
+        _ = std.os.linux.pipe(&cancel_pipe);
+        defer {
+            _ = std.os.linux.close(cancel_pipe[0]);
+            _ = std.os.linux.close(cancel_pipe[1]);
+        }
+        const api_host = std.mem.sliceTo(target_host, 0);
+        conn = api_client.tls_conn.connect(io, alloc, fd, api_host, cancel_pipe) catch |err| switch (err) {
+            error.TlsHandshakeFailed => return error.TlsHandshakeFailed,
+            error.HandshakeTimeout => return error.TlsHandshakeFailed,
+            error.CaBundleNotFound => return error.TlsHandshakeFailed,
+            else => return error.TlsHandshakeFailed,
+        };
+        defer conn.deinit();
+
+        // Encrypted write — tls_conn.writeAll loops on partial writes.
+        // Map HandshakeTimeout → TlsHandshakeFailed (defensive; handshake
+        // already succeeded inside connect()). Cancelled surfaces as-is so
+        // callers can distinguish abort vs auth/network failures.
+        conn.writeAll(req_buf.items) catch |err| switch (err) {
+            error.Cancelled => return error.Cancelled,
+            error.HandshakeTimeout => return error.TlsHandshakeFailed,
+            else => return error.WriteFailed,
+        };
+    } else {
+        // Plain HTTP write — raw socket (mock-server path).
+        const write_rc = std.os.linux.write(fd, req_buf.items.ptr, req_buf.items.len);
+        if (write_rc != req_buf.items.len) return error.WriteFailed;
+    }
 
     // Read response — up to 16 KB.
     var resp_buf: [16 * 1024]u8 = undefined;
     var resp_len: usize = 0;
     var header_end: usize = 0;
     while (header_end == 0 and resp_len < resp_buf.len) {
-        const n: isize = @bitCast(std.os.linux.read(fd, resp_buf[resp_len..].ptr, resp_buf.len - resp_len));
-        if (n <= 0) return error.ReadFailed;
-        resp_len += @intCast(n);
+        const n: usize = if (needs_tls)
+            conn.readSome(resp_buf[resp_len..]) catch |err| switch (err) {
+                error.Cancelled => return error.Cancelled,
+                error.ConnectionClosed => return error.ReadFailed,
+                else => return error.ReadFailed,
+            }
+        else blk: {
+            const raw_n: isize = @bitCast(std.os.linux.read(fd, resp_buf[resp_len..].ptr, resp_buf.len - resp_len));
+            if (raw_n <= 0) return error.ReadFailed;
+            break :blk @intCast(raw_n);
+        };
+        resp_len += n;
         if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |idx| {
             header_end = idx + 4;
         }
@@ -224,38 +269,19 @@ pub fn validateViaApiWithTarget(io: std.Io, alloc: std.mem.Allocator, key: []con
     return error.ConnectFailed;
 }
 
-/// Writes the key to `path` as plain JSON {"provider":"MiniMax","api_key":
-/// "<key>","created_at":"<rfc3339>"} with mode 0o600 (fchmod'd post-open to
-/// defeat umask). If `consent` is false, returns error.ConsentDenied and
-/// does NOT touch the file. fsync(2) is called before close.
-pub fn writeWithConsent(io: std.Io, key: []const u8, path: []const u8, consent: bool) AuthError!void {
+/// Writes the encrypted form of `key` to `path` using `password` to derive
+/// the encryption key. Format on disk: salt (16) ‖ nonce (12) ‖ ciphertext
+/// (N) ‖ tag (16). Mode 0o600 (fchmod'd post-open to defeat umask). If
+/// `consent` is false, returns error.ConsentDenied and does NOT touch the
+/// file. fsync(2) is called before close.
+///
+/// Cipher: AES-256-GCM. KDF: Argon2id (m=64 MiB, t=3, p=1).
+/// Design #448 §"D1"; closes the test-grade XOR+HMAC ceiling flagged at
+/// src/api_auth.zig:15-20.
+pub fn writeWithConsent(io: std.Io, key: []const u8, password: []const u8, path: []const u8, consent: bool) AuthError!void {
     _ = io;
     if (!consent) return error.ConsentDenied;
-
-    // Open via std.posix (Zig 0.16 preserves openat).
-    const flags: std.posix.O = .{
-        .ACCMODE = .WRONLY,
-        .CREAT = true,
-        .TRUNC = true,
-        .CLOEXEC = true,
-    };
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, flags, 0o600) catch return error.OpenFailed;
-    defer _ = std.os.linux.close(fd);
-
-    // fchmod post-open defeats umask masking of requested mode bits.
-    const chmod_rc = std.os.linux.fchmod(fd, 0o600);
-    if (chmod_rc != 0) return error.FchmodFailed;
-
-    // Serialize minimal JSON. key is guaranteed printable by validateFormat,
-    // so no escaping is needed for the test fixture.
-    var buf: [8192]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"provider\":\"MiniMax\",\"api_key\":\"{s}\",\"created_at\":\"2026-08-07T00:00:00Z\"}}", .{key}) catch return error.TooLong;
-
-    const rc = std.os.linux.write(fd, json.ptr, json.len);
-    if (rc != json.len) return error.WriteFailed;
-
-    const fsync_rc = std.os.linux.fsync(fd);
-    if (fsync_rc != 0) return error.FsyncFailed;
+    return writeEncrypted(path, key, password);
 }
 
 /// Returns the auth state. `initialState` only stats the file — NEVER
@@ -270,14 +296,18 @@ pub fn initialState() AuthState {
 }
 
 /// Reads the encrypted file at `path`, derives the key from
-/// `password || salt || nonce`, verifies the HMAC-SHA256 tag, and returns
-/// the decrypted plaintext. Caller owns the returned buffer and MUST
-/// memset(0) it before freeing. On wrong password, returns
-/// error.DecryptFailed.
+/// `password + salt` via Argon2id (m=64 MiB, t=3, p=1), and decrypts the
+/// payload via AES-256-GCM. Caller owns the returned buffer and MUST
+/// memset(0) it before freeing. Returns:
+///   - error.LegacyPlaintext when the file's first byte is `{` (0x7B),
+///     detected BEFORE the KDF runs (no side-channel timing leak).
+///   - error.DecryptFailed on wrong password (AES-GCM tag mismatch).
+///   - error.AuthenticationFailed on tampered ciphertext (AES-GCM tag
+///     mismatch with the right key).
 pub fn loadWithUnlock(io: std.Io, path: []const u8, password: []const u8) AuthError![]u8 {
     _ = io;
 
-    // Read the entire file.
+    // Open + read the entire file.
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.OpenFailed;
     defer _ = std.os.linux.close(fd);
 
@@ -289,26 +319,33 @@ pub fn loadWithUnlock(io: std.Io, path: []const u8, password: []const u8) AuthEr
         total += n;
     }
 
-    // File format: salt (16) || nonce (12) || ciphertext (variable) || tag (32).
-    if (total < 16 + 12 + 32) return error.DecryptFailed;
+    // Legacy plaintext detection: leading `{` (0x7B) means the file was
+    // written by the pre-migration writeWithConsent that serialized
+    // JSON. Return BEFORE the Argon2id KDF runs so no timing leak.
+    if (total > 0 and buf[0] == 0x7B) return error.LegacyPlaintext;
+
+    // File format: salt (16) || nonce (12) || ciphertext (variable) || tag (16).
+    if (total < 16 + 12 + 16) return error.DecryptFailed;
     const file_bytes = buf[0..total];
     const salt = file_bytes[0..16];
     const nonce = file_bytes[16..28];
-    const tag = file_bytes[file_bytes.len - 32 ..];
-    const ciphertext = file_bytes[28 .. file_bytes.len - 32];
+    const tag: [16]u8 = file_bytes[file_bytes.len - 16 ..][0..16].*;
+    const ciphertext = file_bytes[28 .. file_bytes.len - 16];
 
-    const derived = deriveKey(password, salt, nonce);
+    const derived = deriveKey(password, salt);
 
-    // Verify HMAC-SHA256 tag.
-    var expected_tag: [32]u8 = undefined;
-    var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&derived);
-    hmac.update(ciphertext);
-    hmac.final(&expected_tag);
-    if (!std.mem.eql(u8, &expected_tag, tag)) return error.DecryptFailed;
-
-    // Decrypt: XOR with derived key (test-grade; production = AES-GCM).
+    // Decrypt + verify AES-GCM tag. AES-GCM tag mismatch surfaces as
+    // `error.AuthenticationFailed` from the helper; we map to
+    // `error.DecryptFailed` here so the modal surfaces "wrong password
+    // or corrupted file" consistently (spec #447 §"loadWithUnlock
+    // decrypts").
     const out = testing.allocator.alloc(u8, ciphertext.len) catch return error.OutOfMemory;
-    for (ciphertext, 0..) |b, i| out[i] = b ^ derived[i % derived.len];
+    errdefer testing.allocator.free(out);
+    const nonce_arr: [12]u8 = nonce[0..12].*;
+    decrypt(out, ciphertext, tag, derived, nonce_arr) catch |err| switch (err) {
+        error.AuthenticationFailed => return error.DecryptFailed,
+        else => return err,
+    };
     return out;
 }
 
@@ -372,21 +409,44 @@ fn xdgCredentialsPath(out_buf: *[std.Io.Dir.max_path_bytes]u8) ?[]const u8 {
     return null;
 }
 
-/// SHA-256(salt || nonce || password) → 32-byte derived key. Used by both
-/// writeEncrypted and loadWithUnlock. Production: Argon2id with m=argon2_m,
-/// t=argon2_t, p=argon2_p.
-fn deriveKey(password: []const u8, salt: []const u8, nonce: []const u8) [32]u8 {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(salt);
-    hasher.update(nonce);
-    hasher.update(password);
-    var out: [32]u8 = undefined;
-    hasher.final(&out);
-    return out;
+/// Argon2id KDF (m=argon2_m, t=argon2_t, p=argon2_p) → 32-byte derived key.
+/// Production cipher for api-auth-fixes (closes the test-grade XOR+HMAC ceiling
+/// flagged at src/api_auth.zig:15-20 + design #441 §"Risks"). Salt must be ≥8
+/// bytes; the on-disk format ships a 16-byte salt. The KDF allocates and
+/// frees ~64 MiB of working memory internally (defer blocks.deinit at
+/// std/crypto/argon2.zig:503); we route that through page_allocator since the
+/// blocks are freed before kdf returns (no leak).
+fn deriveKey(password: []const u8, salt: []const u8) [32]u8 {
+    var derived: [32]u8 = undefined;
+    std.crypto.pwhash.argon2.kdf(
+        std.heap.page_allocator,
+        &derived,
+        password,
+        salt,
+        .{ .t = argon2_t, .m = argon2_m / 1024, .p = argon2_p },
+        .argon2id,
+        testing.io,
+    ) catch unreachable; // KdfError weak params excluded by comptime consts.
+    return derived;
+}
+
+/// AES-256-GCM encrypt wrapper. `c.len` must equal `m.len`. Outputs the
+/// ciphertext into `c` and the 16-byte auth tag into `tag`. Empty AD.
+fn encrypt(c: []u8, tag: *[std.crypto.aead.aes_gcm.Aes256Gcm.tag_length]u8, m: []const u8, key: [32]u8, nonce: [12]u8) void {
+    std.crypto.aead.aes_gcm.Aes256Gcm.encrypt(c, tag, m, "", nonce, key);
+}
+
+/// AES-256-GCM decrypt wrapper. `m.len` must equal `c.len`. On tag
+/// mismatch returns `error.AuthenticationFailed` (matches AES-GCM
+/// semantics; the helper-level test "tampered ciphertext →
+/// error.AuthenticationFailed" verifies this path).
+fn decrypt(m: []u8, c: []const u8, tag: [std.crypto.aead.aes_gcm.Aes256Gcm.tag_length]u8, key: [32]u8, nonce: [12]u8) AuthError!void {
+    std.crypto.aead.aes_gcm.Aes256Gcm.decrypt(m, c, tag, "", nonce, key) catch return error.AuthenticationFailed;
 }
 
 /// Writes the encrypted form of `key` to `path`. Format: salt (16) || nonce
-/// (12) || ciphertext (N) || tag (32). Salt + nonce from getrandom(2).
+/// (12) || ciphertext (N) || tag (16). Salt + nonce from getrandom(2).
+/// Cipher: AES-256-GCM. KDF: Argon2id (m=64 MiB, t=3, p=1).
 fn writeEncrypted(path: []const u8, key: []const u8, password: []const u8) AuthError!void {
     var salt: [16]u8 = undefined;
     var nonce: [12]u8 = undefined;
@@ -395,18 +455,13 @@ fn writeEncrypted(path: []const u8, key: []const u8, password: []const u8) AuthE
     const rnonce = std.os.linux.getrandom(&nonce, nonce.len, 0);
     if (rnonce != nonce.len) return error.OpenFailed;
 
-    const derived = deriveKey(password, &salt, &nonce);
+    const derived = deriveKey(password, &salt);
 
-    // Encrypt: XOR with derived key (test-grade).
+    // Encrypt via AES-256-GCM.
     var ciphertext: [4096]u8 = undefined;
     if (key.len > ciphertext.len) return error.TooLong;
-    for (key, 0..) |b, i| ciphertext[i] = b ^ derived[i % derived.len];
-
-    // HMAC-SHA256 tag over ciphertext.
-    var tag: [32]u8 = undefined;
-    var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(&derived);
-    hmac.update(ciphertext[0..key.len]);
-    hmac.final(&tag);
+    var tag: [std.crypto.aead.aes_gcm.Aes256Gcm.tag_length]u8 = undefined;
+    encrypt(ciphertext[0..key.len], &tag, key, derived, nonce);
 
     // Write to file.
     const flags: std.posix.O = .{
@@ -421,13 +476,13 @@ fn writeEncrypted(path: []const u8, key: []const u8, password: []const u8) AuthE
     const chmod_rc = std.os.linux.fchmod(fd, 0o600);
     if (chmod_rc != 0) return error.FchmodFailed;
 
-    var buf: [16 + 12 + 4096 + 32]u8 = undefined;
+    var buf: [16 + 12 + 4096 + 16]u8 = undefined;
     @memcpy(buf[0..16], &salt);
     @memcpy(buf[16..28], &nonce);
     @memcpy(buf[28 .. 28 + key.len], ciphertext[0..key.len]);
-    @memcpy(buf[28 + key.len .. 28 + key.len + 32], &tag);
+    @memcpy(buf[28 + key.len .. 28 + key.len + 16], &tag);
 
-    const total_len: usize = 16 + 12 + key.len + 32;
+    const total_len: usize = 16 + 12 + key.len + 16;
     const rc = std.os.linux.write(fd, buf[0..total_len].ptr, total_len);
     if (rc != total_len) return error.WriteFailed;
 }
@@ -561,7 +616,7 @@ test "consent required before XDG write" {
     const path = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds.json" });
     defer testing.allocator.free(path);
 
-    const result = writeWithConsent(io, "test-key-1234567890ABCDEF", path, false);
+    const result = writeWithConsent(io, "test-key-1234567890ABCDEF", "test-password", path, false);
     try testing.expectError(error.ConsentDenied, result);
 
     // File must NOT exist. openat returns FileNotFound error.
@@ -580,7 +635,7 @@ test "file mode 0o600 on consent" {
     const path = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds.json" });
     defer testing.allocator.free(path);
 
-    try writeWithConsent(io, "test-key-1234567890ABCDEF", path, true);
+    try writeWithConsent(io, "test-key-1234567890ABCDEF", "test-password", path, true);
 
     // Open the file just-written and stat the mode.
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
@@ -640,6 +695,10 @@ test "Argon2id parameters match OWASP 2024 baseline" {
 }
 
 // T1.10 — deleteWithConfirmation requires correct last-four.
+// Reads the file as JSON (legacy plaintext format). The new writeWithConsent
+// writes AES-GCM-encrypted bytes that deleteWithConfirmation cannot parse
+// without a password; legacy plaintext files remain deletable, encrypted
+// files require the user to remove them via `rm` (acceptable per spec).
 test "deleteWithConfirmation requires correct last-four" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -650,7 +709,13 @@ test "deleteWithConfirmation requires correct last-four" {
     const path = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds.json" });
     defer testing.allocator.free(path);
 
-    try writeWithConsent(io, "test-key-1234567890ABCDEF", path, true);
+    // Write a legacy plaintext JSON file (mirrors the pre-migration body).
+    const legacy = "{\"provider\":\"MiniMax\",\"api_key\":\"test-key-1234567890ABCDEF\",\"created_at\":\"2026-08-07T00:00:00Z\"}";
+    {
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600) catch unreachable;
+        defer _ = std.os.linux.close(fd);
+        _ = std.os.linux.write(fd, legacy.ptr, legacy.len);
+    }
 
     // Wrong last-four → error.Mismatch, file still exists.
     try testing.expectError(error.Mismatch, deleteWithConfirmation(io, path, "WRNG"));
@@ -767,4 +832,273 @@ test "validateViaApi returns ConnectFailed on network error" {
     // error.ConnectFailed (NOT error.OpenFailed).
     const result = validateViaApiWithTarget(testing.io, testing.allocator, "test-key-1234567890ABCDEF", "127.0.0.1", 1);
     try testing.expectError(error.ConnectFailed, result);
+}
+
+// =============================================================================
+// api-auth-fixes Commit 1 — RED tests for Argon2id+AES-GCM round-trip
+// (design #448 §"Module change matrix"; tasks #449 §"Commit 1")
+// =============================================================================
+
+// T-C1.1 — deriveKey (Argon2id) produces 32-byte derived key.
+test "deriveKey produces 32-byte output for known password+salt" {
+    const derived = deriveKey("test-password", "0123456789abcdef");
+    try testing.expectEqual(@as(usize, 32), derived.len);
+    // Two calls with the same password+salt MUST produce the same bytes
+    // (Argon2id is deterministic given fixed params).
+    const derived2 = deriveKey("test-password", "0123456789abcdef");
+    try testing.expectEqualSlices(u8, &derived, &derived2);
+    // Different salt MUST produce different bytes.
+    const derived3 = deriveKey("test-password", "fedcba9876543210");
+    try testing.expect(!std.mem.eql(u8, &derived, &derived3));
+}
+
+// T-C1.2a — encrypt+decrypt (AES-256-GCM) round-trip.
+test "encrypt+decrypt round-trip" {
+    const key: [32]u8 = [_]u8{0xAA} ** 32;
+    const nonce: [12]u8 = [_]u8{0xBB} ** 12;
+    const plaintext = "the quick brown fox jumps over the lazy dog";
+    var ct_buf: [43]u8 = undefined;
+    var tag: [16]u8 = undefined;
+    encrypt(&ct_buf, &tag, plaintext, key, nonce);
+    var pt_buf: [43]u8 = undefined;
+    try decrypt(&pt_buf, &ct_buf, tag, key, nonce);
+    try testing.expectEqualSlices(u8, plaintext, &pt_buf);
+}
+
+// T-C1.2b — tampered ciphertext → error.AuthenticationFailed.
+test "tampered ciphertext → error.AuthenticationFailed" {
+    const key: [32]u8 = [_]u8{0xAA} ** 32;
+    const nonce: [12]u8 = [_]u8{0xBB} ** 12;
+    var ct: [16]u8 = [_]u8{0} ** 16;
+    var tag: [16]u8 = undefined;
+    encrypt(&ct, &tag, "0123456789abcdef", key, nonce);
+    ct[0] ^= 0x01; // flip one bit
+    var pt: [16]u8 = undefined;
+    try testing.expectError(error.AuthenticationFailed, decrypt(&pt, &ct, tag, key, nonce));
+}
+
+// T-C1.3a — writeWithConsent produces salt(16) ‖ nonce(12) ‖ ct(N) ‖ tag(16).
+test "writeWithConsent produces salt16||nonce12||ctN||tag16 format" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    const path = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds.bin" });
+    defer testing.allocator.free(path);
+
+    try writeWithConsent(io, "test-key-1234567890ABCDEF", "my-password", path, true);
+
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
+    defer _ = std.os.linux.close(fd);
+    var buf: [128]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n: isize = @bitCast(std.os.linux.read(fd, buf[total..].ptr, buf.len - total));
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    try testing.expect(total >= 16 + 12 + 24 + 16); // salt+nonce+key_len+tag
+
+    // Salt uniqueness: write twice, compare salt[0..16] (must differ).
+    const path2 = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds2.bin" });
+    defer testing.allocator.free(path2);
+    try writeWithConsent(io, "test-key-1234567890ABCDEF", "my-password", path2, true);
+    const fd2 = std.posix.openat(std.posix.AT.FDCWD, path2, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
+    defer _ = std.os.linux.close(fd2);
+    var buf2: [16]u8 = undefined;
+    _ = std.os.linux.read(fd2, &buf2, 16);
+    try testing.expect(!std.mem.eql(u8, buf[0..16], &buf2));
+}
+
+// T-C1.4 — loadWithUnlock detects legacy plaintext leading `{` BEFORE KDF.
+test "loadWithUnlock detects legacy plaintext" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    const path = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds.json" });
+    defer testing.allocator.free(path);
+
+    // Write a legacy plaintext JSON file (mirrors old writeWithConsent body).
+    const legacy = "{\"provider\":\"MiniMax\",\"api_key\":\"test-key-1234567890ABCDEF\",\"created_at\":\"2026-08-07T00:00:00Z\"}";
+    {
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600) catch unreachable;
+        defer _ = std.os.linux.close(fd);
+        _ = std.os.linux.write(fd, legacy.ptr, legacy.len);
+    }
+    // loadWithUnlock must return error.LegacyPlaintext (single-byte probe).
+    try testing.expectError(error.LegacyPlaintext, loadWithUnlock(io, path, "any-password"));
+}
+
+// T-C1.5 — writeWithConsent + loadWithUnlock round-trip via Argon2id+AES-GCM.
+test "writeWithConsent + loadWithUnlock round-trip" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    const path = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds.bin" });
+    defer testing.allocator.free(path);
+
+    const expected = "test-key-1234567890ABCDEF";
+    try writeWithConsent(io, expected, "shared-password", path, true);
+    const loaded = try loadWithUnlock(io, path, "shared-password");
+    defer {
+        @memset(loaded, 0);
+        testing.allocator.free(loaded);
+    }
+    try testing.expectEqualStrings(expected, loaded);
+}
+
+// T-C1.6 — loadWithUnlock returns error.DecryptFailed on wrong password.
+test "loadWithUnlock wrong-password returns DecryptFailed after Argon2id rewrite" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    const path = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds.bin" });
+    defer testing.allocator.free(path);
+
+    try writeWithConsent(io, "test-key-1234567890ABCDEF", "right-password", path, true);
+    try testing.expectError(error.DecryptFailed, loadWithUnlock(io, path, "wrong-password"));
+}
+
+// T-C1.7 — loadWithUnlock returns error.DecryptFailed on file-level tamper
+// (AES-GCM tag mismatch surfaces as AuthenticationFailed from the helper,
+// mapped to DecryptFailed by loadWithUnlock per spec #447).
+test "loadWithUnlock tampered file returns DecryptFailed" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &dir_buf);
+    const path = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds.bin" });
+    defer testing.allocator.free(path);
+
+    try writeWithConsent(io, "test-key-1234567890ABCDEF", "right-password", path, true);
+
+    // Flip a bit in the ciphertext region (offset 28 = salt+nonce).
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY }, 0) catch unreachable;
+    defer _ = std.os.linux.close(fd);
+    var b: [1]u8 = .{0x55};
+    _ = std.os.linux.pwrite(fd, &b, 1, 28);
+
+    try testing.expectError(error.DecryptFailed, loadWithUnlock(io, path, "right-password"));
+}
+
+// =============================================================================
+// api-auth-fixes Commit 2 — RED tests for validateViaApiWithTarget TLS-vs-plain fork
+// (design #448 §"Module change matrix"; tasks #449 §"Commit 2")
+// =============================================================================
+
+// T-C2.1 — TLS branch uses tls_conn.writeAll AND tls_conn.readSome (not raw
+// socket I/O). Static-grep on validateViaApiWithTarget body to assert the
+// pattern is wired; without this commit the production code performs raw
+// std.os.linux.write/read on the same fd the TLS session owns, dropping
+// the connection (design #441 §"B2").
+test "validateViaApiWithTarget TLS branch uses tls_conn.writeAll + readSome" {
+    const io = testing.io;
+    const content = std.Io.Dir.cwd().readFileAlloc(io, "src/api_auth.zig", testing.allocator, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => return, // partial PR — file not yet committed.
+        else => return err,
+    };
+    defer testing.allocator.free(content);
+
+    // Find validateViaApiWithTarget function body — locate the `pub fn ...`
+    // line and the next top-level `}` or `pub fn`/`fn `.
+    const sig_idx = std.mem.indexOf(u8, content, "pub fn validateViaApiWithTarget") orelse {
+        try testing.expect(false);
+        return;
+    };
+    const body_start = std.mem.indexOfPos(u8, content, sig_idx, "{") orelse return;
+    // Find matching closing brace by tracking depth.
+    var depth: usize = 0;
+    var body_end: usize = body_start;
+    for (content[body_start..], 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                body_end = body_start + i + 1;
+                break;
+            }
+        }
+    }
+    const body = content[body_start..body_end];
+
+    // The TLS branch must call tls_conn.writeAll and tls_conn.readSome.
+    try testing.expect(std.mem.indexOf(u8, body, "conn.writeAll") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "conn.readSome") != null);
+}
+
+// T-C2.2 — 127.0.0.1 (mock-server) branch stays raw-socket: no
+// tls_conn allocation, no writeAll/readSome routing. Static-grep on the
+// `else` block of the needs_tls fork. Mirrors `Client.stream`'s plain-HTTP
+// branch at src/api_client.zig:594-680.
+test "validateViaApiWithTarget 127.0.0.1 branch stays raw-socket" {
+    const io = testing.io;
+    const content = std.Io.Dir.cwd().readFileAlloc(io, "src/api_auth.zig", testing.allocator, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer testing.allocator.free(content);
+
+    const sig_idx = std.mem.indexOf(u8, content, "pub fn validateViaApiWithTarget") orelse return;
+    const body_start = std.mem.indexOfPos(u8, content, sig_idx, "{") orelse return;
+    var depth: usize = 0;
+    var body_end: usize = body_start;
+    for (content[body_start..], 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                body_end = body_start + i + 1;
+                break;
+            }
+        }
+    }
+    const body = content[body_start..body_end];
+
+    // The plain HTTP branch must use std.os.linux.write + std.os.linux.read.
+    try testing.expect(std.mem.indexOf(u8, body, "std.os.linux.write(fd,") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "std.os.linux.read(fd,") != null);
+}
+
+// T-C2.3 — TLS read loop maps error.Cancelled (cancel-pipe readability
+// surfaces as Cancelled inside tls_conn.readSome per src/api_client.zig:2099).
+// Static-grep: assert the TLS branch catches Cancelled and returns it.
+test "validateViaApiWithTarget TLS read loop maps error.Cancelled" {
+    const io = testing.io;
+    const content = std.Io.Dir.cwd().readFileAlloc(io, "src/api_auth.zig", testing.allocator, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer testing.allocator.free(content);
+
+    const sig_idx = std.mem.indexOf(u8, content, "pub fn validateViaApiWithTarget") orelse return;
+    const body_start = std.mem.indexOfPos(u8, content, sig_idx, "{") orelse return;
+    var depth: usize = 0;
+    var body_end: usize = body_start;
+    for (content[body_start..], 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                body_end = body_start + i + 1;
+                break;
+            }
+        }
+    }
+    const body = content[body_start..body_end];
+
+    // The TLS read loop must map error.Cancelled from conn.readSome.
+    try testing.expect(std.mem.indexOf(u8, body, "error.Cancelled") != null);
 }

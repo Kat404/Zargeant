@@ -454,19 +454,80 @@ pub fn drawConsentPrompt(win: *WindowMock, state: *State) !void {
 ///
 /// Caller passes the key bytes (typed in KeyEntry.draft before the
 /// transition). We zero them after the write.
+///
+/// api-auth-fixes Commit 3 (task 3.1, design #448 §"D3"): the password
+/// passed to writeWithConsent is a deterministic 16-byte sentinel derived
+/// via Argon2id(key_bytes, sentinel_salt)[..16]. The sentinel_salt is a
+/// 16-byte random value persisted at `<path>.sentinel` (mode 0o600) so
+/// subsequent launches re-derive the same password without user input
+/// (first-launch UX requirement — no new modal flow).
 pub fn submitConsentGrant(io: std.Io, key: []const u8, state: *State) !void {
     if (!state.consent_prompt.consent) {
         // Deny: explicit no — leave state in consent_prompt with deny.
         return;
     }
     const path = state.consent_prompt.path;
-    api_auth.writeWithConsent(io, key, path, true) catch |err| {
+    const sentinel_path = std.fmt.allocPrint(io_allocator(io), "{s}.sentinel", .{path}) catch {
+        return;
+    };
+    defer io_allocator(io).free(sentinel_path);
+
+    // 1. Read existing sentinel_salt if present; else generate + persist.
+    var sentinel_salt: [16]u8 = undefined;
+    const existing_fd = std.posix.openat(std.posix.AT.FDCWD, sentinel_path, .{ .ACCMODE = .RDONLY }, 0) catch null;
+    if (existing_fd) |fd| {
+        defer _ = std.os.linux.close(fd);
+        const n: isize = @bitCast(std.os.linux.read(fd, &sentinel_salt, sentinel_salt.len));
+        if (n != sentinel_salt.len) {
+            // Truncated sentinel file — regenerate.
+            const rsalt = std.os.linux.getrandom(&sentinel_salt, sentinel_salt.len, 0);
+            if (rsalt != sentinel_salt.len) return;
+        }
+    } else {
+        const rsalt = std.os.linux.getrandom(&sentinel_salt, sentinel_salt.len, 0);
+        if (rsalt != sentinel_salt.len) return;
+    }
+
+    // 2. Persist sentinel_salt at <path>.sentinel (mode 0o600). Always
+    //    write (overwrite) so a regenerated salt lands on disk atomically.
+    {
+        const sf = std.posix.openat(std.posix.AT.FDCWD, sentinel_path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = true,
+            .CLOEXEC = true,
+        }, 0o600) catch return;
+        defer _ = std.os.linux.close(sf);
+        _ = std.os.linux.fchmod(sf, 0o600);
+        _ = std.os.linux.write(sf, &sentinel_salt, sentinel_salt.len);
+        _ = std.os.linux.fsync(sf);
+    }
+
+    // 3. Derive sentinel password via Argon2id(key, sentinel_salt)[..16].
+    var derived: [32]u8 = undefined;
+    std.crypto.pwhash.argon2.kdf(
+        io_allocator(io),
+        &derived,
+        key,
+        &sentinel_salt,
+        .{ .t = api_auth.argon2_t, .m = api_auth.argon2_m / 1024, .p = api_auth.argon2_p },
+        .argon2id,
+        io,
+    ) catch return;
+    const sentinel_pw: []const u8 = derived[0..16];
+
+    // 4. Write the encrypted credentials file with sentinel-derived password.
+    api_auth.writeWithConsent(io, key, sentinel_pw, path, true) catch |err| {
         // Write failed: log via logger + stay in consent_prompt.
         var buf: [64]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "writeWithConsent failed: {s}", .{@errorName(err)}) catch "write failed";
         logger.global().log(io, .warn, msg) catch {};
         return;
     };
+
+    // Zero the derived buffer (memory hygiene; sentinel_pw aliases it).
+    @memset(&derived, 0);
+
     // Advance to agent_loop.
     state.* = .{ .agent_loop = .{
         .allocator = io_allocator(io),
@@ -867,6 +928,53 @@ test "consent deny does not write (no file at XDG path)" {
     try testing.expectError(error.FileNotFound, open_result);
     // State still in consent_prompt (deny is a no-op transition).
     try testing.expect(std.meta.activeTag(state) == .consent_prompt);
+}
+
+// api-auth-fixes Commit 3 (tasks #449 §"Commit 3"; design #448 §"D3").
+// submitConsentGrant must derive a deterministic sentinel password via
+// Argon2id from the key bytes + a per-install salt stored at <path>.sentinel
+// (mode 0o600). The sentinel is the password passed to writeWithConsent so
+// subsequent launches re-derive the same password from the key bytes alone.
+// RED: assert <path>.sentinel exists with mode 0o600 after submitConsentGrant.
+test "submitConsentGrant writes <path>.sentinel at mode 0o600 (sentinel derivation)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &dir_buf);
+    const path = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds.bin" });
+    defer testing.allocator.free(path);
+    const sentinel_path = try std.fmt.allocPrint(testing.allocator, "{s}.sentinel", .{path});
+    defer testing.allocator.free(sentinel_path);
+
+    var state: State = .{
+        .consent_prompt = .{
+            .consent = true,
+            .last_four = "CDEF".*,
+            .path = path,
+        },
+    };
+    try submitConsentGrant(testing.io, "test-key-1234567890ABCDEF", &state);
+
+    // 1. Credentials file written (existing regression).
+    const fd1 = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
+    defer _ = std.os.linux.close(fd1);
+
+    // 2. Sentinel salt file exists.
+    const fd2 = std.posix.openat(std.posix.AT.FDCWD, sentinel_path, .{ .ACCMODE = .RDONLY }, 0) catch |err| {
+        try testing.expect(false); // sentinel file must exist
+        return err;
+    };
+    defer _ = std.os.linux.close(fd2);
+
+    // 3. Sentinel salt file mode is 0o600.
+    const sentinel_file = std.Io.File{ .handle = fd2, .flags = .{ .nonblocking = false } };
+    const sentinel_stat = try std.Io.File.stat(sentinel_file, testing.io);
+    const sentinel_mode: u32 = @intCast(@as(std.posix.mode_t, @bitCast(sentinel_stat.permissions.toMode())) & 0o777);
+    try testing.expectEqual(@as(u32, 0o600), sentinel_mode);
+
+    // 4. State advanced to .agent_loop.
+    try testing.expect(std.meta.activeTag(state) == .agent_loop);
 }
 
 // =============================================================================
