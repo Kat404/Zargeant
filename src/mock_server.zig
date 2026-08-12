@@ -24,7 +24,15 @@ pub const Handle = struct {
     port: u16,
     acceptor: ?std.Thread,
     threads: std.ArrayListUnmanaged(std.Thread) = .empty,
+    /// FIFO queue of unnamed fixtures (drained by `sendBytes`). Backed by
+    /// the existing test API; the runtime path uses the `named_fixtures`
+    /// map keyed by id instead.
     fixtures: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Named registry (id → bytes). PR 1 (tui-runtime-integration #441,
+    /// REQ-TUI-037): the runtime registers "default" fixture via
+    /// registerFixture + serves it on demand via serveFixture. The FIFO
+    /// path stays unchanged for the 96/96 api-client regression suite.
+    named_fixtures: std.StringHashMapUnmanaged([]const u8) = .empty,
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     allocator: std.mem.Allocator,
     /// Spinlock protecting threads + fixtures. Test-grade: ok for low-contention
@@ -56,14 +64,27 @@ pub const Handle = struct {
         self.lock();
         var threads = self.threads;
         self.threads = .empty;
+        var named = self.named_fixtures;
+        self.named_fixtures = .empty;
+        var fifo = self.fixtures;
+        self.fixtures = .empty;
         self.unlock();
         for (threads.items) |t| t.join();
         threads.deinit(allocator);
-        // Any fixtures still in the queue (not yet popped by a worker) are
-        // owned by the Handle and freed here. Popped fixtures are owned by
-        // their worker and freed in workerLoop.
-        for (self.fixtures.items) |f| allocator.free(f);
-        self.fixtures.deinit(allocator);
+        // Free any named fixtures still registered. The map owns both the
+        // id (key) and the bytes (value); deinit only frees the map storage
+        // itself, not the contents.
+        var it = named.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        named.deinit(allocator);
+        // Any fixtures still in the FIFO queue (not yet popped by a worker)
+        // are owned by the Handle and freed here. Popped fixtures are owned
+        // by their worker and freed in workerLoop.
+        for (fifo.items) |f| allocator.free(f);
+        fifo.deinit(allocator);
         // free the Handle itself.
         allocator.destroy(self);
     }
@@ -130,9 +151,48 @@ pub fn sendBytes(handle: *Handle, bytes: []const u8) !void {
     try handle.fixtures.append(handle.allocator, owned);
 }
 
-/// Register a named fixture (placeholder for v1; v2 will key by id).
+/// Register a named fixture (id → bytes). PR 1 (tui-runtime-integration
+/// #441, REQ-TUI-037): the runtime registers a "default" fixture via this
+/// path; `serveFixture` is the explicit trigger that copies the named bytes
+/// onto the FIFO queue. Multiple ids are stored in `named_fixtures`; the
+/// FIFO `sendBytes` path stays unchanged for the 96/96 api-client suite.
 pub fn registerFixture(handle: *Handle, id: []const u8, bytes: []const u8) !void {
-    _ = id;
+    const owned_id = try handle.allocator.dupe(u8, id);
+    const owned_bytes = try handle.allocator.dupe(u8, bytes);
+    handle.lock();
+    defer handle.unlock();
+    // If id was already registered, free the prior bytes so we don't leak.
+    if (namedFetchOwned(handle, owned_id)) |prev| {
+        handle.allocator.free(prev);
+    }
+    handle.named_fixtures.put(handle.allocator, owned_id, owned_bytes) catch |err| {
+        handle.allocator.free(owned_id);
+        handle.allocator.free(owned_bytes);
+        return err;
+    };
+}
+
+/// ponytail: internal helper used by registerFixture to fetch+remove a
+/// pre-existing entry. Keeps the deinit cleanup path self-contained.
+fn namedFetchOwned(handle: *Handle, id: []const u8) ?[]const u8 {
+    if (handle.named_fixtures.fetchRemove(id)) |kv| {
+        handle.allocator.free(kv.key);
+        return kv.value;
+    }
+    return null;
+}
+
+/// Serve a registered fixture by id on the next accepted connection.
+/// Looks up `id` in the named registry and copies the bytes onto the FIFO
+/// queue. The worker pops the bytes off the queue and serves them verbatim.
+/// Returns error.UnknownFixtureId when the id is not registered.
+pub fn serveFixture(handle: *Handle, id: []const u8) !void {
+    const bytes = blk: {
+        handle.lock();
+        defer handle.unlock();
+        const gop = handle.named_fixtures.getEntry(id) orelse return error.UnknownFixtureId;
+        break :blk gop.value_ptr.*;
+    };
     try sendBytes(handle, bytes);
 }
 

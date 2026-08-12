@@ -8,11 +8,26 @@ pub fn build(b: *std.Build) void {
         "Prioritize performance, safety, or fast compilation (Debug, ReleaseSafe, ReleaseFast)",
     ) orelse .Debug;
 
+    // mibu dep (github.com/xyaman/mibu, MIT, Zig 0.16 tested). Pinned at
+    // 636a36a353614da2a537b060c33f17d608915eab per build.zig.zon. The
+    // module is wired into tui_mod (always), test_mod (always), and
+    // tui-recovery R-PR 2 added lib_mod + exe_mod so main.zig can
+    // transitively pull in src/tui.zig → @import("mibu"). R-PR 4
+    // formalizes this addition per design#408 §2.3.
+    const mibu_dep = b.dependency("mibu", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const mibu_mod = mibu_dep.module("mibu");
+
     // lib: harness (static library)
     const lib_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/root.zig"),
+        .imports = &.{
+            .{ .name = "mibu", .module = mibu_mod },
+        },
     });
     const lib = b.addLibrary(.{
         .name = "harness",
@@ -26,6 +41,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/root.zig"),
+        .imports = &.{
+            .{ .name = "mibu", .module = mibu_mod },
+        },
     });
     exe_mod.single_threaded = false;
     const exe = b.addExecutable(.{
@@ -35,6 +53,14 @@ pub fn build(b: *std.Build) void {
     exe.lto = if (optimize == .ReleaseFast) .full else null;
     exe.root_module.strip = optimize == .ReleaseFast;
     b.installArtifact(exe);
+
+    // run step: `zig build run -- --mock` (or with no args for production mode).
+    // Mirrors the tools-debug pattern (line 78-80). Args after `--` are forwarded
+    // to the zargeant executable via addRunArtifact's args plumbing.
+    const run_exe = b.addRunArtifact(exe);
+    const run_step = b.step("run", "Run zargeant (pass args after `--`, e.g. `zig build run -- --mock`)");
+    run_step.dependOn(&run_exe.step);
+    if (b.args) |args| run_exe.addArgs(args);
 
     // exe: tools/debug_call.zig (manual-only API key probe).
     // tls-handrolled (sdd id=323, T3.5): wires the micro-CLI as a runnable step.
@@ -61,17 +87,104 @@ pub fn build(b: *std.Build) void {
     const debug_call_step = b.step("tools-debug", "Run tools/debug_call.zig with stdin key");
     debug_call_step.dependOn(&debug_call_run.step);
 
+    // tui_mod: exposes mibu (github.com/xyaman/mibu, MIT, Zig 0.16 tested)
+    // under `@import("mibu")` so that src/tui.zig and tests/tui/* can
+    // consume mibu symbols via the build system's `addImport` indirection.
+    // tui (PR 1, sdd id=381 task 1.1) is the first slice to add a dep since
+    // the project bootstrap. mibu replaced libvaxis (was vendored at
+    // vendor/libvaxis/ in the squashed-away 5 libvaxis commits, now wiped
+    // from this branch) because libvaxis v0.5.1 transitive deps don't
+    // compile on Zig 0.16 -- see obs#399 for the full replacement research.
+    const tui_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/tui.zig"),
+    });
+    tui_mod.addImport("mibu", mibu_mod);
+
     // test step
     const test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/root.zig"),
+        .imports = &.{
+            .{ .name = "mibu", .module = mibu_mod },
+        },
     });
     test_mod.addIncludePath(b.path("test"));
     const test_step = b.addTest(.{ .root_module = test_mod });
     const run_test = b.addRunArtifact(test_step);
     const test_decl = b.step("test", "Run unit tests");
     test_decl.dependOn(&run_test.step);
+
+    // test step: tests/tui/mibu_smoke.zig (PR 1, task 1.1 RED guard).
+    // Wired as a separate test artifact so its import of `@import("mibu")`
+    // resolves against the zig-fetched mibu source. Mirrors the
+    // tools/debug_call test-step pattern (C6 from tls-handrolled
+    // remediation, engram id=331).
+    const tui_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/tui/mibu_smoke.zig"),
+        .imports = &.{
+            .{ .name = "mibu", .module = mibu_mod },
+        },
+    });
+    const tui_test_step = b.addTest(.{ .root_module = tui_test_mod });
+    const run_tui_test = b.addRunArtifact(tui_test_step);
+    const tui_test_decl = b.step("test-tui", "Run tests/tui/ in-file tests");
+    tui_test_decl.dependOn(&run_tui_test.step);
+    test_decl.dependOn(&run_tui_test.step);
+
+    // test step: tests/tui/mibu_pin.zig (R-PR 4, REQ-TUI-020).
+    // Pin reproducibility assertion — reads build.zig.zon and asserts
+    // both the git SHA fragment + the Zig hash form. Hash drift fails
+    // the build before any code change happens.
+    const mibu_pin_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/tui/mibu_pin.zig"),
+    });
+    const mibu_pin_test_step = b.addTest(.{ .root_module = mibu_pin_test_mod });
+    const run_mibu_pin_test = b.addRunArtifact(mibu_pin_test_step);
+    const mibu_pin_test_decl = b.step("test-tui-mibu-pin", "Run tests/tui/mibu_pin.zig (REQ-TUI-020)");
+    mibu_pin_test_decl.dependOn(&run_mibu_pin_test.step);
+    test_decl.dependOn(&run_mibu_pin_test.step);
+
+    // test step: tests/tui/runtime_thread.zig (tui-runtime-integration PR 1,
+    // design#441 drift D-5). Dedicated artifact for runtime × mock_server
+    // end-to-end + static-grep guards (T-SG-1..T-SG-3). Wired as a
+    // separate step to keep the mibu import resolution isolated from the
+    // main test runner (mirrors tests/tui/mibu_smoke.zig pattern).
+    //
+    // The test module imports the lib_mod (root.zig re-exports) once
+    // under each alias name so the test file can use natural module names
+    // like `@import("runtime")`. The build system rejects multiple modules
+    // sharing the same source file, so we route everything through root.
+    const runtime_thread_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/tui/runtime_thread.zig"),
+        .imports = &.{
+            .{ .name = "mibu", .module = mibu_mod },
+            .{ .name = "api_auth", .module = lib_mod },
+            .{ .name = "api_client", .module = lib_mod },
+            .{ .name = "channels", .module = lib_mod },
+            .{ .name = "main", .module = lib_mod },
+            .{ .name = "modal", .module = lib_mod },
+            .{ .name = "mock_server", .module = lib_mod },
+            .{ .name = "runtime", .module = lib_mod },
+            .{ .name = "tui", .module = lib_mod },
+        },
+    });
+    const runtime_thread_test_step = b.addTest(.{ .root_module = runtime_thread_test_mod });
+    const run_runtime_thread_test = b.addRunArtifact(runtime_thread_test_step);
+    const runtime_thread_test_decl = b.step(
+        "test-tui-runtime-thread",
+        "Run tests/tui/runtime_thread.zig (tui-runtime-integration PR 1)",
+    );
+    runtime_thread_test_decl.dependOn(&run_runtime_thread_test.step);
+    test_decl.dependOn(&run_runtime_thread_test.step);
 
     // test step: tools/debug_call.zig in-file grep-fail tests.
     // tls-handrolled (sdd id=323, T3.5): the in-file tests in

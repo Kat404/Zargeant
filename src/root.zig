@@ -11,7 +11,6 @@
 // a88fb85 (RED NFRs), 3327317 (GREEN TLS deferral), cd57c99 (dup2-of-pipe).
 // See apply-progress id= for the merged PR 1 + PR 2 + PR 3 evidence.
 const std = @import("std");
-pub const harness = @import("harness.zig");
 pub const version = @import("version.zig");
 pub const logger = @import("logger.zig");
 pub const sandbox = @import("sandbox.zig");
@@ -21,10 +20,23 @@ pub const api_auth = @import("api_auth.zig");
 pub const mock_server = @import("mock_server.zig");
 pub const fixtures_test = @import("fixtures_test.zig");
 
-// ponytail: stub main for the build-toolchain slice. exe.entry = .disabled
-// skips the entry-point link, but std.start.zig still needs root.main to exist
-// at semantic-analysis time. The TUI slice replaces this with the real entry.
-pub fn main() void {}
+// tui-recovery R-PR 1: re-exports for the runtime surface modules. The
+// channels, runtime, and tui modules are imported here so their in-file
+// tests are picked up by `zig build test` (test_mod root = src/root.zig).
+//
+// R-PR 2 re-exports: main_mod (entry point) + password_input (scaffold).
+// R-PR 3 re-exports: modal (WindowMock + State union + 5 draw fns).
+pub const channels = @import("channels.zig");
+pub const runtime = @import("runtime.zig");
+pub const tui = @import("tui.zig");
+pub const main_mod = @import("main.zig");
+pub const password_input = @import("password_input.zig");
+pub const modal = @import("modal.zig");
+
+// R-PR 2 replaces the R-PR 0 build-toolchain placeholder main with the
+// real entry from src/main.zig. The exe is built with root.zig as the
+// root; re-exporting `main` here wires the binary entry to the real impl.
+pub const main = main_mod.main;
 
 // Touch logger/sandbox/api-client/api-sse/api-auth/mock-server types so the
 // test runner pulls in src/{logger,sandbox,api_client,api_sse,api_auth}.zig
@@ -35,7 +47,6 @@ comptime {
     _ = logger.Level;
     _ = logger.Logger;
     _ = logger.defaultPath;
-    _ = harness.harness_placeholder;
     _ = sandbox.Sandbox;
     _ = sandbox.ToolSubprocess;
     _ = api_client.Client;
@@ -47,6 +58,23 @@ comptime {
     _ = api_auth.validateFormat;
     _ = mock_server.Handle;
     _ = fixtures_test;
+    _ = channels.Event;
+    _ = channels.Channel;
+    _ = channels.Channels;
+    _ = channels.pushSseChunk;
+    _ = runtime.Runtime;
+    _ = runtime.Config;
+    _ = runtime.ThreadArgs;
+    _ = tui.tuiThreadMain;
+    _ = tui.ThreadArgs;
+    _ = main_mod.main;
+    _ = main_mod.parseArgs;
+    _ = main_mod.warnIfColdStartExceeded;
+    _ = main_mod.COLD_START_BUDGET_NS;
+    _ = main_mod.usage;
+    _ = password_input.read;
+    _ = password_input.State;
+    _ = modal.WindowMock;
 }
 
 // Re-export logger public API at the root namespace so that downstream
@@ -85,4 +113,14 @@ test "root.zig re-exports are wired" {
     try std.testing.expect(Client == api_client.Client);
     try std.testing.expect(Request == api_client.Request);
     try std.testing.expect(tls_conn == api_client.tls_conn);
+    // tui-recovery R-PR 1 re-exports (REQ-ROOT-001):
+    try std.testing.expect(channels == @import("channels.zig"));
+    try std.testing.expect(runtime == @import("runtime.zig"));
+    try std.testing.expect(tui == @import("tui.zig"));
+    // tui-recovery R-PR 2 re-exports: main_mod + password_input + main alias.
+    try std.testing.expect(main_mod == @import("main.zig"));
+    try std.testing.expect(password_input == @import("password_input.zig"));
+    try std.testing.expect(main == main_mod.main);
+    // tui-recovery R-PR 3 re-export: modal.
+    try std.testing.expect(modal == @import("modal.zig"));
 }
