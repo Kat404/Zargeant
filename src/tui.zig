@@ -99,7 +99,8 @@ pub fn queryDec2048Supported(
     handle: std.Io.File.Handle,
     writer: *std.Io.Writer,
 ) bool {
-    const mode = mibu.events.queryModeWithTimeout(io, handle, writer, 2048, 50) catch return false;
+    const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
+    const mode = mibu.events.queryModeWithTimeout(io, file, writer, 2048, 50) catch return false;
     return mode.supported();
 }
 
@@ -110,7 +111,8 @@ pub fn queryKittyKbSupported(
     handle: std.Io.File.Handle,
     writer: *std.Io.Writer,
 ) bool {
-    return mibu.events.supportsKittyKeyboardWithTimeout(io, handle, writer, 50) catch false;
+    const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
+    return mibu.events.supportsKittyKeyboardWithTimeout(io, file, writer, 50) catch false;
 }
 
 /// Push kitty keyboard flags. Always uses disambiguate + report_events
@@ -411,8 +413,9 @@ pub fn tuiThreadLoop(
 ) !void {
     _ = state; // render hook deferred to runtime wiring (task 4.5).
     _ = writer; // render emission deferred to runtime wiring (task 4.5).
+    const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
     while (!lifecycle.redraw_pending.load(.seq_cst)) {
-        const event = mibu.events.nextWithTimeout(io, handle, 16) catch continue;
+        const event = mibu.events.nextWithTimeout(io, file, 16) catch continue;
         switch (event) {
             .key => |k| try channels.tui_to_agent.tryPut(io, .{ .KeyPress = k }),
             .resize => {

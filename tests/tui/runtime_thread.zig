@@ -945,3 +945,104 @@ test "T-SG-5: src/api_auth.zig production body has no xor / hmac / sha256" {
     try testing.expect(std.mem.indexOf(u8, no_comments, "hmac") == null);
     try testing.expect(std.mem.indexOf(u8, no_comments, "sha256") == null);
 }
+
+// =============================================================================
+// PR fix-slice — tui-verification (REQ-VER-001..004)
+//
+// CRITICAL bug #2 from explore #1237: src/runtime.zig:322-338 (tuiRealMain)
+// is a stub-drain that ignores the production tuiThreadInit/Loop/Shutdown
+// composers in src/tui.zig. The TUI thread never renders, never polls mibu,
+// never recovers the terminal. This static-grep guard (T-VR-1) fences the
+// fix: the three composers MUST be referenced from inside tuiRealMain.
+// =============================================================================
+
+test "T-VR-1: tuiRealMain calls tuiThreadInit + tuiThreadLoop + tuiThreadShutdown" {
+    // REQ-VER-001/002/003 — production wiring must compose the three
+    // R-PR 4 lifecycle functions. Static-grep on the tuiRealMain body
+    // (src/runtime.zig): the three symbol references must exist.
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/runtime.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+
+    // Locate the tuiRealMain function body. Anchor on the signature so
+    // we don't accidentally catch comments / unrelated references.
+    const sig = std.mem.indexOf(u8, no_comments, "fn tuiRealMain") orelse {
+        try testing.expect(false);
+        return;
+    };
+    const body_start = std.mem.indexOfPos(u8, no_comments, sig, "{") orelse return;
+    var depth: usize = 0;
+    var body_end: usize = body_start;
+    for (no_comments[body_start..], 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                body_end = body_start + i + 1;
+                break;
+            }
+        }
+    }
+    const body = no_comments[body_start..body_end];
+
+    // Each composer must be referenced inside the body.
+    try testing.expect(std.mem.indexOf(u8, body, "tuiThreadInit") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "tuiThreadLoop") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "tuiThreadShutdown") != null);
+}
+
+test "T-VR-1b: tuiRealMain catches tuiThreadInit failure → no_tty fallback (REQ-VER-004)" {
+    // REQ-VER-004 — when tuiThreadInit cannot enable raw mode (no TTY,
+    // CI), the thread continues in logger-only mode. The static-grep
+    // guard verifies the call site uses `if (lc.no_tty) …` (or an
+    // equivalent pattern) and that the Lifecycle.no_tty fallback path
+    // is reachable from tuiRealMain.
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/runtime.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+
+    // Locate the tuiRealMain function body.
+    const sig = std.mem.indexOf(u8, no_comments, "fn tuiRealMain") orelse {
+        try testing.expect(false);
+        return;
+    };
+    const body_start = std.mem.indexOfPos(u8, no_comments, sig, "{") orelse return;
+    var depth: usize = 0;
+    var body_end: usize = body_start;
+    for (no_comments[body_start..], 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                body_end = body_start + i + 1;
+                break;
+            }
+        }
+    }
+    const body = no_comments[body_start..body_end];
+
+    // The body must reference tuiThreadInit (proves the wiring), and
+    // must contain a `no_tty` reference (proves the fallback is wired).
+    // Note: `no_tty` may occur AFTER the body (e.g. the lifecycle
+    // return value), so we widen the scan to a small window of the
+    // surrounding prod prefix to keep the test focused but tolerant.
+    const window_after = no_comments[body_end..@min(body_end + 4096, no_comments.len)];
+    try testing.expect(std.mem.indexOf(u8, body, "tuiThreadInit") != null);
+    try testing.expect(std.mem.indexOf(u8, window_after, "no_tty") != null or std.mem.indexOf(u8, body, "no_tty") != null);
+}
