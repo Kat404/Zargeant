@@ -454,13 +454,19 @@ pub fn drawConsentPrompt(win: *WindowMock, state: *State) !void {
 ///
 /// Caller passes the key bytes (typed in KeyEntry.draft before the
 /// transition). We zero them after the write.
+///
+/// api-auth-fixes Commit 3 (task 3.1, design #448 D3) replaces the empty
+/// placeholder password with a deterministic sentinel derived via Argon2id
+/// from the key bytes — first-launch + subsequent unlocks share the same
+/// derivation path. Commit 1 ships the signature ripple with an empty
+/// placeholder so the build stays green.
 pub fn submitConsentGrant(io: std.Io, key: []const u8, state: *State) !void {
     if (!state.consent_prompt.consent) {
         // Deny: explicit no — leave state in consent_prompt with deny.
         return;
     }
     const path = state.consent_prompt.path;
-    api_auth.writeWithConsent(io, key, path, true) catch |err| {
+    api_auth.writeWithConsent(io, key, "", path, true) catch |err| {
         // Write failed: log via logger + stay in consent_prompt.
         var buf: [64]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "writeWithConsent failed: {s}", .{@errorName(err)}) catch "write failed";
