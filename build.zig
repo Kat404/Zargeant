@@ -207,4 +207,25 @@ pub fn build(b: *std.Build) void {
     const tools_test_decl = b.step("test-tools", "Run tools/ in-file tests");
     tools_test_decl.dependOn(&run_tools_test.step);
     test_decl.dependOn(&run_tools_test.step);
+
+    // =========================================================================
+    // QA 1 — Static checks: `zig build check`
+    //   - `zig fmt --check` for formatting (recursive on src/, tests/, tools/)
+    //   - `--ast-check` flag on the same invocation for syntax errors
+    //     (no type checking; faster than full compile)
+    //   - Both run in one process; failure exits non-zero.
+    //
+    // QA 2 — Thread Sanitizer is documented in `docs/methodology.md` §3 but
+    // NOT wired as a build step. Reason: Zig 0.16's bundled libtsan
+    // (`lib/std/libtsan/`) references `<linux/scc.h>`, which the kernel removed
+    // in 5.15. Compilation fails on Arch/CachyOS/nix with recent kernels
+    // (verified on Zen 7.x). Re-add the step when Zig 0.16.1+ ships the fix.
+    // Until then, use `valgrind --tool=helgrind` as a fallback for race
+    // detection on the test binary.
+    // =========================================================================
+    const fmt_check = b.addSystemCommand(&.{
+        "zig", "fmt", "--check", "--ast-check", "src", "tests", "tools",
+    });
+    const check_step = b.step("check", "QA 1: zig fmt --check --ast-check (src/, tests/, tools/)");
+    check_step.dependOn(&fmt_check.step);
 }
