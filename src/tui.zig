@@ -446,19 +446,20 @@ pub fn tuiThreadMain(args: *const ThreadArgs) void {
     }
 }
 
-/// Per-frame loop orchestrator (REQ-TUI-002 + REQ-TUI-021). Polls events
-/// in 16ms windows and renders when the redraw flag is set or new events
-/// arrive. Exits on `Shutdown` arriving on any channel.
+/// Per-frame loop orchestrator (REQ-TUI-002 + REQ-TUI-021 + REQ-RW-004
+/// + REQ-RW-006). Polls mibu events in 16ms windows; when the redraw
+/// flag flips (from init seed, a resize event, or any other source),
+/// runs the modal render bracket and emits the cell diff via emitFrame.
+/// Exits on `Shutdown` arriving on any channel AFTER any pending render
+/// completes.
 ///
-/// `state` is the modal state from src/modal.zig — render of `state` is
-/// deferred (the modal stack renders during the bracket; tuiThreadLoop
-/// only orchestrates the bracket + dispatch). The signature is locked
-/// per task 4.2; the modal render hook lands with the runtime wiring
-/// in task 4.5.
+/// `state` is the modal state from src/modal.zig — its active variant
+/// dispatches via `modal.drawModal` to the per-fn draw* helper. The
+/// per-frame WindowMock is allocated + freed each iteration; the
+/// `prev_snapshot` buffer persists across frames (REQ-RW-002).
 ///
-/// ponytail: state-driven render is a per-frame invoke — no extra
-/// defer for now. If the bracket ordering ever needs guards (e.g.
-/// nested updates), add then.
+/// ponytail: per-frame WindowMock init/deinit is cheap at v1 frame
+/// rates; revisit if profiling shows allocation cost.
 pub fn tuiThreadLoop(
     lifecycle: *Lifecycle,
     handle: std.Io.File.Handle,
@@ -466,11 +467,35 @@ pub fn tuiThreadLoop(
     writer: *std.Io.Writer,
     channels: *@import("channels.zig").Channels,
     state: *@import("modal.zig").State,
+    alloc: std.mem.Allocator,
 ) !void {
-    _ = state; // render hook deferred to runtime wiring (task 4.5).
-    _ = writer; // render emission deferred to runtime wiring (task 4.5).
+    const modal = @import("modal.zig");
     const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
-    while (!lifecycle.redraw_pending.load(.seq_cst)) {
+    while (true) {
+        // 1. Render if pending (REQ-RW-004 sub-bullet 2-3) — runs before
+        // Shutdown drain so a pending render always completes.
+        if (lifecycle.redraw_pending.swap(false, .seq_cst)) {
+            try mibu.term.beginSynchronizedUpdate(writer);
+            var win = try modal.WindowMock.init(alloc, lifecycle.width, lifecycle.height);
+            defer win.deinit();
+            defer mibu.term.endSynchronizedUpdate(writer) catch {};
+            try modal.drawModal(win, state);
+            const current = win.snapshot();
+            // First frame: lifecycle.prev_snapshot is null → use current
+            // as both prev (full-frame emit per REQ-RW-003 S-RW-005).
+            const prev = lifecycle.prev_snapshot orelse current;
+            try emitFrame(writer, prev, current, lifecycle.width, lifecycle.height, alloc);
+            // Swap prev_snapshot. Free the old buffer, dupe the new one.
+            if (lifecycle.prev_snapshot) |p| alloc.free(p);
+            const duped = try alloc.dupe(modal.Cell, current);
+            lifecycle.prev_snapshot = duped;
+        }
+        // 2. Drain channels.Shutdown from any edge (runtime signals all).
+        if (channels.tui_to_agent.tryGet(io)) |ev| switch (ev) {
+            .Shutdown => return,
+            else => continue,
+        };
+        // 3. Poll mibu events. Resize → update dims + set redraw flag.
         const event = mibu.events.nextWithTimeout(io, file, 16) catch continue;
         switch (event) {
             .key => |k| try channels.tui_to_agent.tryPut(io, .{ .KeyPress = k }),
@@ -482,11 +507,6 @@ pub fn tuiThreadLoop(
             },
             .timeout, .none, .invalid, .paste_start, .paste_end, .mouse => {},
         }
-        // Drain channels.Shutdown from any edge (runtime signals all).
-        if (channels.tui_to_agent.tryGet(io)) |ev| switch (ev) {
-            .Shutdown => return,
-            else => continue,
-        };
     }
 }
 

@@ -388,11 +388,15 @@ fn tuiRealMain(args: *const ThreadArgs) void {
                 writer,
                 args.channels,
                 &modal_state,
+                args.allocator,
             ) catch break;
         }
     }
 
     // Stage 3: restore terminal (alternatescreen / raw mode / kitty).
+    // REQ-RW-002: free prev_snapshot before raw mode teardown.
+    if (lc.prev_snapshot) |p| args.allocator.free(p);
+    lc.prev_snapshot = null;
     tui_thread_mod.tuiThreadShutdown(&lc, writer);
 }
 

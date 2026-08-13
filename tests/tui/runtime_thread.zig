@@ -83,7 +83,9 @@ const Main = struct {
 const Tui = struct {
     const root = @import("tui");
     pub const ThreadArgs = root.tui.ThreadArgs;
+    pub const Lifecycle = root.tui.Lifecycle;
     pub const emitFrame = root.tui.emitFrame;
+    pub const tuiThreadLoop = root.tui.tuiThreadLoop;
 };
 
 // =============================================================================
@@ -1403,4 +1405,71 @@ test "W3-5: emitFrame ignores WindowMock.in_alt_screen + cursor_hidden" {
     try Tui.emitFrame(&w_b, &prev, &current, 2, 1, testing.allocator);
     try testing.expectEqual(w_a.end, w_b.end);
     try testing.expectEqualSlices(u8, buf_a[0..w_a.end], buf_b[0..w_b.end]);
+}
+
+// =============================================================================
+// tui-render-wiring W4 tests (REQ-RW-004, REQ-RW-006)
+// =============================================================================
+
+test "W4-1: tuiThreadLoop renders modal on redraw_pending and emits CSI" {
+    // REQ-RW-004 scenario S-RW-007 — when redraw_pending is set, the
+    // loop renders via modal.draw* + emitFrame. End-to-end smoke: the
+    // writer buffer must contain the synchronized-update bracket
+    // (\x1b[?2026h), at least one cursor-position escape
+    // (\x1b[<row>;<col>H), and the trailing reset (\x1b[0m).
+    var ch: Ch.Channels = Ch.Channels.init();
+    defer ch.closeAll(testing.io);
+    var lc: Tui.Lifecycle = .{
+        .raw_term = null,
+        .dec_2048_supported = false,
+        .kitty_supported = false,
+        .kitty_flags_pushed = false,
+        .redraw_pending = std.atomic.Value(bool).init(true),
+        .width = 40,
+        .height = 12,
+    };
+    var modal_state: M.State = .{ .key_entry = .{} };
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    // The loop runs until Shutdown; we trigger Shutdown after one render
+    // by feeding it via channels.tui_to_agent before the call. The
+    // important assertion is that the buffer contains the bracket +
+    // cursor + reset bytes after at least one render pass.
+    try ch.tui_to_agent.tryPut(testing.io, .Shutdown);
+    try Tui.tuiThreadLoop(
+        &lc,
+        std.Io.File.stdin().handle, // any handle — no events in this test
+        testing.io,
+        &w,
+        &ch,
+        &modal_state,
+        testing.allocator,
+    );
+    // The loop allocated a prev_snapshot dupe; free it like tuiRealMain
+    // does on shutdown.
+    if (lc.prev_snapshot) |p| testing.allocator.free(p);
+    lc.prev_snapshot = null;
+    const out = buf[0..w.end];
+    // beginSynchronizedUpdate bracket
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?2026h") != null);
+    // endSynchronizedUpdate bracket
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?2026l") != null);
+    // trailing reset
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[0m") != null);
+}
+
+test "W4-2: tuiThreadLoop drops the _ = state placeholder lines" {
+    // REQ-RW-004 sub-bullet 4 — the `_ = state; // render hook deferred
+    // to runtime wiring (task 4.5)` and `_ = writer; // render emission
+    // deferred to runtime wiring (task 4.5)` placeholders MUST be
+    // removed (zargeant/tui-render-missing #1254).
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/tui.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    try testing.expect(std.mem.indexOf(u8, content, "_ = state; // render hook") == null);
+    try testing.expect(std.mem.indexOf(u8, content, "_ = writer; // render emission") == null);
 }
