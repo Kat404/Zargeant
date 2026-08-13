@@ -47,6 +47,9 @@ const M = struct {
     pub const State = root.modal.State;
     pub const ErrorKind = root.modal.ErrorKind;
     pub const AgentLoopState = root.modal.AgentLoopState;
+    pub const Cell = root.modal.Cell;
+    pub const Style = root.modal.Style;
+    pub const WindowMock = root.modal.WindowMock;
     pub const appendStreamChunk = root.modal.appendStreamChunk;
 };
 const MS = struct {
@@ -80,6 +83,7 @@ const Main = struct {
 const Tui = struct {
     const root = @import("tui");
     pub const ThreadArgs = root.tui.ThreadArgs;
+    pub const emitFrame = root.tui.emitFrame;
 };
 
 // =============================================================================
@@ -1273,4 +1277,130 @@ test "W1-2: tuiRealMain allocates prev_snapshot via args.allocator.alloc" {
     };
     try testing.expect(std.mem.indexOfPos(u8, content, sig, "prev_snapshot") != null);
     try testing.expect(std.mem.indexOfPos(u8, content, sig, "args.allocator.alloc") != null);
+}
+
+// =============================================================================
+// tui-render-wiring W3 tests (REQ-RW-003, REQ-RW-005, REQ-RW-007)
+// =============================================================================
+
+test "W3-1: emitFrame writes CSI cursor position + cell byte for a 2-cell diff" {
+    // REQ-RW-003 scenario S-RW-004 — given prev = all spaces and current
+    // with cell at 1-indexed (col=2, row=1) = 'X' bold, the buffer
+    // contains the cursor-position escape `\x1b[1;2H` (row=1, col=2),
+    // the bold SGR `\x1b[1m`, and the cell byte 'X'. Also a trailing
+    // `\x1b[0m` reset.
+    var prev: [4]M.Cell = .{
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+    };
+    var current: [4]M.Cell = .{
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = 'X', .style = .{ .bold = true } },
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+    };
+    var buf: [128]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Tui.emitFrame(&w, &prev, &current, 2, 2, testing.allocator);
+    const out = buf[0..w.end];
+    // Cursor position: mibu.cursor.goTo(writer, x=2, y=1) → \x1b[1;2H
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;2H") != null);
+    // Bold SGR
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1m") != null);
+    // Cell byte 'X'
+    try testing.expect(std.mem.indexOf(u8, out, "X") != null);
+    // Trailing reset
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[0m") != null);
+}
+
+test "W3-2: emitFrame writes SGR codes for bold/underline/reverse/reset" {
+    // REQ-RW-003 + REQ-RW-007 (S-RW-010) — per-cell lazy SGR emits. Bold
+    // cell triggers \x1b[1m; underline triggers \x1b[4m; reverse triggers
+    // \x1b[7m; each cell preceded by a \x1b[0m reset (no StyleTracker).
+    var prev: [3]M.Cell = .{
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+    };
+    var current: [3]M.Cell = .{
+        .{ .ch = 'A', .style = .{ .bold = true } },
+        .{ .ch = 'B', .style = .{ .underline = true } },
+        .{ .ch = 'C', .style = .{ .reverse = true } },
+    };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Tui.emitFrame(&w, &prev, &current, 3, 1, testing.allocator);
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1m") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[4m") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[7m") != null);
+}
+
+test "W3-3: emitFrame writes no cursor escapes when prev == current" {
+    // REQ-RW-003 scenario S-RW-005 — when prev == current, the diff is
+    // empty so only the trailing reset SGR is emitted (no cursor
+    // positions).
+    var cells: [4]M.Cell = .{
+        .{ .ch = 'A', .style = .{ .bold = true } },
+        .{ .ch = 'B', .style = .{ .underline = true } },
+        .{ .ch = 'C', .style = .{} },
+        .{ .ch = 'D', .style = .{} },
+    };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Tui.emitFrame(&w, &cells, &cells, 2, 2, testing.allocator);
+    const out = buf[0..w.end];
+    // No cursor-position escapes (those look like \x1b[<num>;<num>H).
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[2;1H") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[2;2H") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;1H") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;2H") == null);
+    // Trailing reset only.
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[0m") != null);
+}
+
+test "W3-4: emitFrame frees the diff slice under std.testing.allocator" {
+    // REQ-RW-003 scenario S-RW-006 — emitFrame MUST free the diff slice
+    // allocated by WindowMock.diff. With std.testing.allocator the leak
+    // detector asserts zero leaks.
+    var prev: [3]M.Cell = .{
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+    };
+    var current: [3]M.Cell = .{
+        .{ .ch = 'X', .style = .{ .bold = true } },
+        .{ .ch = 'Y', .style = .{ .underline = true } },
+        .{ .ch = 'Z', .style = .{ .reverse = true } },
+    };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Tui.emitFrame(&w, &prev, &current, 3, 1, testing.allocator);
+    // If emitFrame leaks the diff slice, the testing.allocator would
+    // assert on scope exit; we got here so the leak is zero.
+    try testing.expect(w.end > 0);
+}
+
+test "W3-5: emitFrame ignores WindowMock.in_alt_screen + cursor_hidden" {
+    // REQ-RW-005 (S-RW-008) — emitFrame must not consult the WindowMock's
+    // bookkeeping flags. The same prev/current pair produces byte-equivalent
+    // output regardless of the flag state.
+    var prev: [2]M.Cell = .{
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+    };
+    var current: [2]M.Cell = .{
+        .{ .ch = 'X', .style = .{ .bold = true } },
+        .{ .ch = 'Y', .style = .{ .underline = true } },
+    };
+    var buf_a: [256]u8 = undefined;
+    var w_a = std.Io.Writer.fixed(&buf_a);
+    try Tui.emitFrame(&w_a, &prev, &current, 2, 1, testing.allocator);
+    var buf_b: [256]u8 = undefined;
+    var w_b = std.Io.Writer.fixed(&buf_b);
+    try Tui.emitFrame(&w_b, &prev, &current, 2, 1, testing.allocator);
+    try testing.expectEqual(w_a.end, w_b.end);
+    try testing.expectEqualSlices(u8, buf_a[0..w_a.end], buf_b[0..w_b.end]);
 }

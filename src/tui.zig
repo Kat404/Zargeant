@@ -294,6 +294,49 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
 }
 
 // =============================================================================
+// emitFrame (REQ-RW-003 + REQ-RW-005 + REQ-RW-007 — tui-render-wiring #1259)
+//
+// Cell→ANSI emitter. Reuses WindowMock.diff(current, prev) to compute
+// the entry list, then writes CSI cursor-position + SGR + cell bytes to
+// `writer`. Lazy per-cell SGR emit (no StyleTracker in v1; see D-2).
+// ponytail: no StyleTracker — add when profiling shows >1% frame
+// budget in SGR emits. ponytail: u21→u8 cast is v1 ASCII-only; non-ASCII
+// stays for v2.
+// =============================================================================
+
+/// Emit a frame's worth of CSI cursor-position + SGR + cell bytes to
+/// `writer`. Reuses `WindowMock.diff(prev)` to compute the entry list.
+/// Lazily emits SGR per cell. Caller owns the WindowMock + prev buffer.
+pub fn emitFrame(
+    writer: *std.Io.Writer,
+    prev: []const @import("modal.zig").Cell,
+    current: []const @import("modal.zig").Cell,
+    cols: u16,
+    rows: u16,
+    alloc: std.mem.Allocator,
+) !void {
+    const modal = @import("modal.zig");
+    var win: modal.WindowMock = .{
+        .allocator = alloc,
+        .cols = cols,
+        .rows = rows,
+        .cells = @constCast(current),
+    };
+    const diffs = try win.diff(prev);
+    defer alloc.free(diffs);
+    for (diffs) |entry| {
+        try mibu.cursor.goTo(writer, entry.x + 1, entry.y + 1);
+        try mibu.style.reset(writer);
+        if (entry.cell.style.bold) try mibu.style.bold(writer, true);
+        if (entry.cell.style.underline) try mibu.style.underline(writer, true);
+        if (entry.cell.style.reverse) try mibu.style.reverse(writer, true);
+        // ponytail: u21→u8 cast is v1 ASCII-only; non-ASCII stays for v2.
+        try writer.writeByte(@intCast(entry.cell.ch));
+    }
+    try mibu.style.reset(writer);
+}
+
+// =============================================================================
 // TUI thread body (R-PR 4 real lifecycle).
 //
 // The runtime orchestrator spawns this on its TUI thread. We drain
