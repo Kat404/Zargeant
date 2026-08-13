@@ -66,6 +66,11 @@ pub const Lifecycle = struct {
     /// `enableRawMode` failed (no `/dev/tty`, CI). The TUI thread
     /// runs in degraded logger-only mode; renderers are skipped.
     no_tty: bool = false,
+    /// REQ-RW-002 (tui-render-wiring #1259): previous-frame cell snapshot
+    /// for `emitFrame` diff. Allocated by `tuiRealMain` after init, freed
+    /// in shutdown. `null` on the first frame → `emitFrame` receives
+    /// `current` as both `prev` and `current` arg (full-frame emit).
+    prev_snapshot: ?[]@import("modal.zig").Cell = null,
 };
 
 // =============================================================================
@@ -553,9 +558,10 @@ test "bracket is innermost (begin appears before end in buffer order)" {
 test "Lifecycle struct exposes required fields" {
     // The Lifecycle struct carries the right shape for tuiThreadShutdown.
     // Compile-time assertion via typeinfo. PR 2 adds the `no_tty` field
-    // (REQ-TUI-047); the count rises from 7 to 8.
+    // (REQ-TUI-047); the count rises from 7 to 8. tui-render-wiring
+    // (#1259, REQ-RW-002) adds `prev_snapshot`; the count rises to 9.
     const fields = @typeInfo(Lifecycle).@"struct".fields;
-    try testing.expectEqual(@as(usize, 8), fields.len);
+    try testing.expectEqual(@as(usize, 9), fields.len);
 }
 
 test "redraw_pending is std.atomic.Value(bool) with seq_cst contract" {

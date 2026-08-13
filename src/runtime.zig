@@ -358,6 +358,25 @@ fn tuiRealMain(args: *const ThreadArgs) void {
             .no_tty = true,
         }};
 
+    // REQ-RW-001: seed the first frame after init returns and we have a
+    // real TTY. The no_tty path keeps redraw_pending=false so the loop
+    // falls through to logger-only mode.
+    if (!lc.no_tty) {
+        lc.redraw_pending.store(true, .seq_cst);
+    }
+
+    // REQ-RW-002: allocate `prev_snapshot` for `emitFrame` diff. Owned by
+    // Lifecycle for the lifetime of the loop; freed before shutdown.
+    // OOM is tolerated by leaving prev_snapshot null — `emitFrame` falls
+    // back to a full-frame emit (current as both prev and current).
+    if (!lc.no_tty) {
+        const n: usize = @as(usize, lc.width) * @as(usize, lc.height);
+        lc.prev_snapshot = args.allocator.alloc(
+            @import("modal.zig").Cell,
+            n,
+        ) catch null;
+    }
+
     // Stage 2: per-frame loop. Real TTY: tuiThreadLoop brackets renders
     // + dispatches events. no-TTY: skip rendering, just drain shutdown.
     if (!lc.no_tty) {

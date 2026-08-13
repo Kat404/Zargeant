@@ -1228,3 +1228,49 @@ test "T-VR-5: submitUnlock references the 3-attempt counter (REQ-VER-012)" {
     try testing.expect(std.mem.indexOf(u8, body, "attempts") != null);
     try testing.expect(std.mem.indexOf(u8, body, ".error_modal") != null);
 }
+
+// =============================================================================
+// tui-render-wiring slice (sdd/tui-render-wiring/spec REQ-RW-001/002)
+// W1 tests: seed + prev_snapshot alloc
+// =============================================================================
+
+test "W1-1: tuiRealMain seeds redraw_pending=true after tuiThreadInit" {
+    // REQ-RW-001 — `tuiRealMain` MUST call
+    // `lc.redraw_pending.store(true, .seq_cst)` exactly once after
+    // `tuiThreadInit` returns and `!lc.no_tty`. The seed call unblocks
+    // the loop's first render (the bug from zargeant/tui-render-missing).
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/runtime.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+
+    // Locate the tuiRealMain function body.
+    const sig = std.mem.indexOf(u8, content, "fn tuiRealMain") orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expect(std.mem.indexOfPos(u8, content, sig, "lc.redraw_pending.store(true, .seq_cst)") != null);
+}
+
+test "W1-2: tuiRealMain allocates prev_snapshot via args.allocator.alloc" {
+    // REQ-RW-002 — `Lifecycle.prev_snapshot: ?[]Cell` is heap-allocated
+    // once at init via `args.allocator.alloc(...)`. Both the field
+    // assignment literal and the alloc call must appear in tuiRealMain.
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/runtime.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+
+    const sig = std.mem.indexOf(u8, content, "fn tuiRealMain") orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expect(std.mem.indexOfPos(u8, content, sig, "prev_snapshot") != null);
+    try testing.expect(std.mem.indexOfPos(u8, content, sig, "args.allocator.alloc") != null);
+}
