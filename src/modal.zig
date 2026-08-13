@@ -297,6 +297,21 @@ pub fn initialModalState(auth_state: api_auth.AuthState) State {
     };
 }
 
+/// Dispatch the active `state` variant to its `draw*` fn. Used by
+/// `tuiThreadLoop` (REQ-RW-004, tui-render-wiring #1259). Exhaustive
+/// over the `union(enum)` so adding a new variant fails compilation
+/// until both this switch AND the per-fn handler are added.
+pub fn drawModal(win: *WindowMock, state: *State) !void {
+    switch (state.*) {
+        .welcome => {},
+        .key_entry => try drawKeyEntry(win, state),
+        .unlock_prompt => try drawUnlock(win, state),
+        .consent_prompt => try drawConsentPrompt(win, state),
+        .agent_loop => try drawAgentLoopView(win, state),
+        .error_modal => try drawErrorModal(win, state),
+    }
+}
+
 // =============================================================================
 // Modal draw fns (tasks 3.3 - 3.7)
 //

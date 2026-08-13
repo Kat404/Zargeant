@@ -66,6 +66,11 @@ pub const Lifecycle = struct {
     /// `enableRawMode` failed (no `/dev/tty`, CI). The TUI thread
     /// runs in degraded logger-only mode; renderers are skipped.
     no_tty: bool = false,
+    /// REQ-RW-002 (tui-render-wiring #1259): previous-frame cell snapshot
+    /// for `emitFrame` diff. Allocated by `tuiRealMain` after init, freed
+    /// in shutdown. `null` on the first frame → `emitFrame` receives
+    /// `current` as both `prev` and `current` arg (full-frame emit).
+    prev_snapshot: ?[]@import("modal.zig").Cell = null,
 };
 
 // =============================================================================
@@ -289,6 +294,49 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
 }
 
 // =============================================================================
+// emitFrame (REQ-RW-003 + REQ-RW-005 + REQ-RW-007 — tui-render-wiring #1259)
+//
+// Cell→ANSI emitter. Reuses WindowMock.diff(current, prev) to compute
+// the entry list, then writes CSI cursor-position + SGR + cell bytes to
+// `writer`. Lazy per-cell SGR emit (no StyleTracker in v1; see D-2).
+// ponytail: no StyleTracker — add when profiling shows >1% frame
+// budget in SGR emits. ponytail: u21→u8 cast is v1 ASCII-only; non-ASCII
+// stays for v2.
+// =============================================================================
+
+/// Emit a frame's worth of CSI cursor-position + SGR + cell bytes to
+/// `writer`. Reuses `WindowMock.diff(prev)` to compute the entry list.
+/// Lazily emits SGR per cell. Caller owns the WindowMock + prev buffer.
+pub fn emitFrame(
+    writer: *std.Io.Writer,
+    prev: []const @import("modal.zig").Cell,
+    current: []const @import("modal.zig").Cell,
+    cols: u16,
+    rows: u16,
+    alloc: std.mem.Allocator,
+) !void {
+    const modal = @import("modal.zig");
+    var win: modal.WindowMock = .{
+        .allocator = alloc,
+        .cols = cols,
+        .rows = rows,
+        .cells = @constCast(current),
+    };
+    const diffs = try win.diff(prev);
+    defer alloc.free(diffs);
+    for (diffs) |entry| {
+        try mibu.cursor.goTo(writer, entry.x + 1, entry.y + 1);
+        try mibu.style.reset(writer);
+        if (entry.cell.style.bold) try mibu.style.bold(writer, true);
+        if (entry.cell.style.underline) try mibu.style.underline(writer, true);
+        if (entry.cell.style.reverse) try mibu.style.reverse(writer, true);
+        // ponytail: u21→u8 cast is v1 ASCII-only; non-ASCII stays for v2.
+        try writer.writeByte(@intCast(entry.cell.ch));
+    }
+    try mibu.style.reset(writer);
+}
+
+// =============================================================================
 // TUI thread body (R-PR 4 real lifecycle).
 //
 // The runtime orchestrator spawns this on its TUI thread. We drain
@@ -398,19 +446,20 @@ pub fn tuiThreadMain(args: *const ThreadArgs) void {
     }
 }
 
-/// Per-frame loop orchestrator (REQ-TUI-002 + REQ-TUI-021). Polls events
-/// in 16ms windows and renders when the redraw flag is set or new events
-/// arrive. Exits on `Shutdown` arriving on any channel.
+/// Per-frame loop orchestrator (REQ-TUI-002 + REQ-TUI-021 + REQ-RW-004
+/// + REQ-RW-006). Polls mibu events in 16ms windows; when the redraw
+/// flag flips (from init seed, a resize event, or any other source),
+/// runs the modal render bracket and emits the cell diff via emitFrame.
+/// Exits on `Shutdown` arriving on any channel AFTER any pending render
+/// completes.
 ///
-/// `state` is the modal state from src/modal.zig — render of `state` is
-/// deferred (the modal stack renders during the bracket; tuiThreadLoop
-/// only orchestrates the bracket + dispatch). The signature is locked
-/// per task 4.2; the modal render hook lands with the runtime wiring
-/// in task 4.5.
+/// `state` is the modal state from src/modal.zig — its active variant
+/// dispatches via `modal.drawModal` to the per-fn draw* helper. The
+/// per-frame WindowMock is allocated + freed each iteration; the
+/// `prev_snapshot` buffer persists across frames (REQ-RW-002).
 ///
-/// ponytail: state-driven render is a per-frame invoke — no extra
-/// defer for now. If the bracket ordering ever needs guards (e.g.
-/// nested updates), add then.
+/// ponytail: per-frame WindowMock init/deinit is cheap at v1 frame
+/// rates; revisit if profiling shows allocation cost.
 pub fn tuiThreadLoop(
     lifecycle: *Lifecycle,
     handle: std.Io.File.Handle,
@@ -418,11 +467,35 @@ pub fn tuiThreadLoop(
     writer: *std.Io.Writer,
     channels: *@import("channels.zig").Channels,
     state: *@import("modal.zig").State,
+    alloc: std.mem.Allocator,
 ) !void {
-    _ = state; // render hook deferred to runtime wiring (task 4.5).
-    _ = writer; // render emission deferred to runtime wiring (task 4.5).
+    const modal = @import("modal.zig");
     const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
-    while (!lifecycle.redraw_pending.load(.seq_cst)) {
+    while (true) {
+        // 1. Render if pending (REQ-RW-004 sub-bullet 2-3) — runs before
+        // Shutdown drain so a pending render always completes.
+        if (lifecycle.redraw_pending.swap(false, .seq_cst)) {
+            try mibu.term.beginSynchronizedUpdate(writer);
+            var win = try modal.WindowMock.init(alloc, lifecycle.width, lifecycle.height);
+            defer win.deinit();
+            defer mibu.term.endSynchronizedUpdate(writer) catch {};
+            try modal.drawModal(win, state);
+            const current = win.snapshot();
+            // First frame: lifecycle.prev_snapshot is null → use current
+            // as both prev (full-frame emit per REQ-RW-003 S-RW-005).
+            const prev = lifecycle.prev_snapshot orelse current;
+            try emitFrame(writer, prev, current, lifecycle.width, lifecycle.height, alloc);
+            // Swap prev_snapshot. Free the old buffer, dupe the new one.
+            if (lifecycle.prev_snapshot) |p| alloc.free(p);
+            const duped = try alloc.dupe(modal.Cell, current);
+            lifecycle.prev_snapshot = duped;
+        }
+        // 2. Drain channels.Shutdown from any edge (runtime signals all).
+        if (channels.tui_to_agent.tryGet(io)) |ev| switch (ev) {
+            .Shutdown => return,
+            else => continue,
+        };
+        // 3. Poll mibu events. Resize → update dims + set redraw flag.
         const event = mibu.events.nextWithTimeout(io, file, 16) catch continue;
         switch (event) {
             .key => |k| try channels.tui_to_agent.tryPut(io, .{ .KeyPress = k }),
@@ -434,11 +507,6 @@ pub fn tuiThreadLoop(
             },
             .timeout, .none, .invalid, .paste_start, .paste_end, .mouse => {},
         }
-        // Drain channels.Shutdown from any edge (runtime signals all).
-        if (channels.tui_to_agent.tryGet(io)) |ev| switch (ev) {
-            .Shutdown => return,
-            else => continue,
-        };
     }
 }
 
@@ -553,9 +621,10 @@ test "bracket is innermost (begin appears before end in buffer order)" {
 test "Lifecycle struct exposes required fields" {
     // The Lifecycle struct carries the right shape for tuiThreadShutdown.
     // Compile-time assertion via typeinfo. PR 2 adds the `no_tty` field
-    // (REQ-TUI-047); the count rises from 7 to 8.
+    // (REQ-TUI-047); the count rises from 7 to 8. tui-render-wiring
+    // (#1259, REQ-RW-002) adds `prev_snapshot`; the count rises to 9.
     const fields = @typeInfo(Lifecycle).@"struct".fields;
-    try testing.expectEqual(@as(usize, 8), fields.len);
+    try testing.expectEqual(@as(usize, 9), fields.len);
 }
 
 test "redraw_pending is std.atomic.Value(bool) with seq_cst contract" {

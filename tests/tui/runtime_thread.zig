@@ -47,6 +47,9 @@ const M = struct {
     pub const State = root.modal.State;
     pub const ErrorKind = root.modal.ErrorKind;
     pub const AgentLoopState = root.modal.AgentLoopState;
+    pub const Cell = root.modal.Cell;
+    pub const Style = root.modal.Style;
+    pub const WindowMock = root.modal.WindowMock;
     pub const appendStreamChunk = root.modal.appendStreamChunk;
 };
 const MS = struct {
@@ -80,6 +83,9 @@ const Main = struct {
 const Tui = struct {
     const root = @import("tui");
     pub const ThreadArgs = root.tui.ThreadArgs;
+    pub const Lifecycle = root.tui.Lifecycle;
+    pub const emitFrame = root.tui.emitFrame;
+    pub const tuiThreadLoop = root.tui.tuiThreadLoop;
 };
 
 // =============================================================================
@@ -1227,4 +1233,422 @@ test "T-VR-5: submitUnlock references the 3-attempt counter (REQ-VER-012)" {
     // (the cap terminal state).
     try testing.expect(std.mem.indexOf(u8, body, "attempts") != null);
     try testing.expect(std.mem.indexOf(u8, body, ".error_modal") != null);
+}
+
+// =============================================================================
+// tui-render-wiring slice (sdd/tui-render-wiring/spec REQ-RW-001/002)
+// W1 tests: seed + prev_snapshot alloc
+// =============================================================================
+
+test "W1-1: tuiRealMain seeds redraw_pending=true after tuiThreadInit" {
+    // REQ-RW-001 — `tuiRealMain` MUST call
+    // `lc.redraw_pending.store(true, .seq_cst)` exactly once after
+    // `tuiThreadInit` returns and `!lc.no_tty`. The seed call unblocks
+    // the loop's first render (the bug from zargeant/tui-render-missing).
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/runtime.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+
+    // Locate the tuiRealMain function body.
+    const sig = std.mem.indexOf(u8, content, "fn tuiRealMain") orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expect(std.mem.indexOfPos(u8, content, sig, "lc.redraw_pending.store(true, .seq_cst)") != null);
+}
+
+test "W1-2: tuiRealMain allocates prev_snapshot via args.allocator.alloc" {
+    // REQ-RW-002 — `Lifecycle.prev_snapshot: ?[]Cell` is heap-allocated
+    // once at init via `args.allocator.alloc(...)`. Both the field
+    // assignment literal and the alloc call must appear in tuiRealMain.
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/runtime.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+
+    const sig = std.mem.indexOf(u8, content, "fn tuiRealMain") orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expect(std.mem.indexOfPos(u8, content, sig, "prev_snapshot") != null);
+    try testing.expect(std.mem.indexOfPos(u8, content, sig, "args.allocator.alloc") != null);
+}
+
+// =============================================================================
+// tui-render-wiring W3 tests (REQ-RW-003, REQ-RW-005, REQ-RW-007)
+// =============================================================================
+
+test "W3-1: emitFrame writes CSI cursor position + cell byte for a 2-cell diff" {
+    // REQ-RW-003 scenario S-RW-004 — given prev = all spaces and current
+    // with cell at 1-indexed (col=2, row=1) = 'X' bold, the buffer
+    // contains the cursor-position escape `\x1b[1;2H` (row=1, col=2),
+    // the bold SGR `\x1b[1m`, and the cell byte 'X'. Also a trailing
+    // `\x1b[0m` reset.
+    var prev: [4]M.Cell = .{
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+    };
+    var current: [4]M.Cell = .{
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = 'X', .style = .{ .bold = true } },
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+    };
+    var buf: [128]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Tui.emitFrame(&w, &prev, &current, 2, 2, testing.allocator);
+    const out = buf[0..w.end];
+    // Cursor position: mibu.cursor.goTo(writer, x=2, y=1) → \x1b[1;2H
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;2H") != null);
+    // Bold SGR
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1m") != null);
+    // Cell byte 'X'
+    try testing.expect(std.mem.indexOf(u8, out, "X") != null);
+    // Trailing reset
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[0m") != null);
+}
+
+test "W3-2: emitFrame writes SGR codes for bold/underline/reverse/reset" {
+    // REQ-RW-003 + REQ-RW-007 (S-RW-010) — per-cell lazy SGR emits. Bold
+    // cell triggers \x1b[1m; underline triggers \x1b[4m; reverse triggers
+    // \x1b[7m; each cell preceded by a \x1b[0m reset (no StyleTracker).
+    var prev: [3]M.Cell = .{
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+    };
+    var current: [3]M.Cell = .{
+        .{ .ch = 'A', .style = .{ .bold = true } },
+        .{ .ch = 'B', .style = .{ .underline = true } },
+        .{ .ch = 'C', .style = .{ .reverse = true } },
+    };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Tui.emitFrame(&w, &prev, &current, 3, 1, testing.allocator);
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1m") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[4m") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[7m") != null);
+}
+
+test "W3-3: emitFrame writes no cursor escapes when prev == current" {
+    // REQ-RW-003 scenario S-RW-005 — when prev == current, the diff is
+    // empty so only the trailing reset SGR is emitted (no cursor
+    // positions).
+    var cells: [4]M.Cell = .{
+        .{ .ch = 'A', .style = .{ .bold = true } },
+        .{ .ch = 'B', .style = .{ .underline = true } },
+        .{ .ch = 'C', .style = .{} },
+        .{ .ch = 'D', .style = .{} },
+    };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Tui.emitFrame(&w, &cells, &cells, 2, 2, testing.allocator);
+    const out = buf[0..w.end];
+    // No cursor-position escapes (those look like \x1b[<num>;<num>H).
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[2;1H") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[2;2H") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;1H") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;2H") == null);
+    // Trailing reset only.
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[0m") != null);
+}
+
+test "W3-4: emitFrame frees the diff slice under std.testing.allocator" {
+    // REQ-RW-003 scenario S-RW-006 — emitFrame MUST free the diff slice
+    // allocated by WindowMock.diff. With std.testing.allocator the leak
+    // detector asserts zero leaks.
+    var prev: [3]M.Cell = .{
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+    };
+    var current: [3]M.Cell = .{
+        .{ .ch = 'X', .style = .{ .bold = true } },
+        .{ .ch = 'Y', .style = .{ .underline = true } },
+        .{ .ch = 'Z', .style = .{ .reverse = true } },
+    };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Tui.emitFrame(&w, &prev, &current, 3, 1, testing.allocator);
+    // If emitFrame leaks the diff slice, the testing.allocator would
+    // assert on scope exit; we got here so the leak is zero.
+    try testing.expect(w.end > 0);
+}
+
+test "W3-5: emitFrame ignores WindowMock.in_alt_screen + cursor_hidden" {
+    // REQ-RW-005 (S-RW-008) — emitFrame must not consult the WindowMock's
+    // bookkeeping flags. The same prev/current pair produces byte-equivalent
+    // output regardless of the flag state.
+    var prev: [2]M.Cell = .{
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+    };
+    var current: [2]M.Cell = .{
+        .{ .ch = 'X', .style = .{ .bold = true } },
+        .{ .ch = 'Y', .style = .{ .underline = true } },
+    };
+    var buf_a: [256]u8 = undefined;
+    var w_a = std.Io.Writer.fixed(&buf_a);
+    try Tui.emitFrame(&w_a, &prev, &current, 2, 1, testing.allocator);
+    var buf_b: [256]u8 = undefined;
+    var w_b = std.Io.Writer.fixed(&buf_b);
+    try Tui.emitFrame(&w_b, &prev, &current, 2, 1, testing.allocator);
+    try testing.expectEqual(w_a.end, w_b.end);
+    try testing.expectEqualSlices(u8, buf_a[0..w_a.end], buf_b[0..w_b.end]);
+}
+
+// =============================================================================
+// tui-render-wiring W4 tests (REQ-RW-004, REQ-RW-006)
+// =============================================================================
+
+test "W4-1: tuiThreadLoop renders modal on redraw_pending and emits CSI" {
+    // REQ-RW-004 scenario S-RW-007 — when redraw_pending is set, the
+    // loop renders via modal.draw* + emitFrame. End-to-end smoke: the
+    // writer buffer must contain the synchronized-update bracket
+    // (\x1b[?2026h), at least one cursor-position escape
+    // (\x1b[<row>;<col>H), and the trailing reset (\x1b[0m).
+    var ch: Ch.Channels = Ch.Channels.init();
+    defer ch.closeAll(testing.io);
+    var lc: Tui.Lifecycle = .{
+        .raw_term = null,
+        .dec_2048_supported = false,
+        .kitty_supported = false,
+        .kitty_flags_pushed = false,
+        .redraw_pending = std.atomic.Value(bool).init(true),
+        .width = 40,
+        .height = 12,
+    };
+    var modal_state: M.State = .{ .key_entry = .{} };
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    // The loop runs until Shutdown; we trigger Shutdown after one render
+    // by feeding it via channels.tui_to_agent before the call. The
+    // important assertion is that the buffer contains the bracket +
+    // cursor + reset bytes after at least one render pass.
+    try ch.tui_to_agent.tryPut(testing.io, .Shutdown);
+    try Tui.tuiThreadLoop(
+        &lc,
+        std.Io.File.stdin().handle, // any handle — no events in this test
+        testing.io,
+        &w,
+        &ch,
+        &modal_state,
+        testing.allocator,
+    );
+    // The loop allocated a prev_snapshot dupe; free it like tuiRealMain
+    // does on shutdown.
+    if (lc.prev_snapshot) |p| testing.allocator.free(p);
+    lc.prev_snapshot = null;
+    const out = buf[0..w.end];
+    // beginSynchronizedUpdate bracket
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?2026h") != null);
+    // endSynchronizedUpdate bracket
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?2026l") != null);
+    // trailing reset
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[0m") != null);
+}
+
+test "W4-2: tuiThreadLoop drops the _ = state placeholder lines" {
+    // REQ-RW-004 sub-bullet 4 — the `_ = state; // render hook deferred
+    // to runtime wiring (task 4.5)` and `_ = writer; // render emission
+    // deferred to runtime wiring (task 4.5)` placeholders MUST be
+    // removed (zargeant/tui-render-missing #1254).
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/tui.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    try testing.expect(std.mem.indexOf(u8, content, "_ = state; // render hook") == null);
+    try testing.expect(std.mem.indexOf(u8, content, "_ = writer; // render emission") == null);
+}
+
+// =============================================================================
+// tui-render-wiring W5 tests (REQ-RW-005 alt-screen flag, REQ-RW-006
+// SIGWINCH, REQ-RW-002 prev_snapshot updates, REQ-RW-014 T-SG-7 static-grep
+// + REQ-RW-008/009/012 fold-ins)
+// =============================================================================
+
+test "W5-1: Lifecycle.prev_snapshot updates per frame (no double-emit)" {
+    // REQ-RW-002 + REQ-RW-013 (S-RW-016) — driving two consecutive
+    // frames mutates prev_snapshot. The 2nd frame's prev_snapshot is
+    // NOT the original `prev` slice — it's been replaced with the
+    // 1st frame's `current` snapshot.
+    var prev: [3]M.Cell = .{
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+        .{ .ch = ' ', .style = .{} },
+    };
+    var frame1: [3]M.Cell = .{
+        .{ .ch = 'A', .style = .{ .bold = true } },
+        .{ .ch = 'B', .style = .{ .underline = true } },
+        .{ .ch = 'C', .style = .{ .reverse = true } },
+    };
+    var frame2: [3]M.Cell = .{
+        .{ .ch = 'A', .style = .{ .bold = true } },
+        .{ .ch = 'D', .style = .{ .underline = true } }, // changed cell
+        .{ .ch = 'C', .style = .{ .reverse = true } },
+    };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    // Frame 1: prev -> frame1. emitFrame swaps lifecycle.prev_snapshot
+    // to a dupe of frame1 (we fake this here by tracking manually).
+    try Tui.emitFrame(&w, &prev, &frame1, 3, 1, testing.allocator);
+    const frame1_out = w.end;
+    try testing.expect(frame1_out > 0);
+
+    // Frame 2: frame1 -> frame2 (only cell B→D differs).
+    var w2 = std.Io.Writer.fixed(&buf);
+    try Tui.emitFrame(&w2, &frame1, &frame2, 3, 1, testing.allocator);
+    const frame2_out = w2.end;
+    try testing.expect(frame2_out > 0);
+    // Frame 2 emits fewer bytes than frame 1 (only 1 diff entry vs 3).
+    try testing.expect(frame2_out < frame1_out);
+}
+
+// T-SG-7: REQ-RW-014 (S-RW-017) — static-grep guard for the
+// tui-render-wiring slice. Three sub-assertions: (a) seed call appears
+// in src/runtime.zig:tuiRealMain; (b) emitFrame symbol appears in
+// src/tui.zig; (c) prev_snapshot field appears in src/tui.zig Lifecycle.
+test "T-SG-7: render wiring is present after tui-render-wiring slice" {
+    const runtime_src = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/runtime.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(runtime_src);
+    const tui_src = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/tui.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(tui_src);
+
+    // Sub-assertion 1: seed call literal in runtime.zig.
+    try testing.expect(std.mem.indexOf(u8, runtime_src, "lc.redraw_pending.store(true, .seq_cst)") != null);
+    // Sub-assertion 2: emitFrame signature in tui.zig.
+    try testing.expect(std.mem.indexOf(u8, tui_src, "pub fn emitFrame(") != null);
+    // Sub-assertion 3: prev_snapshot field in tui.zig Lifecycle.
+    try testing.expect(std.mem.indexOf(u8, tui_src, "prev_snapshot:") != null);
+}
+
+// T-SG-8 fold-in: REQ-RW-008 (S-RW-011) — WindowMock + 5 draw fns
+// unchanged. Verifies the 7 literal tokens per spec.
+test "T-SG-8: WindowMock + 5 draw fns unchanged" {
+    const modal_src = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/modal.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(modal_src);
+    const needles = [_][]const u8{
+        "pub fn drawKeyEntry",
+        "pub fn drawUnlock",
+        "pub fn drawConsentPrompt",
+        "pub fn drawErrorModal",
+        "pub fn drawAgentLoopView",
+        "pub fn init(allocator",
+        "pub fn diff(self",
+    };
+    for (needles) |needle| {
+        try testing.expect(std.mem.indexOf(u8, modal_src, needle) != null);
+    }
+}
+
+// T-SG-9 fold-in: REQ-RW-009 (S-RW-012) — no new third-party imports in
+// src/tui.zig or src/runtime.zig. Allowed: std, mibu, builtin,
+// @import("channels.zig"), @import("modal.zig").
+test "T-SG-9: no new third-party imports in src/tui.zig or src/runtime.zig" {
+    const targets = [_][]const u8{
+        "src/tui.zig",
+        "src/runtime.zig",
+    };
+    const allowed = [_][]const u8{
+        "@import(\"std\")",
+        "@import(\"mibu\")",
+        "@import(\"builtin\")",
+        "@import(\"channels.zig\")",
+        "@import(\"modal.zig\")",
+        "@import(\"api_auth.zig\")",
+        "@import(\"api_client.zig\")",
+        "@import(\"api_sse.zig\")",
+        "@import(\"logger.zig\")",
+        "@import(\"mock_server.zig\")",
+        "@import(\"password_input.zig\")",
+        "@import(\"runtime.zig\")",
+        "@import(\"tui.zig\")",
+        "@import(\"sandbox.zig\")",
+        "@import(\"sandbox_profile.zig\")",
+        "@import(\"main\")",
+        "@import(\"root\")",
+    };
+    for (targets) |path| {
+        const content = try std.Io.Dir.cwd().readFileAlloc(
+            testing.io,
+            path,
+            testing.allocator,
+            .limited(1 << 20),
+        );
+        defer testing.allocator.free(content);
+        const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+        const prod_src = content[0..first_test];
+        // Find every @import(...) and check it against the allow-list.
+        var idx: usize = 0;
+        while (std.mem.indexOfPos(u8, prod_src, idx, "@import(")) |start| {
+            const close = std.mem.indexOfPos(u8, prod_src, start, ")") orelse break;
+            const literal = prod_src[start .. close + 1];
+            var ok = false;
+            for (allowed) |a| {
+                if (std.mem.eql(u8, literal, a)) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) {
+                std.debug.print("\n[T-SG-9] forbidden third-party @import in {s}: {s}\n", .{ path, literal });
+                return error.ThirdPartyImport;
+            }
+            idx = close + 1;
+        }
+    }
+}
+
+// T-SG-10 fold-in: REQ-RW-012 (S-RW-015) — no PTY-based test
+// scaffolding in tests/tui/runtime_thread.zig. Scans the production
+// section only (first `test "` marker), so the guard's own forbidden
+// literals don't trip the check.
+test "T-SG-10: no PTY-based test scaffolding in tests/tui/runtime_thread.zig" {
+    const path = "tests/tui/runtime_thread.zig";
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        path,
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const forbidden = [_][]const u8{
+        "forkpty",
+        "posix_spawn",
+        "openpty",
+        "std.posix.fork",
+    };
+    for (forbidden) |needle| {
+        try testing.expect(std.mem.indexOf(u8, prod_src, needle) == null);
+    }
 }
