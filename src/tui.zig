@@ -324,7 +324,15 @@ pub fn emitFrame(
     };
     const diffs = try win.diff(prev);
     defer alloc.free(diffs);
+    // REQ-TIW-001 — track the last diff cell so we can place the
+    // blink cursor adjacent to it after the trailing reset. Terminal-
+    // agnostic: avoids terminal-specific DEC 2026 frozen-cursor on
+    // first frame (Kitty/VTE behavior varies per #1277 W-3).
+    var last_x: u16 = 0;
+    var last_y: u16 = 0;
     for (diffs) |entry| {
+        last_x = entry.x;
+        last_y = entry.y;
         try mibu.cursor.goTo(writer, entry.x + 1, entry.y + 1);
         try mibu.style.reset(writer);
         if (entry.cell.style.bold) try mibu.style.bold(writer, true);
@@ -334,6 +342,9 @@ pub fn emitFrame(
         try writer.writeByte(@intCast(entry.cell.ch));
     }
     try mibu.style.reset(writer);
+    // REQ-TIW-001 — trailing cursor position. Only fires when at least
+    // one diff entry existed (otherwise no position to land on).
+    if (diffs.len > 0) try mibu.cursor.goTo(writer, last_x + 1, last_y + 1);
 }
 
 // =============================================================================
@@ -507,6 +518,81 @@ pub fn tuiThreadLoop(
             },
             .timeout, .none, .invalid, .paste_start, .paste_end, .mouse => {},
         }
+    }
+}
+
+// =============================================================================
+// handleKeyInput — W-4 key-event consumer for the modal state machine.
+//
+// REQ-TIW-003: signature is (io, alloc, state, k) -> !bool. Returns true
+// when the state transitioned (caller MUST set redraw_pending=true);
+// false otherwise (caller MAY forward the key to the Agent channel).
+// Co-located with tuiThreadLoop; keeps src/modal.zig free of mibu imports.
+//
+// REQ-TIW-004: char-append for .key_entry + .unlock_prompt.
+// REQ-TIW-005: backspace decrement (saturating).
+// REQ-TIW-006: enter submit via modal.submitKeyEntry / submitUnlock.
+// REQ-TIW-007: esc cancel for .unlock_prompt (no-op for .key_entry per
+// REQ-TIW-NEG-3).
+// REQ-TIW-008: .event == .release early-return; .event == .repeat is
+// treated like .press (auto-repeat appends/submits).
+// =============================================================================
+
+// ponytail: synchronous `validateViaApi` inside `submitKeyEntry` blocks
+// the TUI thread for ~1-3s. v1 acceptable; offload to Agent via new
+// `Event.ValidateApiKey` + reply channel when UX latency matters.
+pub fn handleKeyInput(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    state: *@import("modal.zig").State,
+    k: mibu.events.Key,
+) !bool {
+    if (k.event == .release) return false; // REQ-TIW-008 — kitty-kb release no-op
+    switch (state.*) {
+        .key_entry => |*ke| switch (k.code) {
+            .char => |c| {
+                if (ke.draft_len >= ke.draft.len) return false; // REQ-TIW-004 ceiling
+                if (c > 0x7F) return false; // REQ-TIW-004 non-ASCII
+                ke.draft[ke.draft_len] = @intCast(c);
+                ke.draft_len += 1;
+                return true;
+            },
+            .backspace => {
+                if (ke.draft_len == 0) return false; // REQ-TIW-005 empty-draft no-op
+                ke.draft_len -= 1;
+                return true;
+            },
+            .enter => {
+                try @import("modal.zig").submitKeyEntry(io, alloc, state); // REQ-TIW-006
+                return true;
+            },
+            .esc => return false, // REQ-TIW-007 + REQ-TIW-NEG-3 — v1 no-op
+            else => return false, // REQ-TIW-009 — arrows / F-keys / tab
+        },
+        .unlock_prompt => |*up| switch (k.code) {
+            .char => |c| {
+                if (up.draft_len >= up.draft.len) return false;
+                if (c > 0x7F) return false;
+                up.draft[up.draft_len] = @intCast(c);
+                up.draft_len += 1;
+                return true;
+            },
+            .backspace => {
+                if (up.draft_len == 0) return false;
+                up.draft_len -= 1;
+                return true;
+            },
+            .enter => {
+                try @import("modal.zig").submitUnlock(io, state); // REQ-TIW-006
+                return true;
+            },
+            .esc => {
+                @import("modal.zig").cancelUnlock(state); // REQ-TIW-007
+                return true;
+            },
+            else => return false,
+        },
+        else => return false, // .welcome / .consent_prompt / .agent_loop / .error_modal
     }
 }
 

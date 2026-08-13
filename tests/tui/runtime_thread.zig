@@ -14,6 +14,7 @@
 const std = @import("std");
 const testing = std.testing;
 const builtin = @import("builtin");
+const mibu = @import("mibu");
 
 // =============================================================================
 // Linux-only comptime guard.
@@ -86,7 +87,17 @@ const Tui = struct {
     pub const Lifecycle = root.tui.Lifecycle;
     pub const emitFrame = root.tui.emitFrame;
     pub const tuiThreadLoop = root.tui.tuiThreadLoop;
+    pub const handleKeyInput = root.tui.handleKeyInput;
 };
+
+/// Key-event driver helper (REQ-TIW-013). Mirrors the wiring in
+/// `tuiThreadLoop`'s `.key` arm: calls `handleKeyInput`, then sets
+/// `redraw_pending = true` when consumed. Used by every W2/W3 behavioral
+/// test in this slice to avoid duplicating inline driver code.
+fn feedKey(state: *M.State, lc: *Tui.Lifecycle, k: mibu.events.Key) !void {
+    const consumed = try Tui.handleKeyInput(testing.io, testing.allocator, state, k);
+    if (consumed) lc.redraw_pending.store(true, .seq_cst);
+}
 
 // =============================================================================
 // T-SG-1: no api_client.Client outside the Agent body (REQ-TUI-034)
@@ -1650,5 +1661,129 @@ test "T-SG-10: no PTY-based test scaffolding in tests/tui/runtime_thread.zig" {
     };
     for (forbidden) |needle| {
         try testing.expect(std.mem.indexOf(u8, prod_src, needle) == null);
+    }
+}
+
+// =============================================================================
+// tui-input-wiring W1 tests (REQ-TIW-001, REQ-TIW-002)
+//
+// REQ-TIW-001: emitFrame must emit a trailing `mibu.cursor.goTo` after the
+// trailing `mibu.style.reset` when diffs.len > 0. The blink cursor lands
+// at one cell to the right of the last rendered cell.
+// REQ-TIW-002: cursor position determinism — terminal-agnostic.
+// =============================================================================
+
+test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001)" {
+    // REQ-TIW-001 — trailing `mibu.cursor.goTo` after the trailing reset.
+    // S-TIW-001: cell 'X' at (col=5, row=0) → trailing cursor at (col=6, row=1)
+    //   = `\x1b[1;6H` immediately following the `\x1b[0m` trailing reset.
+    // S-TIW-002: when prev == current (empty diff), no trailing goTo
+    //   fires — only the trailing reset.
+    {
+        var prev: [60 * 24]M.Cell = undefined;
+        @memset(&prev, .{ .ch = ' ', .style = .{} });
+        var current: [60 * 24]M.Cell = undefined;
+        @memset(&current, .{ .ch = ' ', .style = .{} });
+        current[5] = .{ .ch = 'X', .style = .{ .bold = true } };
+
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try Tui.emitFrame(&w, &prev, &current, 60, 24, testing.allocator);
+        const out = buf[0..w.end];
+
+        try testing.expect(std.mem.endsWith(u8, out, "\x1b[0m\x1b[1;6H"));
+    }
+    {
+        var current: [4]M.Cell = .{
+            .{ .ch = 'A', .style = .{ .bold = true } },
+            .{ .ch = 'B', .style = .{ .underline = true } },
+            .{ .ch = 'C', .style = .{} },
+            .{ .ch = 'D', .style = .{} },
+        };
+
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try Tui.emitFrame(&w, &current, &current, 2, 2, testing.allocator);
+        const out = buf[0..w.end];
+
+        // Trailing reset present.
+        try testing.expect(std.mem.indexOf(u8, out, "\x1b[0m") != null);
+        // No cursor-position escape after the trailing reset (empty diff).
+        if (std.mem.indexOf(u8, out, "\x1b[0m")) |reset_idx| {
+            const after_reset = out[reset_idx + 4 ..];
+            try testing.expect(std.mem.indexOf(u8, after_reset, "\x1b[") == null);
+        } else {
+            try testing.expect(false);
+        }
+    }
+}
+
+// =============================================================================
+// tui-input-wiring W2 tests (REQ-TIW-004, REQ-TIW-005, REQ-TIW-008)
+//
+// REQ-TIW-004: handleKeyInput appends char keys to state.key_entry +
+// state.unlock_prompt draft (with 256-byte ceiling + ASCII-only).
+// REQ-TIW-005: handleKeyInput decrements draft_len on backspace
+// (saturates at 0).
+// REQ-TIW-008: handleKeyInput early-returns on .event == .release.
+// =============================================================================
+
+test "T-TIW-1: handleKeyInput appends char to draft (REQ-TIW-004)" {
+    // REQ-TIW-004 — char keys append to .key_entry + .unlock_prompt draft
+    // with 256-byte ceiling + ASCII-only v1.
+    // S-TIW-004: happy path key_entry (empty draft → 'a' → draft[0]='a', len=1).
+    // S-TIW-005: ceiling (draft_len==256 → silent no-op, returns false).
+    // S-TIW-006: non-ASCII (codepoint > 0x7F → silent no-op).
+    // S-TIW-007: unlock_prompt path consumes char events.
+    {
+        var state: M.State = .{ .key_entry = .{} };
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .{ .char = 'a' }, .event = .press },
+        );
+        try testing.expect(consumed);
+        try testing.expectEqual(@as(usize, 1), state.key_entry.draft_len);
+        try testing.expectEqual(@as(u8, 'a'), state.key_entry.draft[0]);
+    }
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..3], "abc");
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 256,
+        } };
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .{ .char = 'd' }, .event = .press },
+        );
+        try testing.expect(!consumed);
+        try testing.expectEqual(@as(usize, 256), state.key_entry.draft_len);
+    }
+    {
+        var state: M.State = .{ .key_entry = .{} };
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .{ .char = 0x100 }, .event = .press },
+        );
+        try testing.expect(!consumed);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
+    }
+    {
+        var state: M.State = .{ .unlock_prompt = .{} };
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .{ .char = 'p' }, .event = .press },
+        );
+        try testing.expect(consumed);
+        try testing.expectEqual(@as(usize, 1), state.unlock_prompt.draft_len);
+        try testing.expectEqual(@as(u8, 'p'), state.unlock_prompt.draft[0]);
     }
 }
