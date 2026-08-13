@@ -1787,3 +1787,37 @@ test "T-TIW-1: handleKeyInput appends char to draft (REQ-TIW-004)" {
         try testing.expectEqual(@as(u8, 'p'), state.unlock_prompt.draft[0]);
     }
 }
+
+test "T-TIW-2: handleKeyInput decrements draft on backspace (REQ-TIW-005)" {
+    // REQ-TIW-005 — backspace decrements draft_len (saturating at 0).
+    // S-TIW-008: happy path key_entry (draft_len=3 → backspace → draft_len=2).
+    // S-TIW-009: empty-draft no-op (draft_len=0 → backspace → draft_len=0,
+    //           returns false).
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..3], "abc");
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 3,
+        } };
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .backspace, .event = .press },
+        );
+        try testing.expect(consumed);
+        try testing.expectEqual(@as(usize, 2), state.key_entry.draft_len);
+    }
+    {
+        var state: M.State = .{ .key_entry = .{} };
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .backspace, .event = .press },
+        );
+        try testing.expect(!consumed);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
+    }
+}
