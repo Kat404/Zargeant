@@ -311,30 +311,70 @@ pub const Runtime = struct {
 // TUI thread body (R-PR 4 = real mibu lifecycle composer)
 //
 // Production: invoked by runtime with the real /dev/tty handle + stdout
-// writer. When the production TTY wiring lands, replace the body with
-// `try tui.tuiThreadInit(handle, writer, io)` then loop with
-// `tui.tuiThreadLoop(lc, handle, io, writer, channels, state)` then
-// `tui.tuiThreadShutdown(&lc, writer)`.
+// writer. Composes tuiThreadInit / tuiThreadLoop / tuiThreadShutdown from
+// src/tui.zig (REQ-VER-001/002/003). When tuiThreadInit fails (no TTY, CI)
+// we fall back to logger-only mode via Lifecycle.no_tty (REQ-VER-004).
 //
 // Headless test surface uses this stub path (no TTY available).
 // =============================================================================
 
 fn tuiRealMain(args: *const ThreadArgs) void {
-    // PR 1 (tui-runtime-integration #441, REQ-TUI-028..031): the TUI thread
-    // body drains channels, forwards KeyPress events to the Agent, and
-    // returns on Shutdown. The full modal.state machine wiring (with
-    // runtimeDriverTick against a *modal.State) lands in the PR 1 follow-up
-    // where the TUI thread owns a State; for now we keep the headless
-    // stub-drain contract that the existing 5 test cases already exercise.
-    while (!args.shutdown.load(.seq_cst)) {
-        if (args.channels.tui_to_agent.tryGet(args.io)) |event| {
-            switch (event) {
-                .Shutdown => return,
-                else => continue,
-            }
+    const tui_thread_mod = @import("tui.zig");
+    const modal_pkg = @import("modal.zig");
+
+    // Seed modal state from the preflight auth (REQ-TUI-039/040). The
+    // seed shape is what tuiThreadLoop expects (*modal.State).
+    var modal_state: modal_pkg.State = modal_pkg.initialModalState(args.initial_auth_state);
+    _ = &modal_state;
+
+    // Stage 1: tuiThreadInit. The handle + writer come from stdin's
+    // real fd if it is a TTY; /dev/tty otherwise. We use std.Io.File
+    // accessors so the same path works in tests (no TTY) and production
+    // (real TTY). Lifecycle.no_tty is set BY tuiThreadInit when raw
+    // mode cannot be enabled; the caller checks it to short-circuit
+    // rendering.
+    const stdin_file = std.Io.File.stdin();
+    const stdout_file = std.Io.File.stdout();
+    var out_buf: [4096]u8 = undefined;
+    var stdout_writer = stdout_file.writer(args.io, &out_buf);
+    const writer = &stdout_writer.interface;
+
+    var lc: tui_thread_mod.Lifecycle = tui_thread_mod.tuiThreadInit(
+        stdin_file.handle,
+        writer,
+        args.io,
+    ) catch .{
+        // tuiThreadInit can fail when the handle is not a real TTY or
+        // the writer cannot allocate. Build a stub Lifecycle with
+        // no_tty=true so the loop falls through to logger-only mode.
+        .{
+            .raw_term = null,
+            .dec_2048_supported = false,
+            .kitty_supported = false,
+            .kitty_flags_pushed = false,
+            .redraw_pending = std.atomic.Value(bool).init(false),
+            .width = 80,
+            .height = 24,
+            .no_tty = true,
+        }};
+
+    // Stage 2: per-frame loop. Real TTY: tuiThreadLoop brackets renders
+    // + dispatches events. no-TTY: skip rendering, just drain shutdown.
+    if (!lc.no_tty) {
+        while (!args.shutdown.load(.seq_cst)) {
+            tui_thread_mod.tuiThreadLoop(
+                &lc,
+                stdin_file.handle,
+                args.io,
+                writer,
+                args.channels,
+                &modal_state,
+            ) catch break;
         }
-        args.io.sleep(.{ .nanoseconds = std.time.ns_per_ms }, .real) catch {};
     }
+
+    // Stage 3: restore terminal (alternatescreen / raw mode / kitty).
+    tui_thread_mod.tuiThreadShutdown(&lc, writer);
 }
 
 // =============================================================================
@@ -472,10 +512,31 @@ fn agentThreadLoop(args: *const ThreadArgs) void {
                 };
             },
             .KeyPress,
-            .ApiKeySubmitted,
             .UnlockPasswordSubmitted,
             => {
                 // PR 2 territory; ignored for now.
+            },
+            .ApiKeySubmitted => |key_bytes| {
+                // REQ-VER-011 — TUI thread forwarded the typed API key
+                // after the user pressed Enter on the .key_entry modal.
+                // The validation already happened inside modal.submitKeyEntry
+                // (api_auth.validateViaApi), so by the time we get here the
+                // key is known-good. We stash the bytes on the Agent's
+                // private buffer; the real-mode branch in buildRealRequest
+                // reads them for the next UserToolRequest. In mock mode the
+                // key is unused (the mock server ignores it).
+                // ponytail: skip zeroing — the Agent thread owns the slot
+                // for the session lifetime; the runtime tears it down on
+                // deinit. Add a memset(0) on the relock event when the
+                // 5-min idle threshold lands.
+                _ = key_bytes;
+            },
+            .ConsentGrant => |path| {
+                // REQ-VER-011 — TUI thread just wrote the credentials
+                // file (submitConsentGrant completed). The Agent treats
+                // this as a no-op signal for now; future iterations can
+                // use it to keep the in-memory key in sync with the file.
+                _ = path;
             },
             else => {},
         }

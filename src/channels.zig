@@ -57,9 +57,9 @@ pub const AuthKind = enum {
     key_invalid,
 };
 
-/// Single Event union across the 5 channel edges. 16 variants.
+/// Single Event union across the 5 channel edges. 17 variants.
 pub const Event = union(enum) {
-    // TUI→Agent (6)
+    // TUI→Agent (7)
     KeyPress: mibu.events.Key,
     ApiKeySubmitted: []const u8,
     UnlockPasswordSubmitted: []const u8,
@@ -68,6 +68,11 @@ pub const Event = union(enum) {
     /// sends this when the 5-minute idle threshold trips; the Agent
     /// zeroes its in-memory key buffer.
     Relock,
+    /// tui-verification (#1241, REQ-VER-011): TUI thread sends this
+    /// after submitConsentGrant writes the credentials file. The Agent
+    /// thread uses it as a signal to keep the in-memory key in sync
+    /// with the on-disk file (future: trigger a backend sync).
+    ConsentGrant: []const u8,
     Shutdown,
 
     // Agent→TUI (4 — SSE-coalesced StreamChunk on agent_to_tui)
@@ -332,12 +337,14 @@ pub fn pushSseChunk(io: std.Io, ch: *Channel(Event), seq: u64, text: []const u8)
 
 const testing = std.testing;
 
-test "Event union has 16 variants" {
+test "Event union has 17 variants" {
     // REQ-TUI-004 scenario 4 — every variant from design#408 §1.2 resolves.
-    // PR 2 (tui-runtime-integration #441, REQ-TUI-042) adds the `Relock`
+    // PR 2 (tui-runtime-integration #441, REQ-TUI-042) added the `Relock`
     // variant for the 5-min idle relock: 15 → 16.
+    // tui-verification (#1241, REQ-VER-011) added the `ConsentGrant`
+    // variant: 16 → 17.
     const fields = @typeInfo(Event).@"union".fields;
-    try testing.expectEqual(@as(usize, 16), fields.len);
+    try testing.expectEqual(@as(usize, 17), fields.len);
 }
 
 test "channels have capacity 256 (5 edges)" {

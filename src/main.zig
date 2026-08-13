@@ -180,12 +180,28 @@ pub fn main(init: std.process.Init) !void {
     // .unlock_prompt).
     const auth_state = preflightAuthState();
 
+    // --mock wiring (REQ-VER-005/008) — when --mock is set, start the
+    // mock server and thread its handle into Config.mock_handle. The
+    // Agent body uses the handle to pull the ephemeral port when
+    // building the Request (target_host="127.0.0.1", target_port=port,
+    // tls=false). Without --mock, mock_handle stays null and the
+    // Agent body takes the real-mode branch (api.minimax.io:443).
+    const mock_server_pkg = @import("mock_server.zig");
+    var mock_handle: ?*mock_server_pkg.Handle = null;
+    if (parsed.mock_mode) {
+        mock_handle = mock_server_pkg.start(std.heap.page_allocator) catch {
+            std.process.exit(1);
+        };
+        defer mock_handle.?.deinit();
+    }
+
     // Runtime.run() delegation. R-PR 2 ships the R-PR 1 Runtime stub;
     // R-PR 4 replaces the TUI thread body with the real mibu lifecycle.
     var rt = runtime.Runtime.spawn(.{
         .mock_mode = parsed.mock_mode,
         .tls_gated = parsed.tls_gated,
         .initial_auth_state = auth_state,
+        .mock_handle = mock_handle,
     }) catch {
         std.process.exit(1);
     };
