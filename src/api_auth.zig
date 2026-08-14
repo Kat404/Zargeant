@@ -279,9 +279,8 @@ pub fn validateViaApiWithTarget(io: std.Io, alloc: std.mem.Allocator, key: []con
 /// Design #448 §"D1"; closes the test-grade XOR+HMAC ceiling flagged at
 /// src/api_auth.zig:15-20.
 pub fn writeWithConsent(io: std.Io, key: []const u8, password: []const u8, path: []const u8, consent: bool) AuthError!void {
-    _ = io;
     if (!consent) return error.ConsentDenied;
-    return writeEncrypted(path, key, password);
+    return writeEncrypted(io, path, key, password);
 }
 
 /// Returns the auth state. `initialState` only stats the file — NEVER
@@ -321,9 +320,21 @@ pub fn initialState() AuthState {
 ///   - error.DecryptFailed on wrong password (AES-GCM tag mismatch).
 ///   - error.AuthenticationFailed on tampered ciphertext (AES-GCM tag
 ///     mismatch with the right key).
+///
+/// File format detection (added by W-6 fix-up, surfaced by CI ReleaseSafe
+/// flake on `loadWithUnlock tampered file returns DecryptFailed`):
+///   - **New format** (current writeEncrypted output): first byte `0x01`
+///     then `salt (16) || nonce (12) || ciphertext (N) || tag (16)`.
+///     Version byte disambiguates from legacy plaintext (`{` == 0x7B)
+///     and from any future format. Fixes latent false-positive where
+///     random salt[0] == 0x7B (1/256 probability) would falsely trigger
+///     error.LegacyPlaintext for a valid encrypted file.
+///   - **Legacy plaintext**: first byte `{` (0x7B) → error.LegacyPlaintext.
+///     Detected BEFORE the KDF runs (no side-channel timing leak).
+///   - **Old format** (pre-version-byte, written before W-6): falls back
+///     to `salt (16) || nonce (12) || ciphertext (N) || tag (16)`. Backward
+///     compatibility for files written before the version-byte fix.
 pub fn loadWithUnlock(io: std.Io, path: []const u8, password: []const u8) AuthError![]u8 {
-    _ = io;
-
     // Open + read the entire file.
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.OpenFailed;
     defer _ = std.os.linux.close(fd);
@@ -336,28 +347,52 @@ pub fn loadWithUnlock(io: std.Io, path: []const u8, password: []const u8) AuthEr
         total += n;
     }
 
+    // New format: 0x01 (1) || salt (16) || nonce (12) || ct (N) || tag (16).
+    // Minimum size: 1 + 16 + 12 + 16 = 45 bytes.
+    if (total >= 1 + 16 + 12 + 16 and buf[0] == 0x01) {
+        const salt = buf[1..17];
+        const nonce = buf[17..29];
+        const tag: [16]u8 = buf[total - 16 ..][0..16].*;
+        const ciphertext = buf[29 .. total - 16];
+        return tryDecrypt(io, password, salt, nonce, ciphertext, tag);
+    }
+
     // Legacy plaintext detection: leading `{` (0x7B) means the file was
     // written by the pre-migration writeWithConsent that serialized
     // JSON. Return BEFORE the Argon2id KDF runs so no timing leak.
     if (total > 0 and buf[0] == 0x7B) return error.LegacyPlaintext;
 
-    // File format: salt (16) || nonce (12) || ciphertext (variable) || tag (16).
+    // Old format (pre-version-byte, backward compat): salt (16) || nonce (12) || ct (N) || tag (16).
     if (total < 16 + 12 + 16) return error.DecryptFailed;
-    const file_bytes = buf[0..total];
-    const salt = file_bytes[0..16];
-    const nonce = file_bytes[16..28];
-    const tag: [16]u8 = file_bytes[file_bytes.len - 16 ..][0..16].*;
-    const ciphertext = file_bytes[28 .. file_bytes.len - 16];
+    const salt = buf[0..16];
+    const nonce = buf[16..28];
+    const tag: [16]u8 = buf[total - 16 ..][0..16].*;
+    const ciphertext = buf[28 .. total - 16];
+    return tryDecrypt(io, password, salt, nonce, ciphertext, tag);
+}
 
-    const derived = deriveKey(password, salt);
-
-    // Decrypt + verify AES-GCM tag. AES-GCM tag mismatch surfaces as
-    // `error.AuthenticationFailed` from the helper; we map to
-    // `error.DecryptFailed` here so the modal surfaces "wrong password
-    // or corrupted file" consistently (spec #447 §"loadWithUnlock
-    // decrypts").
-    const out = testing.allocator.alloc(u8, ciphertext.len) catch return error.OutOfMemory;
-    errdefer testing.allocator.free(out);
+/// Shared decrypt+verify body for `loadWithUnlock` (new + old formats).
+/// Allocates output buffer, derives key, runs AES-GCM decrypt, maps
+/// AuthenticationFailed → DecryptFailed for caller-visible consistency.
+///
+/// ponytail: same shape as `io_allocator` in modal.zig — testing.allocator
+/// in test mode (leak detection), page_allocator in production. Caller
+/// must use the matching allocator to free. No production caller today
+/// (function is only invoked from tests); future slice should thread a
+/// real ArenaAllocator through submitKeyEntry → validateViaApi →
+/// loadWithUnlock from main (closes R-1 + this latent leak together).
+fn tryDecrypt(
+    io: std.Io,
+    password: []const u8,
+    salt: []const u8,
+    nonce: []const u8,
+    ciphertext: []const u8,
+    tag: [16]u8,
+) AuthError![]u8 {
+    const alloc = if (builtin.is_test) testing.allocator else std.heap.page_allocator;
+    const derived = deriveKey(io, password, salt);
+    const out = alloc.alloc(u8, ciphertext.len) catch return error.OutOfMemory;
+    errdefer alloc.free(out);
     const nonce_arr: [12]u8 = nonce[0..12].*;
     decrypt(out, ciphertext, tag, derived, nonce_arr) catch |err| switch (err) {
         error.AuthenticationFailed => return error.DecryptFailed,
@@ -433,7 +468,13 @@ fn xdgCredentialsPath(out_buf: *[std.Io.Dir.max_path_bytes]u8) ?[]const u8 {
 /// frees ~64 MiB of working memory internally (defer blocks.deinit at
 /// std/crypto/argon2.zig:503); we route that through page_allocator since the
 /// blocks are freed before kdf returns (no leak).
-fn deriveKey(password: []const u8, salt: []const u8) [32]u8 {
+///
+/// ponytail: takes `io` as parameter (was a hardcoded `testing.io`, which
+/// broke `zig build` once the .key arm wired submitKeyEntry into the
+/// production call graph — Zig compiled the public surface, the hardcoded
+/// testing.io triggered @compileError). Tests pass `testing.io`; production
+/// callers thread their own std.Io instance (matches R-1 future offload).
+fn deriveKey(io: std.Io, password: []const u8, salt: []const u8) [32]u8 {
     var derived: [32]u8 = undefined;
     std.crypto.pwhash.argon2.kdf(
         std.heap.page_allocator,
@@ -442,7 +483,7 @@ fn deriveKey(password: []const u8, salt: []const u8) [32]u8 {
         salt,
         .{ .t = argon2_t, .m = argon2_m / 1024, .p = argon2_p },
         .argon2id,
-        testing.io,
+        io,
     ) catch unreachable; // KdfError weak params excluded by comptime consts.
     return derived;
 }
@@ -464,7 +505,7 @@ fn decrypt(m: []u8, c: []const u8, tag: [std.crypto.aead.aes_gcm.Aes256Gcm.tag_l
 /// Writes the encrypted form of `key` to `path`. Format: salt (16) || nonce
 /// (12) || ciphertext (N) || tag (16). Salt + nonce from getrandom(2).
 /// Cipher: AES-256-GCM. KDF: Argon2id (m=64 MiB, t=3, p=1).
-fn writeEncrypted(path: []const u8, key: []const u8, password: []const u8) AuthError!void {
+fn writeEncrypted(io: std.Io, path: []const u8, key: []const u8, password: []const u8) AuthError!void {
     var salt: [16]u8 = undefined;
     var nonce: [12]u8 = undefined;
     const rsalt = std.os.linux.getrandom(&salt, salt.len, 0);
@@ -472,7 +513,7 @@ fn writeEncrypted(path: []const u8, key: []const u8, password: []const u8) AuthE
     const rnonce = std.os.linux.getrandom(&nonce, nonce.len, 0);
     if (rnonce != nonce.len) return error.OpenFailed;
 
-    const derived = deriveKey(password, &salt);
+    const derived = deriveKey(io, password, &salt);
 
     // Encrypt via AES-256-GCM.
     var ciphertext: [4096]u8 = undefined;
@@ -493,13 +534,20 @@ fn writeEncrypted(path: []const u8, key: []const u8, password: []const u8) AuthE
     const chmod_rc = std.os.linux.fchmod(fd, 0o600);
     if (chmod_rc != 0) return error.FchmodFailed;
 
-    var buf: [16 + 12 + 4096 + 16]u8 = undefined;
-    @memcpy(buf[0..16], &salt);
-    @memcpy(buf[16..28], &nonce);
-    @memcpy(buf[28 .. 28 + key.len], ciphertext[0..key.len]);
-    @memcpy(buf[28 + key.len .. 28 + key.len + 16], &tag);
+    var buf: [1 + 16 + 12 + 4096 + 16]u8 = undefined;
+    // New on-disk format: 0x01 (1) || salt (16) || nonce (12) || ct (N) || tag (16).
+    // The 0x01 version byte disambiguates from legacy plaintext JSON
+    // (which starts with `{` == 0x7B) and from any future format. Without
+    // it, salt[0] could randomly be 0x7B (1/256 probability) and trigger a
+    // false-positive LegacyPlaintext detection in loadWithUnlock — surfaced
+    // by CI ReleaseSafe flake on the `tampered file` test.
+    buf[0] = 0x01;
+    @memcpy(buf[1..17], &salt);
+    @memcpy(buf[17..29], &nonce);
+    @memcpy(buf[29 .. 29 + key.len], ciphertext[0..key.len]);
+    @memcpy(buf[29 + key.len .. 29 + key.len + 16], &tag);
 
-    const total_len: usize = 16 + 12 + key.len + 16;
+    const total_len: usize = 1 + 16 + 12 + key.len + 16;
     const rc = std.os.linux.write(fd, buf[0..total_len].ptr, total_len);
     if (rc != total_len) return error.WriteFailed;
 }
@@ -676,7 +724,7 @@ test "loadWithUnlock returns key on correct password" {
     defer testing.allocator.free(path);
 
     const expected = "test-key-1234567890ABCDEF";
-    try writeEncrypted(path, expected, "secret-password");
+    try writeEncrypted(io, path, expected, "secret-password");
 
     const loaded = try loadWithUnlock(io, path, "secret-password");
     defer {
@@ -698,7 +746,7 @@ test "loadWithUnlock returns error on wrong password" {
     const path = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds.enc" });
     defer testing.allocator.free(path);
 
-    try writeEncrypted(path, "test-key-1234567890ABCDEF", "secret-password");
+    try writeEncrypted(io, path, "test-key-1234567890ABCDEF", "secret-password");
 
     const result = loadWithUnlock(io, path, "wrong-password");
     try testing.expectError(error.DecryptFailed, result);
@@ -760,7 +808,7 @@ test "key zeroed on deinit" {
     const path = try std.fs.path.join(testing.allocator, &[_][]const u8{ dir_buf[0..dir_len], "creds.enc" });
     defer testing.allocator.free(path);
 
-    try writeEncrypted(path, "test-key-1234567890ABCDEF", "secret-password");
+    try writeEncrypted(io, path, "test-key-1234567890ABCDEF", "secret-password");
 
     const loaded = try loadWithUnlock(io, path, "secret-password");
     try testing.expect(loaded.len > 0);
@@ -858,14 +906,14 @@ test "validateViaApi returns ConnectFailed on network error" {
 
 // T-C1.1 — deriveKey (Argon2id) produces 32-byte derived key.
 test "deriveKey produces 32-byte output for known password+salt" {
-    const derived = deriveKey("test-password", "0123456789abcdef");
+    const derived = deriveKey(testing.io, "test-password", "0123456789abcdef");
     try testing.expectEqual(@as(usize, 32), derived.len);
     // Two calls with the same password+salt MUST produce the same bytes
     // (Argon2id is deterministic given fixed params).
-    const derived2 = deriveKey("test-password", "0123456789abcdef");
+    const derived2 = deriveKey(testing.io, "test-password", "0123456789abcdef");
     try testing.expectEqualSlices(u8, &derived, &derived2);
     // Different salt MUST produce different bytes.
-    const derived3 = deriveKey("test-password", "fedcba9876543210");
+    const derived3 = deriveKey(testing.io, "test-password", "fedcba9876543210");
     try testing.expect(!std.mem.eql(u8, &derived, &derived3));
 }
 
