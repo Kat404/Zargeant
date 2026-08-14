@@ -2056,3 +2056,58 @@ test "T-TIW-7: feedKey drives a full key sequence through handleKeyInput (REQ-TI
         try testing.expect(forwarded.KeyPress.code == .up);
     }
 }
+
+// T-SG-11: tui-input-wiring slice presence guard (REQ-TIW-013 + REQ-TIW-014)
+//
+// 3 sub-assertions (static-grep on src/tui.zig, the slice's only prod file):
+//   1. src/tui.zig declares `pub fn handleKeyInput(` (REQ-TIW-003 signature).
+//   2. src/tui.zig `emitFrame` body contains a `mibu.cursor.goTo` call AFTER
+//      the trailing `mibu.style.reset` (REQ-TIW-001 ordering).
+//   3. src/tui.zig `tuiThreadLoop` `.key` arm body contains `handleKeyInput`
+//      BEFORE the existing `channels.tui_to_agent.tryPut(io, .{ .KeyPress = k })`
+//      (REQ-TIW-010 ordering).
+//
+// REQ-TIW-013's intent is "static-grep guard verifying slice presence in
+// src/tui.zig". Sub-assertions 1..3 cover that fully. An earlier draft also
+// added a meta-guard scanning THIS file for commented-out test fns — that
+// meta-guard self-triggered on its own docstring (which literally contains
+// the patterns it forbids) and was dropped. Stylistic enforcement of "no
+// commented-out tests" is project-wide hygiene, out of scope for REQ-TIW-013.
+test "T-SG-11: tui-input-wiring slice is present" {
+    const tui_src = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/tui.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(tui_src);
+
+    // Sub-assertion 1: handleKeyInput signature in src/tui.zig.
+    try testing.expect(std.mem.indexOf(u8, tui_src, "pub fn handleKeyInput(") != null);
+
+    // Sub-assertion 2: emitFrame body has mibu.cursor.goTo AFTER the
+    // trailing mibu.style.reset. Locate the trailing reset (the second
+    // occurrence inside emitFrame) and assert a goTo call exists after it.
+    const reset_idx = std.mem.indexOf(u8, tui_src, "mibu.style.reset(writer);") orelse {
+        try testing.expect(false);
+        return;
+    };
+    // The trailing reset is the LAST `mibu.style.reset(writer);` inside
+    // emitFrame (the one after the for loop). Walk forward from the
+    // first occurrence to find the second one.
+    const second_reset_idx = std.mem.indexOfPos(u8, tui_src, reset_idx + 1, "mibu.style.reset(writer);") orelse reset_idx;
+    const trailing_reset_idx = second_reset_idx;
+    const after_reset = tui_src[trailing_reset_idx..];
+    try testing.expect(std.mem.indexOf(u8, after_reset, "mibu.cursor.goTo") != null);
+
+    // Sub-assertion 3: .key arm has handleKeyInput BEFORE channels.tui_to_agent.tryPut.
+    const arm_start = std.mem.indexOf(u8, tui_src, ".key =>") orelse {
+        try testing.expect(false);
+        return;
+    };
+    const arm_end = std.mem.indexOfPos(u8, tui_src, arm_start, ".resize") orelse tui_src.len;
+    const arm_body = tui_src[arm_start..arm_end];
+    const handle_idx = std.mem.indexOf(u8, arm_body, "handleKeyInput").?;
+    const forward_idx = std.mem.indexOf(u8, arm_body, "channels.tui_to_agent.tryPut").?;
+    try testing.expect(handle_idx < forward_idx);
+}
