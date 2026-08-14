@@ -509,7 +509,19 @@ pub fn tuiThreadLoop(
         // 3. Poll mibu events. Resize → update dims + set redraw flag.
         const event = mibu.events.nextWithTimeout(io, file, 16) catch continue;
         switch (event) {
-            .key => |k| try channels.tui_to_agent.tryPut(io, .{ .KeyPress = k }),
+            // REQ-TIW-010 — consume the key locally via handleKeyInput
+            // BEFORE forwarding to Agent. Consumed keys drop the forward
+            // (no double-emit) and set redraw_pending=true so the next
+            // iteration re-renders the modal. Unconsumed keys (arrows,
+            // future dispatch) keep the forward to Agent.
+            .key => |k| {
+                const consumed = handleKeyInput(io, alloc, state, k) catch continue;
+                if (consumed) {
+                    lifecycle.redraw_pending.store(true, .seq_cst);
+                } else {
+                    try channels.tui_to_agent.tryPut(io, .{ .KeyPress = k });
+                }
+            },
             .resize => {
                 const sz = mibu.term.getSize(handle) catch continue;
                 lifecycle.width = sz.width;
