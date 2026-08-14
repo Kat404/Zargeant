@@ -320,6 +320,20 @@ pub fn initialState() AuthState {
 ///   - error.DecryptFailed on wrong password (AES-GCM tag mismatch).
 ///   - error.AuthenticationFailed on tampered ciphertext (AES-GCM tag
 ///     mismatch with the right key).
+///
+/// File format detection (added by W-6 fix-up, surfaced by CI ReleaseSafe
+/// flake on `loadWithUnlock tampered file returns DecryptFailed`):
+///   - **New format** (current writeEncrypted output): first byte `0x01`
+///     then `salt (16) || nonce (12) || ciphertext (N) || tag (16)`.
+///     Version byte disambiguates from legacy plaintext (`{` == 0x7B)
+///     and from any future format. Fixes latent false-positive where
+///     random salt[0] == 0x7B (1/256 probability) would falsely trigger
+///     error.LegacyPlaintext for a valid encrypted file.
+///   - **Legacy plaintext**: first byte `{` (0x7B) → error.LegacyPlaintext.
+///     Detected BEFORE the KDF runs (no side-channel timing leak).
+///   - **Old format** (pre-version-byte, written before W-6): falls back
+///     to `salt (16) || nonce (12) || ciphertext (N) || tag (16)`. Backward
+///     compatibility for files written before the version-byte fix.
 pub fn loadWithUnlock(io: std.Io, path: []const u8, password: []const u8) AuthError![]u8 {
     // Open + read the entire file.
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.OpenFailed;
@@ -333,34 +347,50 @@ pub fn loadWithUnlock(io: std.Io, path: []const u8, password: []const u8) AuthEr
         total += n;
     }
 
+    // New format: 0x01 (1) || salt (16) || nonce (12) || ct (N) || tag (16).
+    // Minimum size: 1 + 16 + 12 + 16 = 45 bytes.
+    if (total >= 1 + 16 + 12 + 16 and buf[0] == 0x01) {
+        const salt = buf[1..17];
+        const nonce = buf[17..29];
+        const tag: [16]u8 = buf[total - 16 ..][0..16].*;
+        const ciphertext = buf[29 .. total - 16];
+        return tryDecrypt(io, password, salt, nonce, ciphertext, tag);
+    }
+
     // Legacy plaintext detection: leading `{` (0x7B) means the file was
     // written by the pre-migration writeWithConsent that serialized
     // JSON. Return BEFORE the Argon2id KDF runs so no timing leak.
     if (total > 0 and buf[0] == 0x7B) return error.LegacyPlaintext;
 
-    // File format: salt (16) || nonce (12) || ciphertext (variable) || tag (16).
+    // Old format (pre-version-byte, backward compat): salt (16) || nonce (12) || ct (N) || tag (16).
     if (total < 16 + 12 + 16) return error.DecryptFailed;
-    const file_bytes = buf[0..total];
-    const salt = file_bytes[0..16];
-    const nonce = file_bytes[16..28];
-    const tag: [16]u8 = file_bytes[file_bytes.len - 16 ..][0..16].*;
-    const ciphertext = file_bytes[28 .. file_bytes.len - 16];
+    const salt = buf[0..16];
+    const nonce = buf[16..28];
+    const tag: [16]u8 = buf[total - 16 ..][0..16].*;
+    const ciphertext = buf[28 .. total - 16];
+    return tryDecrypt(io, password, salt, nonce, ciphertext, tag);
+}
 
-    const derived = deriveKey(io, password, salt);
-
-    // Decrypt + verify AES-GCM tag. AES-GCM tag mismatch surfaces as
-    // `error.AuthenticationFailed` from the helper; we map to
-    // `error.DecryptFailed` here so the modal surfaces "wrong password
-    // or corrupted file" consistently (spec #447 §"loadWithUnlock
-    // decrypts").
-    //
-    // ponytail: same shape as `io_allocator` in modal.zig — testing.allocator
-    // in test mode (leak detection), page_allocator in production. Caller
-    // must use the matching allocator to free. No production caller today
-    // (function is only invoked from tests); future slice should thread a
-    // real ArenaAllocator through submitKeyEntry → validateViaApi →
-    // loadWithUnlock from main (closes R-1 + this latent leak together).
+/// Shared decrypt+verify body for `loadWithUnlock` (new + old formats).
+/// Allocates output buffer, derives key, runs AES-GCM decrypt, maps
+/// AuthenticationFailed → DecryptFailed for caller-visible consistency.
+///
+/// ponytail: same shape as `io_allocator` in modal.zig — testing.allocator
+/// in test mode (leak detection), page_allocator in production. Caller
+/// must use the matching allocator to free. No production caller today
+/// (function is only invoked from tests); future slice should thread a
+/// real ArenaAllocator through submitKeyEntry → validateViaApi →
+/// loadWithUnlock from main (closes R-1 + this latent leak together).
+fn tryDecrypt(
+    io: std.Io,
+    password: []const u8,
+    salt: []const u8,
+    nonce: []const u8,
+    ciphertext: []const u8,
+    tag: [16]u8,
+) AuthError![]u8 {
     const alloc = if (builtin.is_test) testing.allocator else std.heap.page_allocator;
+    const derived = deriveKey(io, password, salt);
     const out = alloc.alloc(u8, ciphertext.len) catch return error.OutOfMemory;
     errdefer alloc.free(out);
     const nonce_arr: [12]u8 = nonce[0..12].*;
@@ -504,13 +534,20 @@ fn writeEncrypted(io: std.Io, path: []const u8, key: []const u8, password: []con
     const chmod_rc = std.os.linux.fchmod(fd, 0o600);
     if (chmod_rc != 0) return error.FchmodFailed;
 
-    var buf: [16 + 12 + 4096 + 16]u8 = undefined;
-    @memcpy(buf[0..16], &salt);
-    @memcpy(buf[16..28], &nonce);
-    @memcpy(buf[28 .. 28 + key.len], ciphertext[0..key.len]);
-    @memcpy(buf[28 + key.len .. 28 + key.len + 16], &tag);
+    var buf: [1 + 16 + 12 + 4096 + 16]u8 = undefined;
+    // New on-disk format: 0x01 (1) || salt (16) || nonce (12) || ct (N) || tag (16).
+    // The 0x01 version byte disambiguates from legacy plaintext JSON
+    // (which starts with `{` == 0x7B) and from any future format. Without
+    // it, salt[0] could randomly be 0x7B (1/256 probability) and trigger a
+    // false-positive LegacyPlaintext detection in loadWithUnlock — surfaced
+    // by CI ReleaseSafe flake on the `tampered file` test.
+    buf[0] = 0x01;
+    @memcpy(buf[1..17], &salt);
+    @memcpy(buf[17..29], &nonce);
+    @memcpy(buf[29 .. 29 + key.len], ciphertext[0..key.len]);
+    @memcpy(buf[29 + key.len .. 29 + key.len + 16], &tag);
 
-    const total_len: usize = 16 + 12 + key.len + 16;
+    const total_len: usize = 1 + 16 + 12 + key.len + 16;
     const rc = std.os.linux.write(fd, buf[0..total_len].ptr, total_len);
     if (rc != total_len) return error.WriteFailed;
 }
