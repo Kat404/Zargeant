@@ -808,10 +808,16 @@ fn readEnvVar(name: []const u8) ?[]const u8 {
 }
 
 /// In tests we don't carry an allocator around on `std.Io`. Pull the
-/// `testing.allocator` from the global — only valid inside `*test` blocks.
+/// `testing.allocator` from the global for leak detection. In production
+/// fall back to `page_allocator` (matches `src/main.zig:192` mock_handle).
+///
+/// ponytail: page_allocator in prod leaks on un-freed allocs — same shape
+/// as the R-1 `validateViaApi` ceiling. Future slice should thread a real
+/// ArenaAllocator through `submitKeyEntry` / `submitUnlock` from `main`.
 fn io_allocator(io: std.Io) std.mem.Allocator {
     _ = io;
-    return testing.allocator;
+    if (builtin.is_test) return testing.allocator;
+    return std.heap.page_allocator;
 }
 
 // =============================================================================
