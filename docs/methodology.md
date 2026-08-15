@@ -93,18 +93,29 @@ Work units compose into slices. A slice is a coherent feature across multiple wo
 
 ## 3. QA Layers
 
-| # | Layer | Tool / Command | When |
-|---|---|---|---|
-| 1 | Static | `zig fmt --check src/`<br>`zig ast-check src/`<br>`zig build check` (wrapper that runs both) | Every push |
-| 2 | Runtime | `zig build test -Doptimize=ReleaseSafe` | Every push |
+**Compile-first emphasis.** QA layers run in **strict order** (0 → 10). A compile failure at QA 1 / 3 / 5 aborts the gamut before any test runs — tests never mask compile errors. The binary is proven to build in every supported optimize mode (`Debug`, `ReleaseSafe`, `ReleaseFast`) before any test executes, and the entire playthrough is reachable via a single entry point: `zig build verify` (local) and `zig build verify` (CI). The verify step is the canonical QA invariant for this project.
 
-> **Note (TSan not wired):** A `zig build test-tsan` step (ReleaseSafe + `-fsanitize-thread`) is documented but **not wired** in `build.zig`. Reason: Zig 0.16's bundled `libtsan` (`lib/std/libtsan/`) references `<linux/scc.h>`, which the kernel removed in 5.15 — compilation fails on Arch/CachyOS/nix with recent kernels. Track upstream fix (Zig 0.16.1+); meanwhile use `valgrind --tool=helgrind` as a fallback for race detection on the test binary.
-| 3 | Fuzz | `zig build test --fuzz[=limit]` (built-in fuzzer, web UI in 0.14+) | Nightly |
+| # | Layer | Tool / Command | Wired? | When |
+|---|---|---|---|---|
+| **QA 0** | Format | `zig build check` (runs `zig fmt --check --ast-check` on `src/`, `tests/`, `tools/`) | ✅ `build.zig` `check` step | Every push |
+| **QA 1** | Compile (Debug) | `zig build` (defaults to Debug) | ✅ `verify` step (system command) | Every push |
+| **QA 2** | Test (Debug) | `zig build test --summary all` | ✅ `verify` step (existing `test` step) | Every push |
+| **QA 3** | Compile (ReleaseSafe) | `zig build -Doptimize=ReleaseSafe` | ✅ `verify` step (system command) | Every push |
+| **QA 4** | Test (ReleaseSafe) | `zig build test --summary all -Doptimize=ReleaseSafe` | ✅ `verify` step (system command) | Every push |
+| **QA 5** | Compile (ReleaseFast) | `zig build -Doptimize=ReleaseFast` | ✅ `verify` step (system command) | Every push |
+| **QA 6** | Test (ReleaseFast) | `zig build test --summary all -Doptimize=ReleaseFast` | ✅ `verify` step (system command) | Every push |
+| **QA 7** | Helgrind (race detection) | `timeout 300 valgrind --tool=helgrind --error-exitcode=1 ./zig-out/bin/zargeant` (built with `-Dcpu=znver1 -Doptimize=ReleaseFast`) | ✅ `verify` step (default ON). Skip locally with `-Dqa-helgrind=false`. CI installs `valgrind` via apt. | Every push |
+| **QA 8** | Audit | Manual review against §3 checklist below + security invariants from `investigation-2.md` | ❌ **manual-only** — NOT wired as a step | Pre-merge |
+| **QA 9** | TDD gate | Every `src/*.zig` has at least one `test "..."` block (`ci.yml` `test-tdd` script) | ✅ `.github/workflows/ci.yml` `strict-tdd` job | Every push |
+| **QA 10** | Co-Authored-By AI | Grep commit messages for `Co-Authored-By:.*(Claude\|MiniMax\|Anthropic\|AI)` | ✅ `.github/workflows/ci.yml` inline grep | Every push |
 
-> **Note:** The fuzzer only runs tests marked with fuzz-friendly signatures (e.g., `test "fuzz: name"` consuming `std.testing.fuzzInput()`). Standard `test "..."` blocks pass through normally and do not trigger fuzz input. Add a fuzz-marked test for any surface that accepts untrusted input (parsers, hash parsers, JSON decoders). For zargeant, this applies to the BPF filter builder and `Seccomp.buildAllowlist`.
-| 4 | Integration | VM smoke + `strace -f -e trace=process,file -y -yy` | **NOT ADOPTED** — see §8 |
-| 5 | Audit | Code review against audit checklist in §3 | Pre-merge |
-| 6 | Pen-test | Manual: `ptrace(PTRACE_TRACEME, ...)` from sandbox, exfiltration via `/proc/self/environ` | **NOT ADOPTED** — see §8 |
+> **Single entry point:** `zig build verify` runs QA 0 → QA 7 in order (helgrind ON by default; pass `-Dqa-helgrind=false` locally to skip). QA 8 is a manual-only checklist (no automation by design — see checklist below). QA 9 and QA 10 are CI jobs (`strict-tdd` and the `Co-Authored-By` grep) that run on every push.
+>
+> **Not in the strict order (by design):**
+> - **Fuzz** (`zig build test --fuzz`) — nightly cadence, not part of the per-push verify step. The fuzzer only runs tests marked with fuzz-friendly signatures (e.g., `test "fuzz: name"` consuming `std.testing.fuzzInput()`). Add a fuzz-marked test for any surface that accepts untrusted input (parsers, hash parsers, JSON decoders). For zargeant, this applies to the BPF filter builder and `Seccomp.buildAllowlist`.
+> - **Thread Sanitizer (TSan)** — documented but **not wired**. Reason: Zig 0.16's bundled `libtsan` (`lib/std/libtsan/`) references `<linux/scc.h>`, which the kernel removed in 5.15 — compilation fails on Arch/CachyOS/nix with recent kernels. Track upstream fix (Zig 0.16.1+); meanwhile, **QA 7 helgrind** is the practical fallback for race detection on the test binary.
+> - **Integration (VM smoke + `strace -f`)** — **NOT ADOPTED** (see §8).
+> - **Pen-test** — **NOT ADOPTED** (see §8).
 
 ### Sanitizers enabled in `ReleaseSafe`
 

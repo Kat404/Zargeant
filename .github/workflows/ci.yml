@@ -46,20 +46,11 @@ jobs:
       - name: Show toolchain
         run: zig version
 
-      - name: Build (default Debug)
-        run: zig build
+      - name: Install valgrind (QA 7 helgrind race-detect fallback)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind
 
-      - name: Run tests (Debug)
-        run: zig build test --summary all
-
-      - name: Run tests (ReleaseSafe)
-        run: zig build test --summary all -Doptimize=ReleaseSafe
-
-      - name: Run tests (ReleaseFast)
-        run: zig build test --summary all -Doptimize=ReleaseFast
-
-      - name: Build release artifact (ReleaseFast)
-        run: zig build -Doptimize=ReleaseFast
+      - name: Strict QA verify (compile-first)
+        run: zig build verify
 
       - name: Verify no Co-Authored-By AI in commits
         run: |
