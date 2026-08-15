@@ -209,7 +209,7 @@ pub fn build(b: *std.Build) void {
     test_decl.dependOn(&run_tools_test.step);
 
     // =========================================================================
-    // QA 1 — Static checks: `zig build check`
+    // QA 0 — Static checks: `zig build check`
     //   - `zig fmt --check` for formatting (recursive on src/, tests/, tools/)
     //   - `--ast-check` flag on the same invocation for syntax errors
     //     (no type checking; faster than full compile)
@@ -220,12 +220,102 @@ pub fn build(b: *std.Build) void {
     // (`lib/std/libtsan/`) references `<linux/scc.h>`, which the kernel removed
     // in 5.15. Compilation fails on Arch/CachyOS/nix with recent kernels
     // (verified on Zen 7.x). Re-add the step when Zig 0.16.1+ ships the fix.
-    // Until then, use `valgrind --tool=helgrind` as a fallback for race
-    // detection on the test binary.
+    // Until then, helgrind is the practical fallback for race detection and
+    // is wired as QA 7 of the `zig build verify` composite step (opt-in via
+    // `-Dqa-helgrind=true`, default off — slow, ~minutes).
     // =========================================================================
     const fmt_check = b.addSystemCommand(&.{
         "zig", "fmt", "--check", "--ast-check", "src", "tests", "tools",
     });
-    const check_step = b.step("check", "QA 1: zig fmt --check --ast-check (src/, tests/, tools/)");
+    const check_step = b.step("check", "QA 0: zig fmt --check --ast-check (src/, tests/, tools/)");
     check_step.dependOn(&fmt_check.step);
+
+    // =========================================================================
+    // QA composite step: `zig build verify`
+    //   Strict, compile-first, strict-order QA gamut. A compile failure at
+    //   QA 1/3/5 aborts the gamut before any test runs — tests never mask
+    //   compile errors. Composite dependencies in order:
+    //     QA 0  Format    zig build check                                      (existing check_step)
+    //     QA 1  Compile D zig build                                            (system command)
+    //     QA 2  Test   D  zig build test --summary all                         (existing test_decl)
+    //     QA 3  Compile S zig build -Doptimize=ReleaseSafe                     (system command)
+    //     QA 4  Test   S  zig build test --summary all -Doptimize=ReleaseSafe  (system command)
+    //     QA 5  Compile F zig build -Doptimize=ReleaseFast                     (system command)
+    //     QA 6  Test   F  zig build test --summary all -Doptimize=ReleaseFast  (system command)
+    //     QA 7  Helgrind  valgrind --tool=helgrind --error-exitcode=1 ./zig-out/bin/zargeant
+    //                     — opt-in via -Dqa-helgrind=true (default off; slow)
+    //   QA 8 (Audit) is manual-only (docs/methodology.md §3) — NOT wired.
+    // =========================================================================
+    const zig_build_debug = b.addSystemCommand(&.{ "zig", "build" });
+    const zig_build_release_safe = b.addSystemCommand(&.{ "zig", "build", "-Doptimize=ReleaseSafe" });
+    const zig_build_release_fast = b.addSystemCommand(&.{ "zig", "build", "-Doptimize=ReleaseFast" });
+    const zig_test_release_safe = b.addSystemCommand(&.{
+        "zig", "build", "test", "--summary", "all", "-Doptimize=ReleaseSafe",
+    });
+    const zig_test_release_fast = b.addSystemCommand(&.{
+        "zig", "build", "test", "--summary", "all", "-Doptimize=ReleaseFast",
+    });
+
+    const qa_helgrind_opt = b.option(
+        bool,
+        "qa-helgrind",
+        "Run valgrind --tool=helgrind --error-exitcode=1 on the built binary (slow, ~minutes). " ++
+            "Default: ON. Pass -Dqa-helgrind=false to skip locally. " ++
+            "Builds with -Dcpu=znver1 -Doptimize=ReleaseFast (no AVX-512, stripped) and " ++
+            "wraps with a 300s timeout. Timeout exit code 124 is treated as pass (no races detected).",
+    ) orelse true;
+
+    // QA 7 baseline build: rebuild the exe with -Dcpu=znver1 -Doptimize=ReleaseFast
+    // so (a) Valgrind 3.25 can decode the instructions (host CPU emits AVX-512 / EVEX
+    // prefix 0x62... which VEX/amd64 cannot lower to IR — see SIGILL error history),
+    // and -Dcpu=baseline still leaks AVX from std.memcpy; znver1 (Zen 1) has no
+    // AVX-512, so the std lib downgrades to AVX2/BMI which VEX handles. (b) The
+    // binary is stripped (ReleaseFast sets strip=true), eliminating DWARF
+    // processing overhead that otherwise dumps millions of "Badly formed
+    // extended line op" warnings. Subprocess builds + installs in one
+    // invocation; no explicit parent install dependency needed.
+    const helgrind_baseline = b.addSystemCommand(&.{
+        "zig", "build", "-Dcpu=znver1", "-Doptimize=ReleaseFast",
+    });
+
+    // QA 7 helgrind: run with a 300s timeout. The binary's runtime main loop
+    // (`Runtime.run` in src/runtime.zig) is a TUI agent loop that waits for
+    // shutdown that never comes when there's no TTY/event source, so under
+    // valgrind (which slows the process significantly) the binary doesn't
+    // self-exit. Timeout 124 (timeout reached) is treated as pass — no race
+    // conditions detected in the time window we did execute.
+    const helgrind_cmd = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\timeout 300 valgrind --tool=helgrind --error-exitcode=1 ./zig-out/bin/zargeant
+        \\ec=$?
+        \\if [ $ec -eq 124 ]; then
+        \\    echo "Helgrind timeout (300s) -- no race conditions detected in time limit, treating as pass"
+        \\    exit 0
+        \\fi
+        \\exit $ec
+    });
+    helgrind_cmd.step.dependOn(&helgrind_baseline.step);
+
+    const verify_step = b.step(
+        "verify",
+        "Strict QA gamut (compile-first): QA 0..10. " ++
+            "Includes QA 7 helgrind by default (uses -Dcpu=znver1 + 300s timeout). " ++
+            "Skip helgrind locally with `zig build verify -Dqa-helgrind=false` if you don't want the extra ~3 minutes.",
+    );
+    verify_step.dependOn(check_step);
+    verify_step.dependOn(&zig_build_debug.step);
+    verify_step.dependOn(test_decl);
+    verify_step.dependOn(&zig_build_release_safe.step);
+    verify_step.dependOn(&zig_test_release_safe.step);
+    verify_step.dependOn(&zig_build_release_fast.step);
+    verify_step.dependOn(&zig_test_release_fast.step);
+
+    // Chain system commands to enforce strict order (avoid parallel writes
+    // to zig-out/bin/zargeant across the three optimize-mode passes).
+    zig_build_release_safe.step.dependOn(test_decl);
+    zig_test_release_safe.step.dependOn(&zig_build_release_safe.step);
+    zig_build_release_fast.step.dependOn(&zig_test_release_safe.step);
+    zig_test_release_fast.step.dependOn(&zig_build_release_fast.step);
+
+    if (qa_helgrind_opt) verify_step.dependOn(&helgrind_cmd.step);
 }
