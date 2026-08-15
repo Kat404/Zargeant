@@ -46,10 +46,7 @@ jobs:
       - name: Show toolchain
         run: zig version
 
-      - name: Install valgrind (QA 7 helgrind race-detect fallback)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind
-
-      - name: Strict QA verify (compile-first)
+      - name: "Strict QA verify (compile-first, QA 0..6)"
         run: zig build verify
 
       - name: Verify no Co-Authored-By AI in commits

@@ -104,12 +104,12 @@ Work units compose into slices. A slice is a coherent feature across multiple wo
 | **QA 4** | Test (ReleaseSafe) | `zig build test --summary all -Doptimize=ReleaseSafe` | ✅ `verify` step (system command) | Every push |
 | **QA 5** | Compile (ReleaseFast) | `zig build -Doptimize=ReleaseFast` | ✅ `verify` step (system command) | Every push |
 | **QA 6** | Test (ReleaseFast) | `zig build test --summary all -Doptimize=ReleaseFast` | ✅ `verify` step (system command) | Every push |
-| **QA 7** | Helgrind (race detection) | `timeout 300 valgrind --tool=helgrind --error-exitcode=1 ./zig-out/bin/zargeant` (built with `-Dcpu=znver1 -Doptimize=ReleaseFast`) | ✅ `verify` step (default ON). Skip locally with `-Dqa-helgrind=false`. CI installs `valgrind` via apt. | Every push |
+| **QA 7** | Helgrind (race detection) | `timeout 300 valgrind --tool=helgrind --error-exitcode=1 ./zig-out/bin/zargeant` (built with `-Dcpu=znver1 -Doptimize=ReleaseFast`) | ⚠️ **opt-in locally** via `-Dqa-helgrind=true`. Default OFF; CI does NOT run it (binary SIGILLs on Valgrind 3.22.0 from `ubuntu-latest` apt, even with `znver1` CPU target — LTO+ReleaseFast pull in newer LLVM intrinsics). | Local pre-merge, manual only |
 | **QA 8** | Audit | Manual review against §3 checklist below + security invariants from `investigation-2.md` | ❌ **manual-only** — NOT wired as a step | Pre-merge |
 | **QA 9** | TDD gate | Every `src/*.zig` has at least one `test "..."` block (`ci.yml` `test-tdd` script) | ✅ `.github/workflows/ci.yml` `strict-tdd` job | Every push |
 | **QA 10** | Co-Authored-By AI | Grep commit messages for `Co-Authored-By:.*(Claude\|MiniMax\|Anthropic\|AI)` | ✅ `.github/workflows/ci.yml` inline grep | Every push |
 
-> **Single entry point:** `zig build verify` runs QA 0 → QA 7 in order (helgrind ON by default; pass `-Dqa-helgrind=false` locally to skip). QA 8 is a manual-only checklist (no automation by design — see checklist below). QA 9 and QA 10 are CI jobs (`strict-tdd` and the `Co-Authored-By` grep) that run on every push.
+> **Single entry point:** `zig build verify` runs QA 0 → QA 6 in order (the canonical CI gamut — fast compile-first checks). QA 7 (helgrind) is **opt-in local** via `-Dqa-helgrind=true` (≈3 minutes); CI does not run it due to valgrind 3.22.0 SIGILL on the ReleaseFast+LTO binary. QA 8 is a manual-only checklist (no automation by design — see checklist below). QA 9 and QA 10 are CI jobs (`strict-tdd` and the `Co-Authored-By` grep) that run on every push.
 >
 > **Not in the strict order (by design):**
 > - **Fuzz** (`zig build test --fuzz`) — nightly cadence, not part of the per-push verify step. The fuzzer only runs tests marked with fuzz-friendly signatures (e.g., `test "fuzz: name"` consuming `std.testing.fuzzInput()`). Add a fuzz-marked test for any surface that accepts untrusted input (parsers, hash parsers, JSON decoders). For zargeant, this applies to the BPF filter builder and `Seccomp.buildAllowlist`.
