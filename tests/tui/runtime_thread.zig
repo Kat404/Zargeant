@@ -1447,6 +1447,7 @@ test "W4-1: tuiThreadLoop renders modal on redraw_pending and emits CSI" {
     // important assertion is that the buffer contains the bracket +
     // cursor + reset bytes after at least one render pass.
     try ch.tui_to_agent.tryPut(testing.io, .Shutdown);
+    var shutdown_atomic = std.atomic.Value(bool).init(false);
     try Tui.tuiThreadLoop(
         &lc,
         std.Io.File.stdin().handle, // any handle — no events in this test
@@ -1455,6 +1456,7 @@ test "W4-1: tuiThreadLoop renders modal on redraw_pending and emits CSI" {
         &ch,
         &modal_state,
         testing.allocator,
+        &shutdown_atomic,
     );
     // The loop allocated a prev_snapshot dupe; free it like tuiRealMain
     // does on shutdown.

@@ -389,6 +389,7 @@ fn tuiRealMain(args: *const ThreadArgs) void {
                 args.channels,
                 &modal_state,
                 args.allocator,
+                args.shutdown, // zargeant/tui-cancel — Ctrl+C path
             ) catch break;
         }
     }

@@ -102,19 +102,23 @@ pub const AuthError = error{
 // =============================================================================
 
 /// Pure format check on the candidate key. Spec: length ≥ 24, printable
-/// ASCII (except space), no whitespace, no control chars. Prefix check
-/// requires either "eyJ" (JWT base64) or "test-key-" (synthetic test key).
-/// Returns true iff the key passes the format check.
+/// ASCII (except space), no whitespace, no control chars. Returns true iff
+/// the key passes the format check.
+///
+/// zargeant/api-format-loose: removed prefix whitelist (eyJ / test-key-).
+/// Real MiniMax API keys do not always start with "eyJ" and the format
+/// pre-flight is too narrow for them. The authoritative check is
+/// `validateViaApi` (real HTTP probe to api.minimax.io). This local
+/// check now only catches obvious typos: short keys, whitespace, and
+/// non-printable bytes. Test fixtures (`test-key-...`) still pass via
+/// length + charset.
 pub fn validateFormat(key: []const u8) bool {
     if (key.len < 24) return false;
     for (key) |c| {
         // Printable ASCII excluding space (0x20). 0x21 ('!') — 0x7E ('~').
         if (c < 0x21 or c > 0x7E) return false;
     }
-    // Prefix must be "eyJ" (JWT) or "test-key-" (synthetic test fixture).
-    if (key.len >= 3 and std.mem.eql(u8, key[0..3], "eyJ")) return true;
-    if (key.len >= 9 and std.mem.eql(u8, key[0..9], "test-key-")) return true;
-    return false;
+    return true;
 }
 
 /// Async key validation probe. tls-handrolled (id=323, T2.4): the stub
@@ -154,13 +158,23 @@ pub fn validateViaApiWithTarget(io: std.Io, alloc: std.mem.Allocator, key: []con
     };
 
     // Resolve target (DNS or IPv4 literal fast path).
-    var addrs = api_client.dns_resolve(alloc, target_host) catch {
+    var addrs = api_client.dns_resolve(alloc, target_host) catch |err| {
+        // zargeant/dns-diag: surface underlying DNS error antes de colapsar
+        // a ConnectFailed. Posibilidades: UnknownHostName (NXDOMAIN/timeout/
+        // parse fail), SocketFailed (UDP socket), DnsSendFailed (sendto).
+        std.debug.print("debug_call: dns_resolve underlying error: {s}\n", .{@errorName(err)});
         return error.ConnectFailed;
     };
     defer alloc.free(addrs);
     if (addrs.len == 0) return error.ConnectFailed;
     const port: u16 = if (target_port != 0) target_port else 443;
     addrs[0].port = std.mem.nativeToBig(u16, port);
+    // zargeant/dns-diag: surface resolved IP (network byte order u32) +
+    // host port to compare against dig/nslookup. A mismatch pinpoints
+    // whether parseDnsResponse or sockaddr byte-order is the bug.
+    std.debug.print("debug_call: dns resolved {s} → IP={x}:{d} (sockaddr_size={d})\n", .{
+        target_host, addrs[0].addr, port, @sizeOf(@TypeOf(addrs[0])),
+    });
 
     // Open TCP socket.
     const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
@@ -169,7 +183,13 @@ pub fn validateViaApiWithTarget(io: std.Io, alloc: std.mem.Allocator, key: []con
     defer _ = std.os.linux.close(fd);
 
     const connect_rc = std.os.linux.connect(fd, @ptrCast(&addrs[0]), @sizeOf(@TypeOf(addrs[0])));
-    if (connect_rc != 0) return error.ConnectFailed;
+    if (connect_rc != 0) {
+        // zargeant/dns-diag: surface raw connect rc. Zig raw syscall
+        // returns negative errno on failure (-110 ETIMEDOUT, -111
+        // ECONNREFUSED, -113 EHOSTUNREACH, -101 ENETUNREACH).
+        std.debug.print("debug_call: TCP connect failed, rc={d} (target={s}:{d})\n", .{ connect_rc, target_host, port });
+        return error.ConnectFailed;
+    }
 
     // For 127.0.0.1 (mock-server tests), skip TLS.
     // For api.minimax.io, TLS via tls_conn.
@@ -659,9 +679,11 @@ test "validateFormat rejects too short" {
     try testing.expect(!validateFormat("short"));
 }
 
-// T1.4 — validateFormat rejects invalid base64 prefix.
-test "validateFormat rejects invalid base64 prefix" {
-    try testing.expect(!validateFormat("not-a-jwt-token-of-sufficient-length"));
+// T1.4 — zargeant/api-format-loose: prefix whitelist removed; any 24+
+// chars of printable ASCII now passes. Authority moved to validateViaApi.
+// This test pins the NEW contract: arbitrary prefix is accepted.
+test "validateFormat accepts arbitrary printable prefix" {
+    try testing.expect(validateFormat("not-a-jwt-token-of-sufficient-length"));
 }
 
 // T1.4 — validateFormat accepts the synthetic test-key.

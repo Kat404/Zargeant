@@ -279,6 +279,13 @@ pub fn tuiThreadInit(
 /// Order matters: pop kitty first (if pushed), then exit alt screen,
 /// then disable raw mode (which restores termios).
 pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
+    // ponytail: flush before teardown so alt-screen-exit + raw-mode-
+    // disable bytes don't sit in the 4 KiB stdout buffer. Without this,
+    // the terminal stays in alt-screen + raw mode until the kernel
+    // closes the fd at process exit, which on some terminals means the
+    // user sees a half-restored TTY.
+    writer.flush() catch {};
+
     // 1. Pop kitty kb (only if we pushed).
     if (lc.kitty_flags_pushed) {
         popKittyKb(writer) catch {};
@@ -479,6 +486,11 @@ pub fn tuiThreadLoop(
     channels: *@import("channels.zig").Channels,
     state: *@import("modal.zig").State,
     alloc: std.mem.Allocator,
+    // zargeant/tui-cancel: mibu raw mode (ISIG=false) means 0x03
+    // arrives as data; the parser turns it into .char('c') + ctrl.
+    // We need this atomic so Ctrl+C in any modal state can flip the
+    // shared shutdown flag the outer wrapper (runtime.zig:383) polls.
+    shutdown: *std.atomic.Value(bool),
 ) !void {
     const modal = @import("modal.zig");
     const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
@@ -496,6 +508,11 @@ pub fn tuiThreadLoop(
             // as both prev (full-frame emit per REQ-RW-003 S-RW-005).
             const prev = lifecycle.prev_snapshot orelse current;
             try emitFrame(writer, prev, current, lifecycle.width, lifecycle.height, alloc);
+            // ponytail: 4 KiB stdout buffer auto-flushes only on overflow,
+            // so frames + cursor CSI bytes sit there until the buffer fills
+            // (~4 frames of busy typing). Flush per-frame so input and
+            // cursor stay in sync. One extra syscall/frame; not a bottleneck.
+            writer.flush() catch continue;
             // Swap prev_snapshot. Free the old buffer, dupe the new one.
             if (lifecycle.prev_snapshot) |p| alloc.free(p);
             const duped = try alloc.dupe(modal.Cell, current);
@@ -515,6 +532,18 @@ pub fn tuiThreadLoop(
             // iteration re-renders the modal. Unconsumed keys (arrows,
             // future dispatch) keep the forward to Agent.
             .key => |k| {
+                // zargeant/tui-cancel — Ctrl+C in any modal state.
+                // Intercept BEFORE handleKeyInput so .key_entry doesn't
+                // type a literal 'c' into the API-key draft, and so the
+                // user has a clean escape hatch from every screen.
+                if (k.code == .char and k.mods.ctrl) {
+                    shutdown.store(true, .seq_cst);
+                    // Also drain Shutdown on the channel so the inner
+                    // loop exits promptly; the outer wrapper polls the
+                    // atomic separately (runtime.zig:383).
+                    channels.tui_to_agent.tryPut(io, .{ .Shutdown = {} }) catch {};
+                    return;
+                }
                 const consumed = handleKeyInput(io, alloc, state, k) catch continue;
                 if (consumed) {
                     lifecycle.redraw_pending.store(true, .seq_cst);

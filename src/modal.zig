@@ -344,7 +344,14 @@ pub fn drawKeyEntry(win: *WindowMock, state: *State) !void {
         }
     }
     if (payload.err_msg) |msg| {
-        try win.print(msg, .{ .bold = true });
+        // zargeant/tui-display-err: write err_msg to row 2 (cells[win.cols..])
+        // instead of win.print(msg, ...) which starts at cells[0] and
+        // overwrites the prompt. Mirrors drawAgentLoopView's row-tracking.
+        for (msg, 0..) |c, i| {
+            const idx = win.cols + i;
+            if (idx >= win.cells.len) break;
+            win.cells[idx] = .{ .ch = c, .style = .{ .bold = true } };
+        }
     }
 }
 
@@ -418,7 +425,14 @@ pub fn drawUnlock(win: *WindowMock, state: *State) !void {
         }
     }
     if (payload.err_msg) |msg| {
-        try win.print(msg, .{ .bold = true });
+        // zargeant/tui-display-err: write err_msg to row 2 (cells[win.cols..])
+        // instead of win.print(msg, ...) which starts at cells[0] and
+        // overwrites the prompt. Mirrors drawAgentLoopView's row-tracking.
+        for (msg, 0..) |c, i| {
+            const idx = win.cols + i;
+            if (idx >= win.cells.len) break;
+            win.cells[idx] = .{ .ch = c, .style = .{ .bold = true } };
+        }
     }
 }
 
