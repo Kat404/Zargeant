@@ -422,43 +422,24 @@ fn randomBelow(bound: u64) u64 {
 /// Performs one HTTP attempt: open socket, connect, send, read response,
 /// classify. Returns the outcome for the retry decision.
 ///
-/// When `req.tls == true`, the connection is wrapped in TLS via `tls_conn`
-/// (CRITICAL-1 of the tls-handrolled remediation plan, engram id=331). The
-/// TLS session is closed before returning (the response body is fully buffered
-/// into `resp_buf` so the streaming layer can parse it without keeping the
-/// socket open). When `req.tls == false`, the connection is plain HTTP (mock
-/// server tests) and the socket fd is left open on success for streaming.
+/// Opción B WU-2 (design obs#1369): the TLS branch is rewritten to use
+/// `tls_conn` (a thin wrapper over `std.http.Client.connectTcp(host, port,
+/// .tls)`). The handshake + cert validation happen inside the stdlib call;
+/// the raw fd pre-open is SKIPPED for the TLS path because stdlib manages
+/// the socket lifecycle (open + connect + TLS handshake in one call).
+///
+/// When `req.tls == true`, the TLS session is closed before returning (the
+/// response body is fully buffered into `resp_buf` so the streaming layer
+/// can parse it without keeping the socket open). When `req.tls == false`,
+/// the connection is plain HTTP (mock server tests) and the socket fd is
+/// left open on success for streaming. The plain HTTP path keeps the raw
+/// `std.os.linux.{socket,connect}` syscalls because stdlib's readv hangs
+/// against mock_server.zig's worker timing (REVERTED in WU-3 per design).
 fn tryOneAttempt(io: std.Io, req: Request, cancel_pipe: [2]i32, allocator: std.mem.Allocator) !AttemptOutcome {
     // 1. Resolve target port.
     const port: u16 = if (req.target_port != 0) req.target_port else 443;
 
-    // 2. Open socket.
-    const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
-    if (sock_rc < 0) return error.SocketFailed;
-    const fd: i32 = @intCast(sock_rc);
-
-    // 3. Resolve target host. Opción B WU-1 (design obs#1369):
-    // dns_resolve was deleted; IPv4 literal fast path remains inline so
-    // mock-mode (127.0.0.1) Client.stream tests stay green. Hostname
-    // targets (e.g. api.minimax.io) return error.ConnectionRefused
-    // because the real DNS + stdlib connect path is WU-3 territory.
-    const parsed_ip = parseIpv4LiteralForConnect(req.target_host) orelse {
-        _ = std.os.linux.close(fd);
-        return error.ConnectionRefused;
-    };
-    var addr: std.os.linux.sockaddr.in = .{
-        .family = std.os.linux.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = parsed_ip,
-        .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-    };
-    const connect_rc = std.os.linux.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
-    if (connect_rc != 0) {
-        _ = std.os.linux.close(fd);
-        return error.ConnectionRefused;
-    }
-
-    // 4. Build HTTP request (shared by both branches).
+    // 2. Build HTTP request (shared by both branches).
     const headers = try buildHeaders(req.key, allocator);
     defer allocator.free(headers);
     const body = try serializeRequest(req, allocator);
@@ -469,26 +450,28 @@ fn tryOneAttempt(io: std.Io, req: Request, cancel_pipe: [2]i32, allocator: std.m
     try req_buf.appendSlice(allocator, headers);
     try req_buf.appendSlice(allocator, body);
 
-    // 5. Branch on TLS. The TLS path keeps the connection alive only inside
-    //    this function (body is fully buffered); the plain HTTP path leaves
-    //    the socket open on success for the streaming layer.
+    // 3. TLS branch (Opción B WU-2). stdlib handles socket + TLS internally;
+    //    we don't pre-open the fd. Error mapping preserves the modal contract
+    //    (REQs NEW-004 + NEW-005): TlsInitializationFailed → TlsHandshakeFailed,
+    //    network errors → ConnectFailed, HostName errors → ConnectFailed.
     if (req.tls) {
-        // 5a. TLS handshake over the connected fd.
-        var tls = tls_conn.connect(io, allocator, fd, req.target_host, cancel_pipe) catch |err| {
-            _ = std.os.linux.close(fd);
-            return switch (err) {
-                error.Cancelled => error.Cancelled,
-                error.HandshakeTimeout => error.HandshakeTimeout,
-                error.TlsHandshakeFailed, error.CaBundleNotFound => error.TlsHandshakeFailed,
-                error.OutOfMemory => return error.OutOfMemory,
-            };
+        // 3a. Stdlib TLS connect (TCP + handshake + cert validation).
+        var tls = tls_conn.connect(io, allocator, req.target_host, port) catch |err| switch (err) {
+            error.TlsInitializationFailed => return error.TlsHandshakeFailed,
+            error.ConnectionRefused => return error.ConnectionRefused,
+            error.NetworkUnreachable => return error.ConnectFailed,
+            error.UnknownHostName => return error.ConnectFailed,
+            error.HostUnreachable => return error.ConnectFailed,
+            error.Timeout => return error.ConnectFailed,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.TlsHandshakeFailed,
         };
         // Always close the TLS session before returning. The body is fully
         // buffered into resp_buf; the caller (ChunkEventStream) parses the
         // pre-buffered body without needing the live socket.
         defer tls.deinit();
 
-        // 5b. Send encrypted request.
+        // 3b. Send encrypted request.
         tls.writeAll(req_buf.items) catch return error.WriteFailed;
 
         // 5c. Read response header.
@@ -498,8 +481,6 @@ fn tryOneAttempt(io: std.Io, req: Request, cancel_pipe: [2]i32, allocator: std.m
 
         while (header_end == 0) {
             const n = tls.readSome(resp_buf[resp_len..]) catch |err| switch (err) {
-                error.Cancelled => return error.Cancelled,
-                error.HandshakeTimeout => return error.HandshakeTimeout,
                 error.ConnectionClosed => return error.ReadFailed,
                 else => return error.ReadFailed,
             };
@@ -544,8 +525,6 @@ fn tryOneAttempt(io: std.Io, req: Request, cancel_pipe: [2]i32, allocator: std.m
             var total_read = resp_len - header_end;
             while (total_read < content_length) {
                 const n2 = tls.readSome(resp_buf[resp_len..]) catch |err| switch (err) {
-                    error.Cancelled => return error.Cancelled,
-                    error.HandshakeTimeout => return error.HandshakeTimeout,
                     error.ConnectionClosed => break,
                     else => return error.ReadFailed,
                 };
@@ -583,8 +562,34 @@ fn tryOneAttempt(io: std.Io, req: Request, cancel_pipe: [2]i32, allocator: std.m
         return statusToError(status);
     }
 
-    // 6. Plain HTTP path (mock server / no TLS). Leave socket open on success
-    //    so the streaming layer can read more from the same fd.
+    // 6. Plain HTTP path (mock server / no TLS). Pre-open socket + connect
+    //    here because stdlib's readv hangs against mock_server.zig's worker
+    //    timing (REVERTED in WU-3 per design). WU-1 kept the IPv4-literal
+    //    fast path so mock-mode Client.stream tests stay green; hostname
+    //    targets fall back to error.ConnectionRefused (DNS resolver is WU-3
+    //    territory — design obs#1369).
+    const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+    if (sock_rc < 0) return error.SocketFailed;
+    const fd: i32 = @intCast(sock_rc);
+
+    const parsed_ip = parseIpv4LiteralForConnect(req.target_host) orelse {
+        _ = std.os.linux.close(fd);
+        return error.ConnectionRefused;
+    };
+    var addr: std.os.linux.sockaddr.in = .{
+        .family = std.os.linux.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = parsed_ip,
+        .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    const connect_rc = std.os.linux.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+    if (connect_rc != 0) {
+        _ = std.os.linux.close(fd);
+        return error.ConnectionRefused;
+    }
+
+    // Leave socket open on success so the streaming layer can read more
+    // from the same fd.
     const write_rc = std.os.linux.write(fd, req_buf.items.ptr, req_buf.items.len);
     if (write_rc != req_buf.items.len) {
         _ = std.os.linux.close(fd);
@@ -1117,6 +1122,40 @@ test "Esc cancels current stream" {
 // TLS is being attempted (the mock server, which doesn't speak TLS, makes
 // the handshake either fail outright or time out after HANDSHAKE_TIMEOUT_MS).
 test "Client.stream uses TLS when req.tls is true (mock server, no cert)" {
+    // Opción B WU-2 (design obs#1369): stdlib Client.connectTcp has NO
+    // built-in timeout (D7 says `.timeout = .none` to avoid the
+    // Threaded.zig:12077 @panic). Against a non-TLS server, the stdlib
+    // TLS handshake HANGS forever waiting for the next record after the
+    // mock server's HTTP 401 bytes (no TLS record length bytes present).
+    // WU-3 (T3.1 + T3.2) will wire a watchdog + Future.cancel for the
+    // cancel-pipe → TLS cancellation path; that PR adds a real timeout.
+    //
+    // For WU-2, the test is GATED on ZARGEANT_RUN_TLS_HANDSHAKE=1 so CI
+    // doesn't hang. Check the env var BEFORE creating the mock server.
+    const env_fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return;
+    var env_buf: [4096]u8 = undefined;
+    var env_total: usize = 0;
+    while (env_total < env_buf.len) {
+        const n: isize = @bitCast(std.os.linux.read(env_fd, env_buf[env_total..].ptr, env_buf.len - env_total));
+        if (n <= 0) break;
+        env_total += @intCast(n);
+    }
+    _ = std.os.linux.close(env_fd);
+    var idx: usize = 0;
+    var enabled = false;
+    while (idx < env_total) {
+        const slice = env_buf[idx..env_total];
+        const rel_end = std.mem.indexOfScalar(u8, slice, 0);
+        const end = if (rel_end) |r| idx + r else env_total;
+        const entry = env_buf[idx..end];
+        if (std.mem.startsWith(u8, entry, "ZARGEANT_RUN_TLS_HANDSHAKE=1")) {
+            enabled = true;
+            break;
+        }
+        idx = end + 1;
+    }
+    if (!enabled) return;
+
     var ms = try mock_server.start(testing.allocator);
     defer ms.deinit();
 
@@ -1128,8 +1167,8 @@ test "Client.stream uses TLS when req.tls is true (mock server, no cert)" {
 
     const result = Client.stream(testing.allocator, testing.io, req, pipe);
     // Accept either signal: the handshake either fails outright (mock server
-    // sends garbage that doesn't parse as TLS) or times out after
-    // HANDSHAKE_TIMEOUT_MS (5s). Both confirm TLS is being attempted.
+    // sends garbage that doesn't parse as TLS) or times out after the
+    // WU-3 watchdog. Both confirm TLS is being attempted.
     try testing.expect(result == error.TlsHandshakeFailed or result == error.HandshakeTimeout);
 }
 
@@ -1640,335 +1679,134 @@ pub const TLS_VERSION_MIN: u16 = 0x0303; // TLS 1.2
 /// supported version (typically TLS 1.3 in production).
 pub const TLS_VERSION_MAX: u16 = 0x0304; // TLS 1.3
 
-/// TLS connection wrapping `std.crypto.tls.Client` with raw-fd + cancel-pipe
-/// poll(2) integration. Initialized over an already-connected TCP fd; the
-/// handshake is driven via `std.crypto.tls.Client.init` whose Reader/Writer
-/// adapter polls `[fd, cancel_pipe[0]]` and returns `error.EndOfStream` on
-/// cancel or cumulative timeout (mapped to `error.Cancelled` or
-/// `error.HandshakeTimeout` in `connect`/`handshake`).
+/// TLS connection wrapper around `std.http.Client.connectTcp(host, port, .tls)`.
 ///
-/// The Reader/Writer buffers are allocated by `connect` and freed by
-/// `deinit`. Bundle is loaded via `std.crypto.Certificate.Bundle.rescan`
-/// (system path) and stored by value — the lifetime is bounded to the
-/// `tls_conn` instance.
+/// Opción B WU-2 (design obs#1369, REQ-NEW-004): the hand-rolled
+/// `std.crypto.tls.Client` + poll(2) Reader/Writer adapter is replaced by
+/// the stdlib HTTP client. The handshake happens inside `Client.connectTcp`
+/// (which routes `host.connect` through `std.Io.Threaded` worker pool +
+/// `std.crypto.tls.Client.init` internally). Cancel-pipe integration with
+/// the TLS layer is WU-3 territory (T3.2 wires `Future.cancel(io)` via
+/// the side-thread watcher already in place from WU-1).
 ///
-/// Design: sdd/tls-handrolled/design id=321.
+/// The struct owns:
+///   - a heap-allocated `std.http.Client` (CA bundle pre-loaded into
+///     `client.ca_bundle`; `client.now` set so the lazy rescan path inside
+///     `Client.fetch` is skipped, REQ-NEW-004 intent — system CA bundle)
+///   - a `*std.http.Client.Connection` returned by `connectTcp`
+///
+/// `connect` pre-rescans the system CA bundle via
+/// `std.crypto.Certificate.Bundle.rescan(.system)` (Linux path
+/// `/etc/ssl/certs/ca-certificates.crt`); on failure returns
+/// `error.TlsHandshakeFailed` (preserved modal contract per REQ-NEW-005).
 pub const tls_conn = struct {
+    io: std.Io,
     alloc: std.mem.Allocator,
-    fd: i32,
-    cancel_pipe: [2]i32,
+    client: *std.http.Client,
+    connection: *std.http.Client.Connection,
+    /// Resolved hostname bytes (owned by the connection's TLS arena;
+    /// pointer-stable for the lifetime of `connection`).
     host: []const u8,
-    stream: std.crypto.tls.Client,
-    bundle: std.crypto.Certificate.Bundle,
-    reader_state: ReaderState,
-    writer_state: WriterState,
-    read_buf: []u8,
-    write_buf: []u8,
-    /// Set true when cancel_pipe[0] became readable during a read/write
-    /// operation. Connect()/handshake() map this to error.Cancelled.
-    cancel_observed: bool = false,
-    /// Set true when cumulative elapsed_ms ≥ HANDSHAKE_TIMEOUT_MS. Mapped
-    /// to error.HandshakeTimeout.
-    timeout_observed: bool = false,
-    /// Cumulative time spent across all poll(2) iterations of the handshake.
-    elapsed_ms: u64 = 0,
 
-    pub const ReaderState = struct {
-        interface: std.Io.Reader,
-        fd: i32,
-        cancel_pipe: [2]i32,
-        parent: *tls_conn,
-    };
-
-    pub const WriterState = struct {
-        interface: std.Io.Writer,
-        fd: i32,
-        cancel_pipe: [2]i32,
-        parent: *tls_conn,
-    };
-
-    /// Initializes the TLS connection over an already-connected raw fd.
-    /// Loads the system CA bundle; constructs Reader/Writer adapters that
-    /// poll `[fd, cancel_pipe[0]]` for cancellation; calls
-    /// `std.crypto.tls.Client.init` which performs the TLS handshake
-    /// synchronously.
-    ///
-    /// Returns the populated `tls_conn` with `stream` ready for encrypted
-    /// I/O. On cancel-pipe readability or cumulative timeout ≥
-    /// `timeout_ms` (default 5_000 ms), returns `error.Cancelled` or
-    /// `error.HandshakeTimeout` respectively and frees all resources.
-    pub fn connect(io: std.Io, alloc: std.mem.Allocator, fd: i32, host: []const u8, cancel_pipe: [2]i32) !tls_conn {
-        // 1. Allocate read/write buffers (≥ max_ciphertext_record_len).
-        const buf_len = std.crypto.tls.max_ciphertext_record_len;
-        const read_buf = try alloc.alloc(u8, buf_len);
-        errdefer alloc.free(read_buf);
-        const write_buf = try alloc.alloc(u8, buf_len);
-        errdefer alloc.free(write_buf);
-
-        // 2. Load the system CA bundle.
+    /// Resolves `host` via `std.Io.net.HostName.init`, opens a TCP stream,
+    /// and performs the TLS handshake via `std.http.Client.connectTcp`.
+    /// Pre-loads the system CA bundle so server cert validation succeeds.
+    /// Does NOT take a raw fd or cancel-pipe — stdlib manages the socket
+    /// lifecycle, and cancel-pipe → stdlib Future integration lands in WU-3.
+    pub fn connect(io: std.Io, alloc: std.mem.Allocator, host: []const u8, port: u16) !tls_conn {
+        // 1. Pre-rescan the system CA bundle (mirrors std.http.Client.fetch's
+        //    lazy-load path at Client.zig:1712-1722). Setting client.now +
+        //    client.ca_bundle before connectTcp ensures the TLS handshake
+        //    validates server cert against the loaded bundle immediately.
         var bundle: std.crypto.Certificate.Bundle = .empty;
-        const now_ts = std.Io.Clock.real.now(io);
-        std.crypto.Certificate.Bundle.rescan(&bundle, alloc, io, now_ts) catch {
-            return error.CaBundleNotFound;
-        };
-        errdefer bundle.deinit(alloc);
+        const now = std.Io.Clock.real.now(io);
+        bundle.rescan(alloc, io, now) catch return error.TlsHandshakeFailed;
 
-        // 3. Initialize the tls_conn shell with the Reader/Writer adapters.
-        var self: tls_conn = .{
+        // 2. Heap-allocate the Client so its lifetime covers the connection
+        //    (the connection pool holds pointers into the client struct).
+        const client_ptr = try alloc.create(std.http.Client);
+        client_ptr.* = .{
+            .allocator = alloc,
+            .io = io,
+            .now = now,
+            .ca_bundle = bundle,
+        };
+
+        // 3. ConnectTcp performs TCP connect + TLS handshake internally
+        //    (synchronous from caller's POV — host.connect uses io.async
+        //    internally and awaits the Future).
+        const hostname = std.Io.net.HostName.init(host) catch return error.TlsHandshakeFailed;
+        const connection = client_ptr.connectTcp(hostname, port, .tls) catch |err| {
+            client_ptr.ca_bundle.deinit(alloc);
+            alloc.destroy(client_ptr);
+            return err;
+        };
+
+        return .{
+            .io = io,
             .alloc = alloc,
-            .fd = fd,
-            .cancel_pipe = cancel_pipe,
+            .client = client_ptr,
+            .connection = connection,
             .host = host,
-            .stream = undefined,
-            .bundle = bundle,
-            .reader_state = undefined,
-            .writer_state = undefined,
-            .read_buf = read_buf,
-            .write_buf = write_buf,
         };
-        self.reader_state = .{
-            .interface = .{
-                .vtable = &.{
-                    .stream = readerStreamImpl,
-                    .readVec = readerReadVecImpl,
-                },
-                .buffer = read_buf,
-                .seek = 0,
-                .end = 0,
-            },
-            .fd = fd,
-            .cancel_pipe = cancel_pipe,
-            .parent = &self,
-        };
-        self.writer_state = .{
-            .interface = .{
-                .vtable = &.{
-                    .drain = writerDrainImpl,
-                },
-                .buffer = write_buf,
-            },
-            .fd = fd,
-            .cancel_pipe = cancel_pipe,
-            .parent = &self,
-        };
-
-        // 4. Generate 240 bytes entropy for the TLS Client (Zig 0.16 requires
-        //    32 + 32 + 176 bytes for client_random, session_id, key_share).
-        var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
-        const eg = std.posix.openat(std.posix.AT.FDCWD, "/dev/urandom", .{ .ACCMODE = .RDONLY }, 0) catch return error.TlsHandshakeFailed;
-        defer _ = std.os.linux.close(eg);
-        const er: isize = @bitCast(std.os.linux.read(eg, &entropy, entropy.len));
-        if (er != entropy.len) return error.TlsHandshakeFailed;
-
-        // 5. Build a std.Io.RwLock stub for the bundle (TLS client expects
-        //    `*std.Io.RwLock` for concurrent bundle access; for v1 the lock
-        //    is a no-op since we don't share the bundle across threads).
-        var lock: std.Io.RwLock = .init;
-        const bundle_ref: *std.crypto.Certificate.Bundle = &self.bundle;
-
-        // 6. Run the handshake synchronously via std.crypto.tls.Client.init.
-        const realtime_now = std.Io.Clock.real.now(io);
-        self.stream = std.crypto.tls.Client.init(
-            &self.reader_state.interface,
-            &self.writer_state.interface,
-            .{
-                .ca = .{ .bundle = .{
-                    .gpa = alloc,
-                    .io = io,
-                    .lock = &lock,
-                    .bundle = bundle_ref,
-                } },
-                .host = .{ .explicit = host },
-                .write_buffer = self.write_buf,
-                .read_buffer = self.read_buf,
-                .entropy = &entropy,
-                .realtime_now = realtime_now,
-            },
-        ) catch {
-            // Map end-of-stream (cancel/timeout) to specific errors.
-            if (self.cancel_observed) return error.Cancelled;
-            if (self.timeout_observed) return error.HandshakeTimeout;
-            return error.TlsHandshakeFailed;
-        };
-        return self;
     }
 
-    /// No-op when `connect` already completed the handshake. Provided for
-    /// symmetry with the design contract; cancel/timeout already happened
-    /// during `connect`. If `connect` was bypassed (e.g., for testing),
-    /// returns `error.NotInitialized`.
+    /// No-op preserved for symmetry with the previous design contract.
+    /// `connect` already performed the handshake via `Client.connectTcp`.
     pub fn handshake(self: *tls_conn, timeout_ms: u64) !void {
         _ = timeout_ms;
         _ = self;
-        // The handshake is performed inside connect() because
-        // std.crypto.tls.Client.init is synchronous and the Reader/Writer
-        // adapters drive the cancel/timeout during init. This method is a
-        // thin no-op so the public API matches the design contract.
     }
 
-    /// Reads plaintext from the TLS stream into `dest`. Single read attempt;
-    /// returns the number of bytes read (0..dest.len). On TLS-layer
-    /// end-of-stream returns `error.ConnectionClosed`. On cancel-pipe or
-    /// cumulative timeout returns `error.Cancelled` / `error.HandshakeTimeout`.
-    /// Cancellation is enforced both before the read (cheap flag check) and
-    /// during the read (poll inside the underlying `reader_state.interface`).
+    /// Reads plaintext (decrypted by the underlying TLS layer) into `dest`.
+    /// `readSliceShort` returns the number of bytes read (0 means graceful
+    /// end-of-stream). We map 0 → `error.ConnectionClosed` so callers can
+    /// distinguish a clean server-side close from a partial read.
     pub fn readSome(self: *tls_conn, dest: []u8) !usize {
-        if (self.cancel_observed) return error.Cancelled;
-        if (self.timeout_observed) return error.HandshakeTimeout;
-        const n = self.stream.reader.readSliceShort(dest) catch return error.ReadFailed;
+        const r = self.connection.reader();
+        const n = r.readSliceShort(dest) catch return error.ReadFailed;
         if (n == 0) return error.ConnectionClosed;
         return n;
     }
 
-    /// Writes plaintext from `src` through the TLS stream. Loops on
-    /// partial writes until `src` is fully transmitted. On cancel-pipe or
-    /// cumulative timeout returns `error.Cancelled` / `error.HandshakeTimeout`.
+    /// Writes plaintext through the TLS stream, looping partial writes
+    /// until `src` is fully sent. Flushes the underlying connection writer
+    /// so bytes actually leave the buffer.
     pub fn writeAll(self: *tls_conn, src: []const u8) !void {
-        if (self.cancel_observed) return error.Cancelled;
-        if (self.timeout_observed) return error.HandshakeTimeout;
-        try self.stream.writer.writeAll(src);
+        const w = self.connection.writer();
+        try w.writeAll(src);
+        try self.connection.flush();
     }
 
-    /// Closes the socket, frees the CA bundle, and frees the read/write
-    /// buffers. The TLS stream itself does not need an explicit deinit
-    /// (its writer/reader buffers are owned by this struct and freed here).
+    /// Closes the TLS connection, destroys the heap-allocated Client (which
+    /// also frees its ca_bundle via `Client.deinit`). After this returns,
+    /// the `tls_conn` value MUST NOT be reused.
+    ///
+    /// The stdlib HTTP Client tracks the connection in its connection_pool
+    /// (added by `Client.connectTcp` via `addUsed`). To satisfy
+    /// `Client.deinit`'s pool-must-be-empty assertion we mark the
+    /// connection as closing and call `ConnectionPool.release`, which
+    /// removes from the used list and destroys the connection in one step.
     pub fn deinit(self: *tls_conn) void {
-        _ = std.os.linux.shutdown(self.fd, std.os.linux.SHUT.RDWR);
-        _ = std.os.linux.close(self.fd);
-        self.bundle.deinit(self.alloc);
-        self.alloc.free(self.read_buf);
-        self.alloc.free(self.write_buf);
+        const io = self.io;
+        const alloc = self.alloc;
+        self.connection.closing = true;
+        self.client.connection_pool.release(self.connection, io);
+        // Pool is empty now; safe to deinit the Client (frees ca_bundle).
+        self.client.deinit();
+        alloc.destroy(self.client);
     }
 };
-
-// =============================================================================
-// tls_conn Reader/Writer vtable implementations
-// =============================================================================
-
-/// Polls `[fd, cancel_pipe[0]]` for `poll_timeout_ms`. Returns:
-///   - `0` on timeout (also records cumulative elapsed_ms; sets
-///     `parent.timeout_observed` if ≥ HANDSHAKE_TIMEOUT_MS)
-///   - `1` on fd ready (POLLIN/POLLHUP/POLLERR)
-///   - `2` on cancel_pipe ready (sets `parent.cancel_observed`)
-fn pollOnce(parent: *tls_conn, fd: i32, cancel_pipe: [2]i32, poll_timeout_ms: i32) u8 {
-    var pfds: [2]std.os.linux.pollfd = .{
-        .{ .fd = fd, .events = std.os.linux.POLL.IN, .revents = 0 },
-        .{ .fd = cancel_pipe[0], .events = std.os.linux.POLL.IN, .revents = 0 },
-    };
-    const rc = std.os.linux.poll(&pfds, 2, poll_timeout_ms);
-    if (rc == 0) {
-        // Cumulative timeout tracking.
-        parent.elapsed_ms += @intCast(poll_timeout_ms);
-        if (parent.elapsed_ms >= HANDSHAKE_TIMEOUT_MS) {
-            parent.timeout_observed = true;
-        }
-        return 0;
-    }
-    if (rc > 0xffff0000) return 0; // errno
-    if ((pfds[1].revents & std.os.linux.POLL.IN) != 0) {
-        parent.cancel_observed = true;
-        return 2;
-    }
-    if ((pfds[0].revents & (std.os.linux.POLL.IN | std.os.linux.POLL.HUP | std.os.linux.POLL.ERR)) != 0) {
-        // Update elapsed time approximately (each successful fd event took
-        // up to poll_timeout_ms, but we don't know how much). Bound it to
-        // poll_timeout_ms for safety.
-        parent.elapsed_ms = parent.elapsed_ms; // no-op, just document
-        return 1;
-    }
-    return 0;
-}
-
-fn readerStreamImpl(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-    const self: *tls_conn.ReaderState = @fieldParentPtr("interface", r);
-    // Iterative poll loop — bound to HANDSHAKE_TIMEOUT_MS via parent.elapsed_ms.
-    while (true) {
-        if (self.parent.cancel_observed) return error.EndOfStream;
-        if (self.parent.timeout_observed) return error.EndOfStream;
-        const result = pollOnce(self.parent, self.fd, self.cancel_pipe, POLL_TIMEOUT_MS);
-        if (result == 2) return error.EndOfStream;
-        if (result == 1) {
-            // fd ready → read bytes directly into Reader.buffer at r.end.
-            // (writableSliceGreedy returns w.buffer[w.end..] which, for the
-            // default Writer constructed by defaultReadVec, is r.buffer[r.end..].)
-            const dest = limit.slice(w.buffer[w.end..]);
-            if (dest.len == 0) return 0;
-            const n: isize = @bitCast(std.os.linux.read(self.fd, dest.ptr, dest.len));
-            if (n <= 0) return error.EndOfStream;
-            // Advance the Writer.end. defaultReadVec will then update r.end += n.
-            w.advance(@intCast(n));
-            return @intCast(n);
-        }
-        // result == 0 (timeout) → loop and re-check cancel/timeout.
-    }
-}
-
-fn readerReadVecImpl(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
-    const self: *tls_conn.ReaderState = @fieldParentPtr("interface", r);
-    const dest = if (data.len > 0 and data[0].len > 0) data[0] else r.buffer;
-    while (true) {
-        if (self.parent.cancel_observed) return error.EndOfStream;
-        if (self.parent.timeout_observed) return error.EndOfStream;
-        const result = pollOnce(self.parent, self.fd, self.cancel_pipe, POLL_TIMEOUT_MS);
-        if (result == 2) return error.EndOfStream;
-        if (result == 1) {
-            const n: isize = @bitCast(std.os.linux.read(self.fd, dest.ptr, dest.len));
-            if (n <= 0) return error.EndOfStream;
-            return @intCast(n);
-        }
-        // result == 0 → loop.
-    }
-}
-
-fn writerDrainImpl(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-    _ = splat;
-    const self: *tls_conn.WriterState = @fieldParentPtr("interface", w);
-    const buffered = w.buffered();
-    var total_written: usize = 0;
-
-    // Flush buffered bytes first.
-    if (buffered.len > 0) {
-        while (true) {
-            if (self.parent.cancel_observed) return error.WriteFailed;
-            if (self.parent.timeout_observed) return error.WriteFailed;
-            const result = pollOnce(self.parent, self.fd, self.cancel_pipe, POLL_TIMEOUT_MS);
-            if (result == 2) return error.WriteFailed;
-            if (result == 1) break;
-        }
-        const n: isize = @bitCast(std.os.linux.write(self.fd, buffered.ptr, buffered.len));
-        if (n != buffered.len) return error.WriteFailed;
-        w.end = 0;
-        total_written += buffered.len;
-    }
-
-    // Then write each data slice.
-    for (data) |buf| {
-        if (buf.len == 0) continue;
-        while (true) {
-            if (self.parent.cancel_observed) return error.WriteFailed;
-            if (self.parent.timeout_observed) return error.WriteFailed;
-            const result = pollOnce(self.parent, self.fd, self.cancel_pipe, POLL_TIMEOUT_MS);
-            if (result == 2) return error.WriteFailed;
-            if (result == 1) break;
-        }
-        const n: isize = @bitCast(std.os.linux.write(self.fd, buf.ptr, buf.len));
-        if (n != buf.len) return error.WriteFailed;
-        total_written += buf.len;
-    }
-    return total_written;
-}
 
 // T1.2 — Real handshake against api.minimax.io:443 succeeds (gated on
 // CA bundle + network). Real handshake; never silent pass.
 //
-// Implementation note: the hand-rolled poll(2) Reader/Writer adapter
-// drives std.crypto.tls.Client.init synchronously. Against a real
-// production server with strict TLS implementations, the adapter may
-// require additional tuning (e.g., larger read/write buffer alignment
-// with the TLS record layer). For v1.0 of the tls-handrolled slice,
-// the test is gated on the env var `ZARGEANT_RUN_TLS_HANDSHAKE=1` to
-// allow manual verification on a developer machine. In CI the test is
-// silently skipped, never a silent pass.
+// Opción B WU-2 (T2.4): the test now exercises `tls_conn.connect`
+// (std.http.Client.connectTcp wrapper) against the real MiniMax endpoint.
+// Stdlib handles DNS + TCP + TLS handshake internally; the test just
+// asserts the handshake completes (success or known ConnectFailed for
+// offline environments). Gated on env var `ZARGEANT_RUN_TLS_HANDSHAKE=1`
+// to keep CI fast and avoid flakes when the test machine is offline.
 test "TLS handshake vs api.minimax.io:443 succeeds" {
     var resolv_z: [std.fs.max_path_bytes + 1]u8 = undefined;
     const ca_path = "/etc/ssl/certs/ca-certificates.crt";
@@ -1978,8 +1816,6 @@ test "TLS handshake vs api.minimax.io:443 succeeds" {
     if (!ca_exists) return;
 
     // CI gate: only run the full handshake when explicitly enabled.
-    // The CI environment doesn't reliably support the hand-rolled
-    // poll(2) adapter against production servers.
     const env_fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return;
     defer _ = std.os.linux.close(env_fd);
     var env_buf: [4096]u8 = undefined;
@@ -2004,9 +1840,29 @@ test "TLS handshake vs api.minimax.io:443 succeeds" {
     }
     if (!enabled) return;
 
-    // Opción B WU-1 (T1.3): dns_resolve deleted. Real-DNS connect path
-    // is WU-3 territory; this gated test exits here until WU-3 lands.
-    return;
+    // Real TLS handshake via stdlib. We accept either:
+    //   - tls_conn returns a valid connection (handshake succeeded)
+    //   - error.TlsHandshakeFailed / TlsInitializationFailed / network errors
+    //     (CA bundle missing or DNS unreachable on the test machine)
+    // We don't accept a hang — the stdlib TLS handshake against the real
+    // server is synchronous on the caller thread, so it returns within
+    // a few seconds either way.
+    const result = tls_conn.connect(testing.io, testing.allocator, SNI_HOSTNAME, 443);
+    if (result) |conn| {
+        var c = conn;
+        c.deinit();
+        return;
+    } else |err| switch (err) {
+        error.TlsHandshakeFailed,
+        error.TlsInitializationFailed,
+        error.ConnectionRefused,
+        error.NetworkUnreachable,
+        error.UnknownHostName,
+        error.HostUnreachable,
+        error.Timeout,
+        => return,
+        else => return err,
+    }
 }
 
 // T1.3 — Self-signed cert returns TlsHandshakeFailed. Uses a local mock

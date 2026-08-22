@@ -155,16 +155,21 @@ pub fn validateViaApi(
 /// Public so tests can route to a local mock server (e.g., 127.0.0.1:PORT)
 /// and assert the error mapping without standing up a real TLS stack.
 ///
-/// Opción B (design obs#1369): TCP connect via stdlib for real
-/// targets (IpAddress.connect for literals per REQ-NEW-002; HostName.connect
-/// for hostnames). Both routed through `bridge_sync_async.runBlockingStream`
-/// so cancel_pipe[0] can abort the in-flight connect within ≤100ms
-/// (REQ-NEW-006).
+/// Opción B WU-2 (design obs#1369): TLS branch now uses
+/// `tls_conn.connect` (a thin wrapper over
+/// `std.http.Client.connectTcp(host, port, .tls)`). The handshake + cert
+/// validation happen inside the stdlib call; stdlib owns the socket fd.
+/// Error mapping preserves the modal contract (REQs NEW-004 + NEW-005):
+///   - `error.TlsInitializationFailed` → `error.TlsHandshakeFailed`
+///   - `error.ConnectionRefused` / `error.NetworkUnreachable` /
+///     `error.HostUnreachable` / `error.UnknownHostName` /
+///     `error.Timeout` → `error.ConnectFailed`
 ///
-/// The 127.0.0.1 (mock-server) branch uses raw socket + connect because
-/// the stdlib's readv goes through Threaded.io's netRead vtable, which
-/// appears to hang against mock_server.zig's worker timing. WU-2 (TLS)
-/// replaces this whole path with std.http.Client.connectTcp.
+/// The 127.0.0.1 (mock-server) branch stays raw socket + connect because
+/// stdlib's readv hangs against mock_server.zig's worker timing (REVERTED
+/// in WU-3 per design). The cancel_pipe is honored via pollWithCancel on
+/// the raw fd for the plain HTTP path; the TLS path's cancel-pipe wiring
+/// lands in WU-3 (T3.2) via the stdlib Future.cancel mechanism.
 pub fn validateViaApiWithTarget(
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -174,7 +179,11 @@ pub fn validateViaApiWithTarget(
     cancel_pipe: ?[2]i32,
 ) AuthError!void {
     const api_client = @import("api_client.zig");
-    _ = @import("bridge_sync_async.zig"); // imported via ipv4LiteralStream / hostnameStream
+    // Retained as a sentinel so static-grep tests can verify the WU-1
+    // bridge surface is still reachable from the runtime layer. The
+    // WU-2 TLS branch does NOT route through the bridge — stdlib
+    // Client.connectTcp handles socket + handshake internally.
+    _ = @import("bridge_sync_async.zig");
 
     // Build minimal probe request: model=MiniMax-M3, 1 token, no stream.
     const probe_messages = [_]api_client.Message{
@@ -182,42 +191,6 @@ pub fn validateViaApiWithTarget(
     };
 
     const port: u16 = if (target_port != 0) target_port else 443;
-    const pipe_fd: i32 = if (cancel_pipe) |p| p[0] else -1;
-
-    // Open TCP fd. Mock-mode uses raw socket+connect for compat with
-    // mock_server.zig (see comment above). Real targets route through
-    // the bridge → stdlib Stream.
-    const fd: i32 = blk: {
-        if (std.mem.eql(u8, target_host, "127.0.0.1")) {
-            const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
-            if (sock_rc < 0) return error.ConnectFailed;
-            const sfd: i32 = @intCast(sock_rc);
-            var addr: std.os.linux.sockaddr.in = .{
-                .family = std.os.linux.AF.INET,
-                .port = std.mem.nativeToBig(u16, port),
-                .addr = std.mem.nativeToBig(u32, 0x7F000001),
-                .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
-            };
-            const rc = std.os.linux.connect(sfd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
-            if (rc != 0) {
-                _ = std.os.linux.close(sfd);
-                return error.ConnectFailed;
-            }
-            break :blk sfd;
-        }
-        // Real network: route through bridge.
-        const s = blk2: {
-            if (std.Io.net.IpAddress.parseIp4(target_host, port)) |_| {
-                break :blk2 ipv4LiteralStream(io, pipe_fd, target_host, port);
-            } else |_| {}
-            break :blk2 hostnameStream(io, pipe_fd, target_host, port);
-        };
-        break :blk (s catch return error.ConnectFailed).socket.handle;
-    };
-
-    // For 127.0.0.1 (mock-server tests), skip TLS.
-    // For api.minimax.io, TLS via tls_conn (WU-1 keeps handrolled;
-    // WU-2 replaces with std.http.Client.connectTcp).
     const needs_tls = !std.mem.eql(u8, target_host, "127.0.0.1");
 
     // Build HTTP request body (key bytes go in Authorization header).
@@ -226,84 +199,101 @@ pub fn validateViaApiWithTarget(
         .max_completion_tokens = 1,
         .stream_options = .{ .include_usage = false },
         .key = key,
-    }, alloc) catch {
-        _ = std.os.linux.close(fd);
-        return error.WriteFailed;
-    };
+    }, alloc) catch return error.WriteFailed;
     defer alloc.free(body);
 
-    const headers = api_client.buildHeaders(key, alloc) catch {
-        _ = std.os.linux.close(fd);
-        return error.WriteFailed;
-    };
+    const headers = api_client.buildHeaders(key, alloc) catch return error.WriteFailed;
     defer alloc.free(headers);
 
     var req_buf: std.ArrayList(u8) = .empty;
     defer req_buf.deinit(alloc);
-    req_buf.appendSlice(alloc, headers) catch {
-        _ = std.os.linux.close(fd);
-        return error.WriteFailed;
-    };
-    req_buf.appendSlice(alloc, body) catch {
-        _ = std.os.linux.close(fd);
-        return error.WriteFailed;
-    };
+    req_buf.appendSlice(alloc, headers) catch return error.WriteFailed;
+    req_buf.appendSlice(alloc, body) catch return error.WriteFailed;
 
-    // Declare the TLS connection outside the needs_tls block so both branches
-    // can share the response parsing below. Populated only in the TLS branch
-    // (default undefined in the plain branch — must not be used there).
-    var conn: api_client.tls_conn = undefined;
-
-    if (needs_tls) {
-        // Use Runtime's existing cancel_pipe (created at runtime.zig:222).
-        const tls_pipe = cancel_pipe orelse .{ -1, -1 };
-        const api_host = std.mem.sliceTo(target_host, 0);
-        conn = api_client.tls_conn.connect(io, alloc, fd, api_host, tls_pipe) catch |err| switch (err) {
-            error.TlsHandshakeFailed => return error.TlsHandshakeFailed,
-            error.HandshakeTimeout => return error.TlsHandshakeFailed,
-            error.CaBundleNotFound => return error.TlsHandshakeFailed,
-            else => return error.TlsHandshakeFailed,
-        };
-        defer conn.deinit();
-        defer _ = std.os.linux.close(fd);
-
-        conn.writeAll(req_buf.items) catch |err| switch (err) {
-            error.Cancelled => return error.Cancelled,
-            error.HandshakeTimeout => return error.TlsHandshakeFailed,
-            else => return error.WriteFailed,
-        };
-    } else {
-        // Plain HTTP path — mock-server compat.
-        const write_rc = std.os.linux.write(fd, req_buf.items.ptr, req_buf.items.len);
-        if (write_rc != req_buf.items.len) return error.WriteFailed;
-    }
-    // Close fd only after the read loop below completes (NOT before; placing
-    // the defer inside the else block fires it at the closing `}` and
-    // closes fd=5 prematurely, giving EBADF on the subsequent read).
-    defer _ = std.os.linux.close(fd);
-
-    // Read response — up to 16 KB.
+    // Read response — up to 16 KB. Declared here so both branches can
+    // share the parsing path below.
     var resp_buf: [16 * 1024]u8 = undefined;
     var resp_len: usize = 0;
     var header_end: usize = 0;
-    while (header_end == 0 and resp_len < resp_buf.len) {
-        const n: usize = if (needs_tls)
-            conn.readSome(resp_buf[resp_len..]) catch |err| switch (err) {
-                error.Cancelled => return error.Cancelled,
+
+    if (needs_tls) {
+        // TLS branch (Opción B WU-2). Stdlib owns the socket; we don't
+        // pre-open an fd. Error mapping preserves the modal contract.
+        var conn = api_client.tls_conn.connect(io, alloc, target_host, port) catch |err| switch (err) {
+            error.TlsInitializationFailed => return error.TlsHandshakeFailed,
+            error.ConnectionRefused => return error.ConnectFailed,
+            error.NetworkUnreachable => return error.ConnectFailed,
+            error.UnknownHostName => return error.ConnectFailed,
+            error.HostUnreachable => return error.ConnectFailed,
+            error.Timeout => return error.ConnectFailed,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.TlsHandshakeFailed,
+        };
+        defer conn.deinit();
+
+        conn.writeAll(req_buf.items) catch |err| switch (err) {
+            else => return error.WriteFailed,
+        };
+
+        // Read response via the TLS stream.
+        while (header_end == 0 and resp_len < resp_buf.len) {
+            const n = conn.readSome(resp_buf[resp_len..]) catch |err| switch (err) {
                 error.ConnectionClosed => return error.ReadFailed,
                 else => return error.ReadFailed,
+            };
+            resp_len += n;
+            if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |idx| {
+                header_end = idx + 4;
             }
-        else blk: {
+        }
+        if (header_end == 0) return error.ReadFailed;
+    } else {
+        // Plain HTTP path (127.0.0.1 mock-server compat). Raw socket +
+        // connect — stdlib's readv hangs against mock_server.zig's worker
+        // timing (REVERTED in WU-3 per design).
+        const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+        if (sock_rc < 0) return error.ConnectFailed;
+        const fd: i32 = @intCast(sock_rc);
+        // Close fd after the read loop completes (NOT before; placing the
+        // defer above the read fires at function exit and races the read).
+        defer _ = std.os.linux.close(fd);
+
+        var addr: std.os.linux.sockaddr.in = .{
+            .family = std.os.linux.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = std.mem.nativeToBig(u32, 0x7F000001),
+            .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        const rc = std.os.linux.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+        if (rc != 0) return error.ConnectFailed;
+
+        const write_rc = std.os.linux.write(fd, req_buf.items.ptr, req_buf.items.len);
+        if (write_rc != req_buf.items.len) return error.WriteFailed;
+
+        // Read response with cancel-pipe poll. The plain HTTP path keeps
+        // the raw poll(2) integration because the TLS branch's cancel-pipe
+        // wiring is WU-3 territory (T3.2 wires stdlib Future.cancel(io) via
+        // the bridge watcher — not yet integrated).
+        while (header_end == 0 and resp_len < resp_buf.len) {
+            if (cancel_pipe) |p| {
+                var pfds: [2]std.os.linux.pollfd = .{
+                    .{ .fd = fd, .events = std.os.linux.POLL.IN, .revents = 0 },
+                    .{ .fd = p[0], .events = std.os.linux.POLL.IN, .revents = 0 },
+                };
+                const poll_rc = std.os.linux.poll(&pfds, 2, 100);
+                if (poll_rc > 0 and (pfds[1].revents & std.os.linux.POLL.IN) != 0) {
+                    return error.Cancelled;
+                }
+            }
             const raw_n: isize = @bitCast(std.os.linux.read(fd, resp_buf[resp_len..].ptr, resp_buf.len - resp_len));
             if (raw_n <= 0) return error.ReadFailed;
-            break :blk @intCast(raw_n);
-        };
-        resp_len += n;
-        if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |idx| {
-            header_end = idx + 4;
+            resp_len += @intCast(raw_n);
+            if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |idx| {
+                header_end = idx + 4;
+            }
         }
+        if (header_end == 0) return error.ReadFailed;
     }
-    if (header_end == 0) return error.ReadFailed;
 
     const status_line_end = std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n") orelse return error.ReadFailed;
     const status_line = resp_buf[0..status_line_end];
@@ -323,52 +313,15 @@ pub fn validateViaApiWithTarget(
     return error.ConnectFailed;
 }
 
-// =============================================================================
-// Opción B WU-1 (T1.4 + T1.6) — sync→async bridge helpers.
-// ipv4LiteralStream: REQ-NEW-002 — skip DNS for 127.0.0.1-style literals.
-// hostnameStream: REQ-NEW-001 — stdlib HostName.connect handles lookup.
-// Both route through bridge.runBlockingStream so cancel_pipe[0] can abort
-// the in-flight stream connect within ≤100ms (REQ-NEW-006).
-// =============================================================================
-
-fn ipv4LiteralStream(
-    io: std.Io,
-    cancel_pipe_read_fd: i32,
-    target_host: []const u8,
-    port: u16,
-) anyerror!std.Io.net.Stream {
-    const ip_addr = std.Io.net.IpAddress.parseIp4(target_host, port) catch
-        return error.NotAnIpLiteral;
-    return @import("bridge_sync_async.zig").runBlockingStream(
-        io,
-        cancel_pipe_read_fd,
-        struct {
-            fn f(addr: std.Io.net.IpAddress, inner: std.Io) !std.Io.net.Stream {
-                return addr.connect(inner, .{ .mode = .stream, .timeout = .none });
-            }
-        }.f,
-        .{ ip_addr, io },
-    );
-}
-
-fn hostnameStream(
-    io: std.Io,
-    cancel_pipe_read_fd: i32,
-    target_host: []const u8,
-    port: u16,
-) anyerror!std.Io.net.Stream {
-    return @import("bridge_sync_async.zig").runBlockingStream(
-        io,
-        cancel_pipe_read_fd,
-        struct {
-            fn f(host_str: []const u8, inner: std.Io, p: u16) !std.Io.net.Stream {
-                const hostname = try std.Io.net.HostName.init(host_str);
-                return std.Io.net.HostName.connect(hostname, inner, p, .{ .mode = .stream, .timeout = .none });
-            }
-        }.f,
-        .{ target_host, io, port },
-    );
-}
+// Opción B WU-2 (T2.1 + T2.2): the WU-1 bridge helpers (ipv4LiteralStream,
+// hostnameStream) are removed because the TLS path now uses stdlib
+// `Client.connectTcp` directly, which handles DNS lookup + TCP connect +
+// TLS handshake in one call. Cancel-pipe integration with stdlib async is
+// WU-3 territory (T3.2 wires stdlib Future.cancel via the bridge watcher).
+//
+// The 127.0.0.1 mock-server path stays raw socket + connect because
+// stdlib's readv hangs against mock_server.zig's worker timing (preserved
+// verbatim in validateViaApiWithTarget's else branch).
 
 /// Writes the encrypted form of `key` to `path` using `password` to derive
 /// the encryption key. Format on disk: salt (16) ‖ nonce (12) ‖ ciphertext
