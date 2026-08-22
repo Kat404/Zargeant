@@ -81,6 +81,7 @@ pub fn parseArgs(argv: []const []const u8) ParseError!ParsedArgs {
             return error.UnknownFlag;
         }
     }
+
     return args;
 }
 
@@ -206,7 +207,23 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     defer rt.deinit();
-    rt.run(init.io) catch {};
+
+    // Opción B (design obs#1369): construct std.Io.Threaded for stdlib
+    // networking. MUST use DebugAllocator (NOT ArenaAllocator, per issue
+    // #25900 alignment panic). MUST use .async_limit = null (NOT
+    // .nothing, per investigation Section 5.2 futex deadlock).
+    // Threaded.io() is the runtime used by validateViaApiWithTarget via
+    // bridge_sync_async.runBlockingStream.
+    // ponytail: Zig 0.16 std.heap has no GeneralPurposeAllocator; DebugAllocator
+    // is the in-tree replacement (leak detection + safety in Debug). For
+    // production builds swap to page_allocator + leak suppression.
+    var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = debug_alloc.deinit();
+    var threaded = std.Io.Threaded.init(debug_alloc.allocator(), .{ .async_limit = null });
+    defer threaded.deinit();
+    const stdlib_io = threaded.io();
+
+    rt.run(stdlib_io) catch {};
 }
 
 // =============================================================================

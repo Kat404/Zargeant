@@ -95,7 +95,7 @@ const Tui = struct {
 /// `redraw_pending = true` when consumed. Used by every W2/W3 behavioral
 /// test in this slice to avoid duplicating inline driver code.
 fn feedKey(state: *M.State, lc: *Tui.Lifecycle, k: mibu.events.Key) !void {
-    const consumed = try Tui.handleKeyInput(testing.io, testing.allocator, state, k);
+    const consumed = try Tui.handleKeyInput(testing.io, testing.allocator, state, k, null);
     if (consumed) lc.redraw_pending.store(true, .seq_cst);
 }
 
@@ -1457,6 +1457,7 @@ test "W4-1: tuiThreadLoop renders modal on redraw_pending and emits CSI" {
         &modal_state,
         testing.allocator,
         &shutdown_atomic,
+        null, // cancel_pipe — null for tests
     );
     // The loop allocated a prev_snapshot dupe; free it like tuiRealMain
     // does on shutdown.
@@ -1744,6 +1745,7 @@ test "T-TIW-1: handleKeyInput appends char to draft (REQ-TIW-004)" {
             testing.allocator,
             &state,
             .{ .code = .{ .char = 'a' }, .event = .press },
+            null, // cancel_pipe — null for tests
         );
         try testing.expect(consumed);
         try testing.expectEqual(@as(usize, 1), state.key_entry.draft_len);
@@ -1760,7 +1762,8 @@ test "T-TIW-1: handleKeyInput appends char to draft (REQ-TIW-004)" {
             testing.io,
             testing.allocator,
             &state,
-            .{ .code = .{ .char = 'd' }, .event = .press },
+            .{ .code = .{ .char = 'a' }, .event = .press },
+            null, // cancel_pipe — null for tests
         );
         try testing.expect(!consumed);
         try testing.expectEqual(@as(usize, 256), state.key_entry.draft_len);
@@ -1772,6 +1775,7 @@ test "T-TIW-1: handleKeyInput appends char to draft (REQ-TIW-004)" {
             testing.allocator,
             &state,
             .{ .code = .{ .char = 0x100 }, .event = .press },
+            null, // cancel_pipe — null for tests
         );
         try testing.expect(!consumed);
         try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
@@ -1783,6 +1787,7 @@ test "T-TIW-1: handleKeyInput appends char to draft (REQ-TIW-004)" {
             testing.allocator,
             &state,
             .{ .code = .{ .char = 'p' }, .event = .press },
+            null, // cancel_pipe — null for tests
         );
         try testing.expect(consumed);
         try testing.expectEqual(@as(usize, 1), state.unlock_prompt.draft_len);
@@ -1807,6 +1812,7 @@ test "T-TIW-2: handleKeyInput decrements draft on backspace (REQ-TIW-005)" {
             testing.allocator,
             &state,
             .{ .code = .backspace, .event = .press },
+            null, // cancel_pipe — null for tests
         );
         try testing.expect(consumed);
         try testing.expectEqual(@as(usize, 2), state.key_entry.draft_len);
@@ -1818,6 +1824,7 @@ test "T-TIW-2: handleKeyInput decrements draft on backspace (REQ-TIW-005)" {
             testing.allocator,
             &state,
             .{ .code = .backspace, .event = .press },
+            null, // cancel_pipe — null for tests
         );
         try testing.expect(!consumed);
         try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
@@ -1854,6 +1861,7 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
             testing.allocator,
             &state,
             .{ .code = .enter, .event = .press },
+            null, // cancel_pipe — null for tests
         ) catch {};
         // Either state stays in .key_entry with err_msg set (offline),
         // OR state advanced to .consent_prompt (online success). Both
@@ -1871,6 +1879,7 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
             testing.allocator,
             &state,
             .{ .code = .enter, .event = .press },
+            null, // cancel_pipe — null for tests
         ) catch {};
         // Either attempts incremented or state transitioned to .error_modal
         // (when no storage path resolves — the CI environment).
@@ -1890,6 +1899,7 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
             testing.allocator,
             &state,
             .{ .code = .esc, .event = .press },
+            null, // cancel_pipe — null for tests
         );
         try testing.expect(consumed);
         try testing.expect(std.meta.activeTag(state) == .key_entry);
@@ -1909,6 +1919,7 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
             testing.allocator,
             &state,
             .{ .code = .esc, .event = .press },
+            null, // cancel_pipe — null for tests
         );
         try testing.expect(!consumed);
         try testing.expectEqual(@as(usize, 5), state.key_entry.draft_len);
@@ -1926,6 +1937,7 @@ test "T-TIW-4: handleKeyInput ignores .release; treats .repeat as .press (REQ-TI
             testing.allocator,
             &state,
             .{ .code = .{ .char = 'a' }, .event = .release },
+            null, // cancel_pipe — null for tests
         );
         try testing.expect(!consumed);
         try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
@@ -1937,6 +1949,7 @@ test "T-TIW-4: handleKeyInput ignores .release; treats .repeat as .press (REQ-TI
             testing.allocator,
             &state,
             .{ .code = .{ .char = 'x' }, .event = .repeat },
+            null, // cancel_pipe — null for tests
         );
         try testing.expect(consumed);
         try testing.expectEqual(@as(usize, 1), state.key_entry.draft_len);
@@ -2039,6 +2052,7 @@ test "T-TIW-7: feedKey drives a full key sequence through handleKeyInput (REQ-TI
             testing.allocator,
             &state,
             .{ .code = .{ .char = 'a' }, .event = .press },
+            null, // cancel_pipe — null for tests
         );
         if (consumed) lc.redraw_pending.store(true, .seq_cst);
         try testing.expect(consumed);
@@ -2048,6 +2062,7 @@ test "T-TIW-7: feedKey drives a full key sequence through handleKeyInput (REQ-TI
             testing.allocator,
             &state,
             .{ .code = .up, .event = .press },
+            null, // cancel_pipe — null for tests
         );
         try testing.expect(!up_consumed);
         // The .key arm would now forward; we simulate by pushing to the channel.

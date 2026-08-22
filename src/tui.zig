@@ -106,6 +106,7 @@ pub fn queryDec2048Supported(
 ) bool {
     const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
     const mode = mibu.events.queryModeWithTimeout(io, file, writer, 2048, 50) catch return false;
+
     return mode.supported();
 }
 
@@ -491,6 +492,11 @@ pub fn tuiThreadLoop(
     // We need this atomic so Ctrl+C in any modal state can flip the
     // shared shutdown flag the outer wrapper (runtime.zig:383) polls.
     shutdown: *std.atomic.Value(bool),
+    // Opción B WU-1 (T1.6): Runtime's existing cancel_pipe (created at
+    // runtime.zig:222). Threaded through to submitKeyEntry →
+    // validateViaApi so a Ctrl+C during in-flight TLS handshake aborts
+    // within ≤100ms (REQ-NEW-006). Tests / no-TTY paths pass null.
+    cancel_pipe: ?[2]i32,
 ) !void {
     const modal = @import("modal.zig");
     const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
@@ -544,7 +550,7 @@ pub fn tuiThreadLoop(
                     channels.tui_to_agent.tryPut(io, .{ .Shutdown = {} }) catch {};
                     return;
                 }
-                const consumed = handleKeyInput(io, alloc, state, k) catch continue;
+                const consumed = handleKeyInput(io, alloc, state, k, cancel_pipe) catch continue;
                 if (consumed) {
                     lifecycle.redraw_pending.store(true, .seq_cst);
                 } else {
@@ -587,6 +593,7 @@ pub fn handleKeyInput(
     alloc: std.mem.Allocator,
     state: *@import("modal.zig").State,
     k: mibu.events.Key,
+    cancel_pipe: ?[2]i32,
 ) !bool {
     if (k.event == .release) return false; // REQ-TIW-008 — kitty-kb release no-op
     switch (state.*) {
@@ -604,7 +611,7 @@ pub fn handleKeyInput(
                 return true;
             },
             .enter => {
-                try @import("modal.zig").submitKeyEntry(io, alloc, state); // REQ-TIW-006
+                try @import("modal.zig").submitKeyEntry(io, alloc, state, cancel_pipe); // REQ-TIW-006
                 return true;
             },
             .esc => return false, // REQ-TIW-007 + REQ-TIW-NEG-3 — v1 no-op
