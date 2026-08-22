@@ -186,6 +186,25 @@ pub fn build(b: *std.Build) void {
     runtime_thread_test_decl.dependOn(&run_runtime_thread_test.step);
     test_decl.dependOn(&run_runtime_thread_test.step);
 
+    // test step: tests/api_client.zig (Opción B WU-3, T3.4). Static-grep
+    // guards verifying the stdlib rewrite (tryOneAttempt TLS branch uses
+    // stdlib, validateViaApiWithTarget routes through bridge_sync_async,
+    // tls_conn.connect signature matches the bridge's expected fn shape).
+    const api_client_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/api_client.zig"),
+        .imports = &.{
+            .{ .name = "api_auth", .module = lib_mod },
+            .{ .name = "api_client", .module = lib_mod },
+        },
+    });
+    const api_client_test_step = b.addTest(.{ .root_module = api_client_test_mod });
+    const run_api_client_test = b.addRunArtifact(api_client_test_step);
+    const api_client_test_decl = b.step("test-api-client", "Run tests/api_client.zig (Opción B WU-3 T3.4 static-grep guards)");
+    api_client_test_decl.dependOn(&run_api_client_test.step);
+    test_decl.dependOn(&run_api_client_test.step);
+
     // test step: tools/debug_call.zig in-file grep-fail tests.
     // tls-handrolled (sdd id=323, T3.5): the in-file tests in
     // tools/debug_call.zig MUST be wired into a separate test step so
@@ -229,6 +248,30 @@ pub fn build(b: *std.Build) void {
     });
     const check_step = b.step("check", "QA 0: zig fmt --check --ast-check (src/, tests/, tools/)");
     check_step.dependOn(&fmt_check.step);
+
+    // =========================================================================
+    // QA 0.5 — Forbidden-syscall grep step (Opción B REQ-NEW-003 / T3.3).
+    //   Scans src/*.zig for std.os.linux.{socket,connect,bind,listen} outside
+    //   src/mock_server.zig (always allowed — never touch per design). Lines
+    //   with `// allowed: std.os.linux.<name>` markers are exempted (mirrors
+    //   the `no automatic key sources` pattern at api_auth.zig:657). Test-only
+    //   raw socket use in src/fixtures_test.zig is also exempted — production
+    //   code paths MUST use std.Io.net.Stream + std.http.Client.
+    // =========================================================================
+    const forbidden_syscall_check = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\matches=$(grep -rn 'std\.os\.linux\.\(socket\|connect\|bind\|listen\)' src/ --include='*.zig' --exclude='mock_server.zig' --exclude='fixtures_test.zig' 2>/dev/null | grep -v '// allowed:')
+        \\if [ -n "$matches" ]; then
+        \\    echo "$matches"
+        \\    echo ""
+        \\    echo "FORBIDDEN: std.os.linux.{socket,connect,bind,listen} found outside mock_server.zig (Opción B REQ-NEW-003)."
+        \\    echo "Production code MUST use std.Io.net.Stream + std.http.Client.connectTcp."
+        \\    echo "If the use is intentional (mock-server 127.0.0.1 compat), add '// allowed: std.os.linux.<name>' marker on the line."
+        \\    exit 1
+        \\fi
+    });
+    const check_syscalls_step = b.step("check-forbidden-syscalls", "QA 0.5: forbid std.os.linux.{socket,connect,bind,listen} outside mock_server.zig (REQ-NEW-003)");
+    check_syscalls_step.dependOn(&forbidden_syscall_check.step);
 
     // =========================================================================
     // QA composite step: `zig build verify`
@@ -303,6 +346,7 @@ pub fn build(b: *std.Build) void {
             "Adds QA 7 helgrind only if you pass `-Dqa-helgrind=true` (toolchain-dependent: valgrind 3.22.0 on ubuntu-latest CI cannot decode the LTO ReleaseFast binary — `zig build verify` runs QA 0..6 only on CI).",
     );
     verify_step.dependOn(check_step);
+    verify_step.dependOn(check_syscalls_step);
     verify_step.dependOn(&zig_build_debug.step);
     verify_step.dependOn(test_decl);
     verify_step.dependOn(&zig_build_release_safe.step);

@@ -568,7 +568,7 @@ fn tryOneAttempt(io: std.Io, req: Request, cancel_pipe: [2]i32, allocator: std.m
     //    fast path so mock-mode Client.stream tests stay green; hostname
     //    targets fall back to error.ConnectionRefused (DNS resolver is WU-3
     //    territory — design obs#1369).
-    const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+    const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0); // allowed: std.os.linux.socket (REQ-NEW-008)
     if (sock_rc < 0) return error.SocketFailed;
     const fd: i32 = @intCast(sock_rc);
 
@@ -582,7 +582,7 @@ fn tryOneAttempt(io: std.Io, req: Request, cancel_pipe: [2]i32, allocator: std.m
         .addr = parsed_ip,
         .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
-    const connect_rc = std.os.linux.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+    const connect_rc = std.os.linux.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))); // allowed: std.os.linux.connect — mock-server 127.0.0.1 compat (REQ-NEW-008)
     if (connect_rc != 0) {
         _ = std.os.linux.close(fd);
         return error.ConnectionRefused;
@@ -978,6 +978,40 @@ fn testRequest(port: u16, retry_base_ms: u32) Request {
         .target_port = port,
         .retry_base_ms = retry_base_ms,
     };
+}
+
+/// CI gate for tests that perform a real TLS handshake against api.minimax.io.
+/// Returns true iff the system CA bundle is reachable AND
+/// `ZARGEANT_RUN_TLS_HANDSHAKE=1` is set in the process environment.
+/// Otherwise the test exits early without asserting anything (the test runner
+/// counts it as PASS). Replaces ~25 lines of duplicated env-var + access()
+/// boilerplate per call site (Opción B WU-3 T3.6 fixture cleanup).
+fn tlsHandshakeGate() bool {
+    var resolv_z: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const ca_path = "/etc/ssl/certs/ca-certificates.crt";
+    @memcpy(resolv_z[0..ca_path.len], ca_path.ptr);
+    resolv_z[ca_path.len] = 0;
+    if (std.os.linux.access(resolv_z[0..ca_path.len :0].ptr, 0) != 0) return false;
+
+    const env_fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return false;
+    defer _ = std.os.linux.close(env_fd);
+    var env_buf: [4096]u8 = undefined;
+    var env_total: usize = 0;
+    while (env_total < env_buf.len) {
+        const n: isize = @bitCast(std.os.linux.read(env_fd, env_buf[env_total..].ptr, env_buf.len - env_total));
+        if (n <= 0) break;
+        env_total += @intCast(n);
+    }
+    var idx: usize = 0;
+    while (idx < env_total) {
+        const slice = env_buf[idx..env_total];
+        const rel_end = std.mem.indexOfScalar(u8, slice, 0);
+        const end = if (rel_end) |r| idx + r else env_total;
+        const entry = env_buf[idx..end];
+        if (std.mem.startsWith(u8, entry, "ZARGEANT_RUN_TLS_HANDSHAKE=1")) return true;
+        idx = end + 1;
+    }
+    return false;
 }
 
 // T3.4 — 401 status code MUST NOT retry. The function returns
@@ -1807,38 +1841,10 @@ pub const tls_conn = struct {
 // asserts the handshake completes (success or known ConnectFailed for
 // offline environments). Gated on env var `ZARGEANT_RUN_TLS_HANDSHAKE=1`
 // to keep CI fast and avoid flakes when the test machine is offline.
+//
+// Opción B WU-3 (T3.6): uses tlsHandshakeGate() helper — saves ~22 LoC.
 test "TLS handshake vs api.minimax.io:443 succeeds" {
-    var resolv_z: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const ca_path = "/etc/ssl/certs/ca-certificates.crt";
-    @memcpy(resolv_z[0..ca_path.len], ca_path.ptr);
-    resolv_z[ca_path.len] = 0;
-    const ca_exists = std.os.linux.access(resolv_z[0..ca_path.len :0].ptr, 0) == 0;
-    if (!ca_exists) return;
-
-    // CI gate: only run the full handshake when explicitly enabled.
-    const env_fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return;
-    defer _ = std.os.linux.close(env_fd);
-    var env_buf: [4096]u8 = undefined;
-    var env_total: usize = 0;
-    while (env_total < env_buf.len) {
-        const n: isize = @bitCast(std.os.linux.read(env_fd, env_buf[env_total..].ptr, env_buf.len - env_total));
-        if (n <= 0) break;
-        env_total += @intCast(n);
-    }
-    var idx: usize = 0;
-    var enabled = false;
-    while (idx < env_total) {
-        const slice = env_buf[idx..env_total];
-        const rel_end = std.mem.indexOfScalar(u8, slice, 0);
-        const end = if (rel_end) |r| idx + r else env_total;
-        const entry = env_buf[idx..end];
-        if (std.mem.startsWith(u8, entry, "ZARGEANT_RUN_TLS_HANDSHAKE=1")) {
-            enabled = true;
-            break;
-        }
-        idx = end + 1;
-    }
-    if (!enabled) return;
+    if (!tlsHandshakeGate()) return;
 
     // Real TLS handshake via stdlib. We accept either:
     //   - tls_conn returns a valid connection (handshake succeeded)
@@ -1886,38 +1892,10 @@ test "TLS ClientHello includes SNI servername api.minimax.io" {
 // T1.5 — Cancel before/during handshake. Pre-cancel path: write to
 // cancel_pipe[1] before invoking connect → asserts error.Cancelled.
 // Same CI gating as T1.2: only runs when ZARGEANT_RUN_TLS_HANDSHAKE=1.
+//
+// Opción B WU-3 (T3.6): uses tlsHandshakeGate() helper — saves ~22 LoC.
 test "TLS handshake honors cancel via cancel_pipe" {
-    var resolv_z: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const ca_path = "/etc/ssl/certs/ca-certificates.crt";
-    @memcpy(resolv_z[0..ca_path.len], ca_path.ptr);
-    resolv_z[ca_path.len] = 0;
-    const ca_exists = std.os.linux.access(resolv_z[0..ca_path.len :0].ptr, 0) == 0;
-    if (!ca_exists) return;
-
-    // CI gate.
-    const env_fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return;
-    defer _ = std.os.linux.close(env_fd);
-    var env_buf: [4096]u8 = undefined;
-    var env_total: usize = 0;
-    while (env_total < env_buf.len) {
-        const n: isize = @bitCast(std.os.linux.read(env_fd, env_buf[env_total..].ptr, env_buf.len - env_total));
-        if (n <= 0) break;
-        env_total += @intCast(n);
-    }
-    var idx: usize = 0;
-    var enabled = false;
-    while (idx < env_total) {
-        const slice = env_buf[idx..env_total];
-        const rel_end = std.mem.indexOfScalar(u8, slice, 0);
-        const end = if (rel_end) |r| idx + r else env_total;
-        const entry = env_buf[idx..end];
-        if (std.mem.startsWith(u8, entry, "ZARGEANT_RUN_TLS_HANDSHAKE=1")) {
-            enabled = true;
-            break;
-        }
-        idx = end + 1;
-    }
-    if (!enabled) return;
+    if (!tlsHandshakeGate()) return;
 
     // Opción B WU-1 (T1.3): dns_resolve deleted; cancel test exits here
     // until WU-3 lands the stdlib connect path.
@@ -1928,38 +1906,10 @@ test "TLS handshake honors cancel via cancel_pipe" {
 // ZARGEANT_RUN_TLS_HANDSHAKE=1 (same as T1.2/T1.5). The test opens a
 // real socket to api.minimax.io:443 and asserts that the handshake
 // returns within the 5s timeout window.
+//
+// Opción B WU-3 (T3.6): uses tlsHandshakeGate() helper — saves ~22 LoC.
 test "TLS handshake timeout after HANDSHAKE_TIMEOUT_MS" {
-    var resolv_z: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const ca_path = "/etc/ssl/certs/ca-certificates.crt";
-    @memcpy(resolv_z[0..ca_path.len], ca_path.ptr);
-    resolv_z[ca_path.len] = 0;
-    const ca_exists = std.os.linux.access(resolv_z[0..ca_path.len :0].ptr, 0) == 0;
-    if (!ca_exists) return;
-
-    // CI gate.
-    const env_fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0) catch return;
-    defer _ = std.os.linux.close(env_fd);
-    var env_buf: [4096]u8 = undefined;
-    var env_total: usize = 0;
-    while (env_total < env_buf.len) {
-        const n: isize = @bitCast(std.os.linux.read(env_fd, env_buf[env_total..].ptr, env_buf.len - env_total));
-        if (n <= 0) break;
-        env_total += @intCast(n);
-    }
-    var idx: usize = 0;
-    var enabled = false;
-    while (idx < env_total) {
-        const slice = env_buf[idx..env_total];
-        const rel_end = std.mem.indexOfScalar(u8, slice, 0);
-        const end = if (rel_end) |r| idx + r else env_total;
-        const entry = env_buf[idx..end];
-        if (std.mem.startsWith(u8, entry, "ZARGEANT_RUN_TLS_HANDSHAKE=1")) {
-            enabled = true;
-            break;
-        }
-        idx = end + 1;
-    }
-    if (!enabled) return;
+    if (!tlsHandshakeGate()) return;
 
     // Opción B WU-1 (T1.3): dns_resolve deleted; timeout test exits here
     // until WU-3 lands the stdlib connect path.
