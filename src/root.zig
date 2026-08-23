@@ -32,6 +32,10 @@ pub const tui = @import("tui.zig");
 pub const main_mod = @import("main.zig");
 pub const password_input = @import("password_input.zig");
 pub const modal = @import("modal.zig");
+// tui-input-bugfixes-1: SIGINT bridge to cancel-pipe writer. Re-exported
+// at root so build.zig's lib_mod wiring (`src/root.zig` is the test
+// root) pulls in the cancel_signal module's in-file tests.
+pub const cancel_signal = @import("cancel_signal.zig");
 
 // R-PR 2 replaces the R-PR 0 build-toolchain placeholder main with the
 // real entry from src/main.zig. The exe is built with root.zig as the
@@ -75,6 +79,10 @@ comptime {
     _ = password_input.read;
     _ = password_input.State;
     _ = modal.WindowMock;
+    // tui-input-bugfixes-1: pull cancel_signal symbols so its tests run.
+    _ = cancel_signal.installSigintHandler;
+    _ = cancel_signal.clobber_window_active;
+    _ = cancel_signal.resetForTest;
 }
 
 // Re-export logger public API at the root namespace so that downstream
@@ -123,4 +131,6 @@ test "root.zig re-exports are wired" {
     try std.testing.expect(main == main_mod.main);
     // tui-recovery R-PR 3 re-export: modal.
     try std.testing.expect(modal == @import("modal.zig"));
+    // tui-input-bugfixes-1: cancel_signal re-export wired.
+    try std.testing.expect(cancel_signal == @import("cancel_signal.zig"));
 }
