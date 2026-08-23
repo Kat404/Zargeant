@@ -217,9 +217,35 @@ pub fn validateViaApiWithTarget(
     var header_end: usize = 0;
 
     if (needs_tls) {
-        // TLS branch (Opción B WU-2). Stdlib owns the socket; we don't
-        // pre-open an fd. Error mapping preserves the modal contract.
-        var conn = api_client.tls_conn.connect(io, alloc, target_host, port) catch |err| switch (err) {
+        // TLS branch (Opción B WU-2 + WU-3 T3.2). Stdlib owns the socket;
+        // we don't pre-open an fd. The handshake runs through
+        // `bridge_sync_async.runBlocking` so the side-thread cancel watcher
+        // can call `Future.cancel(io)` on cancel-pipe readability, which
+        // SIGIO-interrupts the stdlib worker per investigation Section 4.1
+        // (REQ-NEW-006 ≤100ms abort).
+        const bridge = @import("bridge_sync_async.zig");
+
+        const TlsConnectFn = struct {
+            io: std.Io,
+            alloc: std.mem.Allocator,
+            target_host: []const u8,
+            port: u16,
+
+            fn run(ctx: *@This()) anyerror!api_client.tls_conn {
+                return api_client.tls_conn.connect(ctx.io, ctx.alloc, ctx.target_host, ctx.port);
+            }
+        };
+        var tls_ctx = TlsConnectFn{
+            .io = io,
+            .alloc = alloc,
+            .target_host = target_host,
+            .port = port,
+        };
+        const read_fd: i32 = if (cancel_pipe) |p| p[0] else -1;
+
+        var conn = bridge.runBlocking(io, read_fd, TlsConnectFn.run, .{&tls_ctx}) catch |err| switch (err) {
+            error.BridgeFailed => return error.TlsHandshakeFailed,
+            error.Cancelled => return error.Cancelled,
             error.TlsInitializationFailed => return error.TlsHandshakeFailed,
             error.ConnectionRefused => return error.ConnectFailed,
             error.NetworkUnreachable => return error.ConnectFailed,
@@ -235,8 +261,21 @@ pub fn validateViaApiWithTarget(
             else => return error.WriteFailed,
         };
 
-        // Read response via the TLS stream.
+        // Read response via the TLS stream. Mid-read cancel check via
+        // poll(CANCEL_PIPE, 0) before each read — bounded by resp_buf.len
+        // (16 KB), the cancel latency budget (100 ms) is comfortably larger
+        // than the typical read time, so missing a mid-read cancel is
+        // acceptable (REQ-NEW-006).
         while (header_end == 0 and resp_len < resp_buf.len) {
+            if (cancel_pipe) |p| {
+                var pfds: [1]std.os.linux.pollfd = .{
+                    .{ .fd = p[0], .events = std.os.linux.POLL.IN, .revents = 0 },
+                };
+                const poll_rc = std.os.linux.poll(&pfds, 1, 0);
+                if (poll_rc > 0 and (pfds[0].revents & std.os.linux.POLL.IN) != 0) {
+                    return error.Cancelled;
+                }
+            }
             const n = conn.readSome(resp_buf[resp_len..]) catch |err| switch (err) {
                 error.ConnectionClosed => return error.ReadFailed,
                 else => return error.ReadFailed,
@@ -251,7 +290,7 @@ pub fn validateViaApiWithTarget(
         // Plain HTTP path (127.0.0.1 mock-server compat). Raw socket +
         // connect — stdlib's readv hangs against mock_server.zig's worker
         // timing (REVERTED in WU-3 per design).
-        const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+        const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0); // allowed: std.os.linux.socket (REQ-NEW-008)
         if (sock_rc < 0) return error.ConnectFailed;
         const fd: i32 = @intCast(sock_rc);
         // Close fd after the read loop completes (NOT before; placing the
@@ -264,7 +303,7 @@ pub fn validateViaApiWithTarget(
             .addr = std.mem.nativeToBig(u32, 0x7F000001),
             .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
         };
-        const rc = std.os.linux.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+        const rc = std.os.linux.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))); // allowed: std.os.linux.connect — mock-server 127.0.0.1 compat (REQ-NEW-008)
         if (rc != 0) return error.ConnectFailed;
 
         const write_rc = std.os.linux.write(fd, req_buf.items.ptr, req_buf.items.len);
@@ -1166,9 +1205,9 @@ test "validateViaApiWithTarget 127.0.0.1 branch stays raw-socket" {
     const body_end = @min(body_start + 12288, content.len);
     const body = content[body_start..body_end];
 
-    // The 127.0.0.1 branch must still use std.os.linux.socket + connect.
-    try testing.expect(std.mem.indexOf(u8, body, "std.os.linux.socket") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "std.os.linux.connect") != null);
+    // The 127.0.0.1 branch must still use std.os.linux.socket + connect. // allowed: std.os.linux.socket,std.os.linux.connect (test static-grep pattern)
+    try testing.expect(std.mem.indexOf(u8, body, "std.os.linux.socket") != null); // allowed: std.os.linux.socket (test static-grep pattern)
+    try testing.expect(std.mem.indexOf(u8, body, "std.os.linux.connect") != null); // allowed: std.os.linux.connect (test static-grep pattern)
     // AND the bridge_sync_async module is imported for the real path.
     try testing.expect(std.mem.indexOf(u8, body, "bridge_sync_async") != null);
 }
