@@ -227,6 +227,29 @@ pub fn build(b: *std.Build) void {
     tools_test_decl.dependOn(&run_tools_test.step);
     test_decl.dependOn(&run_tools_test.step);
 
+    // test step: tests/cancel_e2e.zig (tui-input-bugfixes-1 WU-D,
+    // REQ-BUGFIX1-002/006). Static-grep guard for handler-install order
+    // in main.zig + env-gated end-to-end cancel test (skipped unless
+    // ZARGEANT_RUN_TUI_CANCEL_E2E=1). Wired as a separate artifact so
+    // the gated e2e test does not block fast CI.
+    const cancel_e2e_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/cancel_e2e.zig"),
+        .imports = &.{
+            .{ .name = "api_auth", .module = lib_mod },
+            .{ .name = "mock_server", .module = lib_mod },
+        },
+    });
+    const cancel_e2e_test_step = b.addTest(.{ .root_module = cancel_e2e_test_mod });
+    const run_cancel_e2e_test = b.addRunArtifact(cancel_e2e_test_step);
+    const cancel_e2e_test_decl = b.step(
+        "test-cancel-e2e",
+        "Run tests/cancel_e2e.zig (tui-input-bugfixes-1 WU-D, env-gated e2e)",
+    );
+    cancel_e2e_test_decl.dependOn(&run_cancel_e2e_test.step);
+    test_decl.dependOn(&run_cancel_e2e_test.step);
+
     // =========================================================================
     // QA 0 — Static checks: `zig build check`
     //   - `zig fmt --check` for formatting (recursive on src/, tests/, tools/)

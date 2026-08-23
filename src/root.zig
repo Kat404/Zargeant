@@ -83,6 +83,10 @@ comptime {
     _ = cancel_signal.installSigintHandler;
     _ = cancel_signal.clobber_window_active;
     _ = cancel_signal.resetForTest;
+    // tui-input-bugfixes-1 WU-D: pull mock_server Config + startWithConfig
+    // so tests/cancel_e2e.zig can route through lib_mod.
+    _ = mock_server.startWithConfig;
+    _ = mock_server.Config;
 }
 
 // Re-export logger public API at the root namespace so that downstream
@@ -101,11 +105,25 @@ pub const global = logger.global;
 // expects `validateFormat` / `validateViaApi` to resolve.
 pub const validateFormat = api_auth.validateFormat;
 pub const validateViaApi = api_auth.validateViaApi;
+// tui-input-bugfixes-1 WU-D: validateViaApiWithTarget is the variant
+// that takes a target host/port (used by tests/cancel_e2e.zig to drive
+// the cancel path against the mock server). Re-exported here so the
+// test module can call it through lib_mod's `api_auth` alias.
+pub const validateViaApiWithTarget = api_auth.validateViaApiWithTarget;
 
 // Re-export the api_client API surface at the root namespace.
 pub const Client = api_client.Client;
 pub const Request = api_client.Request;
 pub const tls_conn = api_client.tls_conn;
+
+// tui-input-bugfixes-1 WU-D: re-export mock_server Config + startWithConfig
+// at the root namespace so tests/cancel_e2e.zig (which routes through
+// lib_mod → root.zig via build.zig's `mock_server = lib_mod` alias) can
+// drive the new Config-aware overload. Without these aliases, the
+// comptime touches above would be unreachable from sibling test modules.
+pub const startWithConfig = mock_server.startWithConfig;
+pub const MockServerConfig = mock_server.Config;
+pub const MockServerPort = mock_server.port;
 
 test "root.zig re-exports are wired" {
     // The re-export module is verified at compile time via the comptime
@@ -133,4 +151,10 @@ test "root.zig re-exports are wired" {
     try std.testing.expect(modal == @import("modal.zig"));
     // tui-input-bugfixes-1: cancel_signal re-export wired.
     try std.testing.expect(cancel_signal == @import("cancel_signal.zig"));
+    // tui-input-bugfixes-1 WU-D: mock_server Config + startWithConfig
+    // re-exports resolve through lib_mod → tests/cancel_e2e.zig.
+    try std.testing.expect(@TypeOf(mock_server.startWithConfig) ==
+        @TypeOf(@import("mock_server.zig").startWithConfig));
+    try std.testing.expect(@TypeOf(mock_server.Config) ==
+        @TypeOf(@import("mock_server.zig").Config));
 }
