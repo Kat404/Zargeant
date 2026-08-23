@@ -38,6 +38,12 @@ pub const Handle = struct {
     /// Spinlock protecting threads + fixtures. Test-grade: ok for low-contention
     /// fixtures appends, no syscall blocking.
     lock_state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// tui-input-bugfixes-1 (REQ-BUGFIX1-006 / D6): optional handshake
+    /// delay in milliseconds. When > 0, the worker thread sleeps for
+    /// this long before reading the request and serving bytes, allowing
+    /// tests to drive Ctrl+C during a simulated handshake. Default 0 =
+    /// no delay (preserves existing 96/96 api-client regression suite).
+    cancel_delay_ms: u32 = 0,
 
     fn lock(self: *Handle) void {
         while (self.lock_state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
@@ -133,6 +139,70 @@ pub fn start(allocator: std.mem.Allocator) !*Handle {
         .port = assigned_port,
         .acceptor = null,
         .allocator = allocator,
+    };
+
+    // Spawn the acceptor thread.
+    const acceptor = try std.Thread.spawn(.{}, acceptorLoop, .{handle});
+    handle.acceptor = acceptor;
+
+    return handle;
+}
+
+// =============================================================================
+// tui-input-bugfixes-1 (REQ-BUGFIX1-006 / D6): Config-aware overload of
+// `start` that lets tests inject a deterministic handshake delay. The
+// existing `start(allocator)` overload (above, lines 104-149) is preserved
+// unchanged for back-compat with the 96/96 api-client regression suite.
+// =============================================================================
+
+/// Configurable knobs for `start(allocator, config)`. Every field defaults
+/// to the historical behavior so callers passing `.{}` get exactly the
+/// same wire output as the legacy `start(allocator)` overload.
+pub const Config = struct {
+    /// Optional handshake delay in milliseconds. When > 0, each worker
+    /// thread sleeps for this long BEFORE pulling a fixture from the
+    /// queue, blocking the connection long enough for tests to drive
+    /// Ctrl+C during a simulated handshake. Default 0 = no delay.
+    cancel_delay_ms: u32 = 0,
+};
+
+/// Bind to `127.0.0.1:0` (kernel-assigned ephemeral port), start the
+/// acceptor thread with the given Config. The body intentionally mirrors
+/// the legacy `start(allocator)` overload — these two entry points must
+/// produce identical wire output when Config fields are at their defaults.
+pub fn startWithConfig(allocator: std.mem.Allocator, config: Config) !*Handle {
+    const sock = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+    if (sock < 0) return error.SocketFailed;
+    const fd: i32 = @intCast(sock);
+
+    // Bind to 127.0.0.1:0. The `addr` field must be in network byte order.
+    var addr: std.os.linux.sockaddr.in = .{
+        .family = std.os.linux.AF.INET,
+        .port = std.mem.nativeToBig(u16, 0),
+        .addr = std.mem.nativeToBig(u32, 0x7F000001),
+        .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    const bind_rc: isize = @bitCast(std.os.linux.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))));
+    if (bind_rc < 0) return error.BindFailed;
+
+    // Listen.
+    const listen_rc: isize = @bitCast(std.os.linux.listen(fd, 8));
+    if (listen_rc < 0) return error.ListenFailed;
+
+    // Read the assigned port.
+    var sockname: std.os.linux.sockaddr.in = undefined;
+    var sockname_len: std.os.linux.socklen_t = @sizeOf(@TypeOf(sockname));
+    const getsockname_rc: isize = @bitCast(std.os.linux.getsockname(fd, @ptrCast(&sockname), &sockname_len));
+    if (getsockname_rc < 0) return error.GetsocknameFailed;
+    const assigned_port = std.mem.bigToNative(u16, sockname.port);
+
+    const handle = try allocator.create(Handle);
+    handle.* = .{
+        .listen_fd = fd,
+        .port = assigned_port,
+        .acceptor = null,
+        .allocator = allocator,
+        .cancel_delay_ms = config.cancel_delay_ms,
     };
 
     // Spawn the acceptor thread.
@@ -243,6 +313,24 @@ fn acceptorLoop(handle: *Handle) void {
 
 fn workerLoop(handle: *Handle, conn_fd: i32) void {
     defer _ = std.os.linux.close(conn_fd);
+
+    // tui-input-bugfixes-1 (REQ-BUGFIX1-006 / D6): if the handle was
+    // constructed with a non-zero cancel_delay_ms, sleep BEFORE pulling
+    // the fixture. This blocks the worker's accept loop for tests/cancel_e2e.zig
+    // to drive Ctrl+C during a simulated handshake. The sleep uses
+    // nanosleep directly (best-effort, no EINTR retry needed: the SIGINT
+    // handler only writes to a pipe — it does not interrupt this worker).
+    // ponytail: best-effort single-shot sleep. The test asserts cancel
+    // latency < 100 ms (well below the 5000 ms delay), so nanosleep
+    // jitter is irrelevant — if cancel fires, the test passes long
+    // before this sleep returns.
+    if (handle.cancel_delay_ms > 0) {
+        var ts = std.os.linux.timespec{
+            .sec = @intCast(@divFloor(handle.cancel_delay_ms, 1000)),
+            .nsec = @intCast((handle.cancel_delay_ms % 1000) * std.time.ns_per_ms),
+        };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
 
     // Pop the next fixture from the queue.
     handle.lock();
