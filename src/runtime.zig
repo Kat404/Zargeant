@@ -375,6 +375,14 @@ fn tuiRealMain(args: *const ThreadArgs) void {
             @import("modal.zig").Cell,
             n,
         ) catch null;
+        // REQ-BUGFIX1-004: zero-init the prev_snapshot buffer. Without
+        // this, alloc returns undefined memory and the first frame's diff
+        // compares against garbage, triggering a full-frame emit of
+        // ~38 KB that stalls slow terminals for ~2 s on the first 2
+        // keystrokes (see explore obs#1378 §Bug 3).
+        if (lc.prev_snapshot != null) {
+            @memset(lc.prev_snapshot.?, .{ .ch = ' ', .style = .{} });
+        }
     }
 
     // Stage 2: per-frame loop. Real TTY: tuiThreadLoop brackets renders
