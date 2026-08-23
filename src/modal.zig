@@ -344,7 +344,14 @@ pub fn drawKeyEntry(win: *WindowMock, state: *State) !void {
         }
     }
     if (payload.err_msg) |msg| {
-        try win.print(msg, .{ .bold = true });
+        // zargeant/tui-display-err: write err_msg to row 2 (cells[win.cols..])
+        // instead of win.print(msg, ...) which starts at cells[0] and
+        // overwrites the prompt. Mirrors drawAgentLoopView's row-tracking.
+        for (msg, 0..) |c, i| {
+            const idx = win.cols + i;
+            if (idx >= win.cells.len) break;
+            win.cells[idx] = .{ .ch = c, .style = .{ .bold = true } };
+        }
     }
 }
 
@@ -354,7 +361,7 @@ pub fn drawKeyEntry(win: *WindowMock, state: *State) !void {
 /// On format fail: redisplay (state stays `.key_entry`, err_msg set).
 /// On API validation fail: redisplay (state stays `.key_entry`, err_msg set).
 /// On API success: advance to `.consent_prompt` (REQ-TUI-006 scenario 2).
-pub fn submitKeyEntry(io: std.Io, alloc: std.mem.Allocator, state: *State) !void {
+pub fn submitKeyEntry(io: std.Io, alloc: std.mem.Allocator, state: *State, cancel_pipe: ?[2]i32) !void {
     const payload = &state.key_entry;
     const draft = payload.draft[0..payload.draft_len];
 
@@ -371,7 +378,7 @@ pub fn submitKeyEntry(io: std.Io, alloc: std.mem.Allocator, state: *State) !void
     }
 
     // API validation (REQ-TUI-006 scenarios 2 + 3).
-    api_auth.validateViaApi(io, alloc, draft) catch |err| {
+    api_auth.validateViaApi(io, alloc, draft, cancel_pipe) catch |err| {
         // Map every error to "key rejected" so the user can re-type. The
         // error message is logged via the api_auth module's own logger.
         var buf: [64]u8 = undefined;
@@ -418,7 +425,14 @@ pub fn drawUnlock(win: *WindowMock, state: *State) !void {
         }
     }
     if (payload.err_msg) |msg| {
-        try win.print(msg, .{ .bold = true });
+        // zargeant/tui-display-err: write err_msg to row 2 (cells[win.cols..])
+        // instead of win.print(msg, ...) which starts at cells[0] and
+        // overwrites the prompt. Mirrors drawAgentLoopView's row-tracking.
+        for (msg, 0..) |c, i| {
+            const idx = win.cols + i;
+            if (idx >= win.cells.len) break;
+            win.cells[idx] = .{ .ch = c, .style = .{ .bold = true } };
+        }
     }
 }
 
@@ -866,7 +880,7 @@ test "KeyEntry rejects malformed format (redisplay)" {
     defer win.deinit();
     try drawKeyEntry(win, &state);
     // Submit handler transitions back to key_entry with err_msg set.
-    submitKeyEntry(testing.io, testing.allocator, &state) catch {};
+    submitKeyEntry(testing.io, testing.allocator, &state, null) catch {};
     try testing.expect(std.meta.activeTag(state) == .key_entry);
     try testing.expect(state.key_entry.err_msg != null);
     try testing.expectEqualStrings("Invalid key format", state.key_entry.err_msg.?);

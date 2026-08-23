@@ -91,8 +91,14 @@ pub fn main() !void {
     }
 
     // Probe the API.
-    api_auth.validateViaApi(io, alloc, key) catch |err| {
+    api_auth.validateViaApi(io, alloc, key, null) catch |err| {
         logger.global().log(io, .err, "debug_call: validate_failed") catch {};
+        // zargeant/tls-diag: surface the actual Zig error name to stderr
+        // so the user (and CI) can distinguish ConnectFailed /
+        // TlsHandshakeFailed / CaBundleNotFound / HandshakeTimeout
+        // without parsing the log file. std.debug.print returns void —
+        // no error union to catch (it panics on broken stderr).
+        std.debug.print("debug_call: validateViaApi error: {s}\n", .{@errorName(err)});
         switch (err) {
             error.Unauthorized => std.process.exit(2),
             error.ConnectFailed, error.TlsHandshakeFailed => std.process.exit(3),

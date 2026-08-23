@@ -389,6 +389,8 @@ fn tuiRealMain(args: *const ThreadArgs) void {
                 args.channels,
                 &modal_state,
                 args.allocator,
+                args.shutdown, // zargeant/tui-cancel — Ctrl+C path
+                args.cancel_pipe, // Opción B WU-1 (T1.6) — cancel bridge
             ) catch break;
         }
     }

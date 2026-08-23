@@ -88,6 +88,7 @@ test "cumulative-delta regression end-to-end via mock server" {
     try mock_server.sendBytes(h, fixture_content);
 
     // Connect to the server.
+    // allowed: std.os.linux.socket — test-only loopback connection (fixtures_test.zig excluded from production grep)
     const sock = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM, 0);
     const fd: i32 = @intCast(sock);
     try testing.expect(fd >= 0);
@@ -99,7 +100,7 @@ test "cumulative-delta regression end-to-end via mock server" {
         .addr = std.mem.nativeToBig(u32, 0x7F000001),
         .zero = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
     };
-    const connect_rc = std.os.linux.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+    const connect_rc = std.os.linux.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))); // allowed: std.os.linux.connect — test-only loopback
     try testing.expectEqual(@as(usize, 0), connect_rc);
 
     // Read all fixture bytes from the socket.
