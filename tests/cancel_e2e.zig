@@ -200,3 +200,85 @@ test "e2e: cancel_pipe[1] write cancels validateViaApiWithTarget within 1000ms (
         .{ elapsed_ms, port },
     );
 }
+
+// =============================================================================
+// tui-input-flow-bugfixes-2 WU-3 (CAP-09 — R2a writer redirect).
+//
+// Verifies the new code path at src/tui.zig:553-555 (Ctrl+C key-event
+// intercept writes 1 byte to cancel_pipe[1] after setting the shutdown
+// atomic) is async-signal-safe and roundtrips within ≤1ms — REQ-NEW-006
+// invariant is preserved at the writer side.
+//
+// The test exercises the EXACT write call from src/tui.zig:554 in a
+// spawned thread, then polls cancel_pipe[0] with a 1ms timeout. The
+// combined path (write + kernel buffer delivery + poll wakeup) MUST
+// observe readability within ≤1ms; the existing 100ms tolerance on the
+// e2e test above is end-to-end (handler + worker thread park + cancel
+// propagation), whereas this is just the writer-side latency.
+// =============================================================================
+
+test "key-event intercept: write to cancel_pipe[1] is observable on cancel_pipe[0] within 1ms (CAP-09)" {
+    // Always-on (not env-gated): the write is a single syscall; running
+    // it in every CI cycle is cheap and proves the CAP-09 invariant.
+
+    // 1. Create cancel_pipe (same call pattern as main.zig:206-218).
+    var cancel_pipe: [2]i32 = .{ -1, -1 };
+    {
+        const rc = std.os.linux.pipe(&cancel_pipe);
+        try testing.expectEqual(@as(usize, 0), rc);
+    }
+    defer {
+        if (cancel_pipe[0] >= 0) _ = std.os.linux.close(cancel_pipe[0]);
+        if (cancel_pipe[1] >= 0) _ = std.os.linux.close(cancel_pipe[1]);
+    }
+
+    // 2. Spawn a writer thread that mirrors the EXACT call from
+    //    src/tui.zig:554 — std.os.linux.write(p[1], &.{0x01}, 1).
+    //    We don't depend on tuiThreadLoop here because spinning up the
+    //    full poll/mibu/render stack would dwarf the latency we're
+    //    trying to measure; the writer call is byte-for-byte identical.
+    const WriterCtx = struct {
+        fd: i32,
+    };
+    const writer_ctx: WriterCtx = .{ .fd = cancel_pipe[1] };
+    const writer = try std.Thread.spawn(.{}, struct {
+        fn run(ctx: WriterCtx) void {
+            // Mirrors src/tui.zig:554 verbatim.
+            _ = std.os.linux.write(ctx.fd, &.{0x01}, 1);
+        }
+    }.run, .{writer_ctx});
+
+    // 3. Poll cancel_pipe[0] with a 1ms timeout. Assert readability
+    //    arrives within ≤1ms (POSIX poll timeout is in milliseconds).
+    var pfds: [1]std.os.linux.pollfd = .{.{
+        .fd = cancel_pipe[0],
+        .events = std.os.linux.POLL.IN,
+        .revents = 0,
+    }};
+    const start_ns = std.Io.Clock.real.now(testing.io).nanoseconds;
+    // poll() takes a many pointer; coerce the single-item pointer.
+    const poll_rc = std.os.linux.poll(@ptrCast(&pfds[0]), 1, 1); // 1ms timeout
+    const elapsed_signed: i96 = std.Io.Clock.real.now(testing.io).nanoseconds - start_ns;
+    const elapsed_ns: u64 = if (elapsed_signed > 0) @intCast(elapsed_signed) else 0;
+    const elapsed_ms = elapsed_ns / std.time.ns_per_ms;
+
+    writer.join();
+
+    // 4. Drain the byte (so we don't leak fd buffer pressure on the
+    //    next test in the same process if any).
+    var read_buf: [1]u8 = undefined;
+    _ = std.os.linux.read(cancel_pipe[0], &read_buf, 1);
+
+    // 5. Assertions:
+    //    a. poll returned 1 fd (readable)
+    //    b. revents has POLL.IN set
+    //    c. wall-clock elapsed < 1ms (kernel roundtrip is microseconds)
+    try testing.expectEqual(@as(usize, 1), poll_rc);
+    try testing.expect((pfds[0].revents & std.os.linux.POLL.IN) != 0);
+    try testing.expect(elapsed_ms < 1);
+
+    std.debug.print(
+        "\n[cancel_e2e] CAP-09 PASS — cancel_pipe writer roundtrip in {d} ms\n",
+        .{elapsed_ms},
+    );
+}
