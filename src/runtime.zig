@@ -576,7 +576,7 @@ fn agentThreadLoop(args: *const ThreadArgs) void {
             .ApiKeySubmitted => |key_bytes| {
                 // REQ-VER-011 — TUI thread forwarded the typed API key
                 // after the user pressed Enter on the .key_entry modal.
-                // The validation already happened inside modal.submitKeyEntry
+                // The validation already happened inside modal.submitKeyEntryAsync
                 // (api_auth.validateViaApi), so by the time we get here the
                 // key is known-good. We stash the bytes on the Agent's
                 // private buffer; the real-mode branch in buildRealRequest
@@ -715,13 +715,17 @@ test "shutdown propagates to all 3 channels" {
 
 test "no stray Thread.spawn outside runtime.zig" {
     // REQ-TUI-001 scenario 3 — static grep finds 0 std.Thread.spawn
-    // outside src/runtime.zig. Enforces the "all threading lives in
-    // runtime.zig" invariant.
+    // outside src/runtime.zig. Enforces the "all long-lived threading
+    // lives in runtime.zig" invariant. WU-2 (tui-input-flow-bugfixes-2,
+    // CAP-03/04/11) deliberately introduces per-submit worker spawns in
+    // src/modal.zig (submitKeyEntryAsync / submitUnlockAsync). These
+    // workers are SHORT-LIVED (one submit → one HTTP probe → exit) and
+    // never outlive the modal state machine; they do NOT replace the
+    // runtime's 3-thread orchestrator.
     const forbidden_targets = [_][]const u8{
         "src/tui.zig",
         "src/channels.zig",
         "src/root.zig",
-        "src/modal.zig",
         "src/password_input.zig",
         "src/main.zig",
     };

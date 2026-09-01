@@ -529,6 +529,13 @@ pub fn tuiThreadLoop(
             .Shutdown => return,
             else => continue,
         };
+        // 2.5 WU-2 (CAP-03/04/08/14): drain submit_reply BEFORE the
+        // mibu poll so a fast worker reply transitions the state within
+        // the same frame (latency ≤ next 16ms tick). Set redraw_pending
+        // so the next render reflects the new state.
+        if (drainSubmitReply(io, state, channels)) {
+            lifecycle.redraw_pending.store(true, .seq_cst);
+        }
         // 3. Poll mibu events. Resize → update dims + set redraw flag.
         const event = mibu.events.nextWithTimeout(io, file, 16) catch continue;
         switch (event) {
@@ -550,7 +557,7 @@ pub fn tuiThreadLoop(
                     channels.tui_to_agent.tryPut(io, .{ .Shutdown = {} }) catch {};
                     return;
                 }
-                const consumed = handleKeyInput(io, alloc, state, k, cancel_pipe) catch continue;
+                const consumed = handleKeyInput(io, alloc, state, k, cancel_pipe, channels) catch continue;
                 if (consumed) {
                     lifecycle.redraw_pending.store(true, .seq_cst);
                 } else {
@@ -586,14 +593,19 @@ pub fn tuiThreadLoop(
 // =============================================================================
 
 // ponytail: synchronous `validateViaApi` inside `submitKeyEntry` blocks
-// the TUI thread for ~1-3s. v1 acceptable; offload to Agent via new
-// `Event.ValidateApiKey` + reply channel when UX latency matters.
+// the TUI thread for ~1-3s. WU-2 (tui-input-flow-bugfixes-2, CAP-03/04):
+// the synchronous submit is renamed to `submitKeyEntryAsync` /
+// `submitUnlockAsync`. Both spawn a per-submit worker thread and return
+// within ≤1ms; the worker posts `Event.ValidateApiReply` to
+// `channels.submit_reply`. `tuiThreadLoop` drains the reply on the
+// next 16ms poll cycle + transitions the state.
 pub fn handleKeyInput(
     io: std.Io,
     alloc: std.mem.Allocator,
     state: *@import("modal.zig").State,
     k: mibu.events.Key,
     cancel_pipe: ?[2]i32,
+    channels: *@import("channels.zig").Channels,
 ) !bool {
     if (k.event == .release) return false; // REQ-TIW-008 — kitty-kb release no-op
     switch (state.*) {
@@ -611,7 +623,15 @@ pub fn handleKeyInput(
                 return true;
             },
             .enter => {
-                try @import("modal.zig").submitKeyEntry(io, alloc, state, cancel_pipe); // REQ-TIW-006
+                // WU-2 (CAP-03): spawn worker, return ≤1ms. State
+                // transitions on submit_reply consumption, not here.
+                try @import("modal.zig").submitKeyEntryAsync(
+                    io,
+                    alloc,
+                    state,
+                    cancel_pipe,
+                    &channels.submit_reply,
+                ); // REQ-TIW-006
                 return true;
             },
             .esc => return false, // REQ-TIW-007 + REQ-TIW-NEG-3 — v1 no-op
@@ -631,7 +651,14 @@ pub fn handleKeyInput(
                 return true;
             },
             .enter => {
-                try @import("modal.zig").submitUnlock(io, state); // REQ-TIW-006
+                // WU-2 (CAP-04): spawn worker, return ≤1ms. State
+                // transitions on submit_reply consumption, not here.
+                try @import("modal.zig").submitUnlockAsync(
+                    io,
+                    alloc,
+                    state,
+                    &channels.submit_reply,
+                ); // REQ-TIW-006
                 return true;
             },
             .esc => {
@@ -642,6 +669,128 @@ pub fn handleKeyInput(
         },
         else => return false, // .welcome / .consent_prompt / .agent_loop / .error_modal
     }
+}
+
+/// Drain one tick of `submit_reply` events into the modal state. Returns
+/// true when at least one reply was consumed (caller MUST set
+/// `redraw_pending = true`). Mirrors `modal.runtimeDriverTick`'s shape
+/// but for the WU-2 worker reply channel.
+///
+/// WU-2 (CAP-03/04/08/14): the worker reply carries INLINE buffers
+/// (Bug 1 pattern) — no slice aliases the worker's stack-local storage
+/// after the worker exits. The TUI thread joins the worker via
+/// `state.X.worker_thread` AFTER consuming the reply (fire-and-forget
+/// + join-on-reply, design D1).
+pub fn drainSubmitReply(
+    io: std.Io,
+    state: *@import("modal.zig").State,
+    channels: *@import("channels.zig").Channels,
+) bool {
+    var consumed = false;
+    while (channels.submit_reply.tryGet(io)) |event| {
+        consumed = true;
+        switch (event) {
+            .ValidateApiReply => |payload| {
+                // Join the worker BEFORE reading inline data (join-on-
+                // reply ordering; the worker has already exited by the
+                // time the reply is in the channel buffer, so the join
+                // is immediate).
+                switch (state.*) {
+                    .key_entry => |*ke| {
+                        if (ke.worker_thread) |t| t.join();
+                        ke.worker_thread = null;
+                        ke.validating = false;
+                        if (payload.success) {
+                            // Advance to .consent_prompt with the
+                            // validated key's last-4 + canonical path.
+                            state.* = .{
+                                .consent_prompt = .{
+                                    .consent = false,
+                                    .last_four = payload.last_four,
+                                    .path = "~/.config/zargeant/credentials.json",
+                                },
+                            };
+                        } else {
+                            // Stay in .key_entry; copy err into inline buffer.
+                            var err_buf: [128]u8 = .{0} ** 128;
+                            const len = copyErrInline(&err_buf, &payload.err, payload.err_len);
+                            state.* = .{
+                                .key_entry = .{
+                                    .draft = ke.draft,
+                                    .draft_len = ke.draft_len,
+                                    .err_msg_buf = err_buf,
+                                    .err_msg_len = len,
+                                    .validating = false,
+                                },
+                            };
+                        }
+                    },
+                    .unlock_prompt => |*up| {
+                        if (up.worker_thread) |t| t.join();
+                        const next_attempts: u8 = up.attempts + 1;
+                        up.worker_thread = null;
+                        up.validating = false;
+                        if (payload.success) {
+                            // Advance to .agent_loop.
+                            state.* = .{ .agent_loop = .{
+                                .allocator = io_allocator_tui(io),
+                                .cumulative = .empty,
+                                .last_update_ms = 0,
+                                .model = "",
+                                .tokens = 0,
+                            } };
+                        } else if (next_attempts >= @import("modal.zig").UNLOCK_MAX_ATTEMPTS) {
+                            // Cap reached — escalate to .error_modal.
+                            state.* = .{ .error_modal = .{
+                                .kind = .auth,
+                                .message_buf = payload.err,
+                                .message_len = payload.err_len,
+                                .prior = .unlock_prompt,
+                            } };
+                        } else {
+                            // Stay in .unlock_prompt with err populated.
+                            var err_buf: [128]u8 = .{0} ** 128;
+                            const len = copyErrInline(&err_buf, &payload.err, payload.err_len);
+                            state.* = .{
+                                .unlock_prompt = .{
+                                    .draft = up.draft,
+                                    .draft_len = up.draft_len,
+                                    .err_msg_buf = err_buf,
+                                    .err_msg_len = len,
+                                    .attempts = next_attempts,
+                                    .validating = false,
+                                },
+                            };
+                        }
+                    },
+                    else => {
+                        // Reply arrived for a state that no longer
+                        // expects one (user dismissed). Best-effort
+                        // drop — payload is consumed by the channel.
+                    },
+                }
+            },
+            else => {},
+        }
+    }
+    return consumed;
+}
+
+/// Copy `src[0..len]` into a 128-byte inline buffer (Bug 1 pattern).
+/// Truncates to 128 bytes. Returns the actual length copied.
+inline fn copyErrInline(dst: *[128]u8, src: *const [128]u8, len: usize) usize {
+    const n: usize = @min(len, dst.len);
+    @memcpy(dst[0..n], src[0..n]);
+    return n;
+}
+
+/// Resolve an allocator for the .agent_loop variant from the TUI thread.
+/// Mirrors `modal.io_allocator`; re-declared here to avoid pulling
+/// modal.zig's test-only helper into the TUI source path.
+fn io_allocator_tui(io: std.Io) std.mem.Allocator {
+    _ = io;
+    if (builtin.is_test) return std.testing.allocator;
+    return std.heap.page_allocator;
 }
 
 // =============================================================================
