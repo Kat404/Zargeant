@@ -57,7 +57,13 @@ pub const AuthKind = enum {
     key_invalid,
 };
 
-/// Single Event union across the 5 channel edges. 17 variants.
+/// Single Event union across the 5 channel edges. 18 variants.
+/// WU-2 (tui-input-flow-bugfixes-2, CAP-03/04/08): added the
+/// `ValidateApiReply` variant so the per-submit worker thread spawned
+/// in `submitKeyEntryAsync` / `submitUnlockAsync` can post the result
+/// back to the TUI thread. The payload uses INLINE buffers (Bug 1
+/// pattern — WU-1) so no slice aliases the worker's stack-local
+/// storage after the worker exits.
 pub const Event = union(enum) {
     // TUI→Agent (7)
     KeyPress: mibu.events.Key,
@@ -92,6 +98,33 @@ pub const Event = union(enum) {
     // Tools→Agent (2)
     SubprocessSpawned: SubprocessSpawnedPayload,
     SubprocessExited: SubprocessExitedPayload,
+
+    // Worker→TUI (1 — async submit reply, tui-input-flow-bugfixes-2 WU-2)
+    ValidateApiReply: ValidateApiReplyPayload,
+};
+
+/// Payload for `Event.ValidateApiReply` (WU-2).
+///
+/// `success: true`  → TUI advances the state to `.consent_prompt` (key_entry)
+///                   or `.agent_loop` (unlock_prompt).
+/// `success: false` → TUI writes the inline `err[0..err_len]` into the
+///                   matching `err_msg_buf` and stays in the same variant.
+///
+/// `last_four` carries the trailing 4 bytes of the validated key (for
+/// `consent_prompt` display on key_entry success). For `submitUnlockAsync`
+/// the field is unused but the buffer stays inline to keep the variant
+/// shape uniform.
+///
+/// ponytail: every buffer is INLINE — no `[]const u8` slice aliases the
+/// worker's stack-local storage (Bug 1 pattern, 2026-09-01). The variant
+/// is safe to consume at any time because the worker writes its reply
+/// into the channel ring buffer BEFORE exiting, and the inline data lives
+/// in the ring buffer (not the worker's stack).
+pub const ValidateApiReplyPayload = struct {
+    success: bool,
+    last_four: [4]u8 = .{0} ** 4,
+    err: [128]u8 = .{0} ** 128,
+    err_len: usize = 0,
 };
 
 pub const UserToolArgs = struct {
@@ -272,6 +305,12 @@ pub const Channels = struct {
     tui_to_tools: Channel(Event),
     tools_to_agent: Channel(Event),
     tools_to_tui: Channel(Event),
+    /// WU-2 (tui-input-flow-bugfixes-2, CAP-03/04/08/11): the per-submit
+    /// worker thread spawned by `submitKeyEntryAsync` / `submitUnlockAsync`
+    /// posts a `Event.ValidateApiReply` to this channel; the TUI thread
+    /// drains it in `tuiThreadLoop` (next 16 ms poll cycle). Capacity
+    /// 256 — matches the other edges.
+    submit_reply: Channel(Event),
 
     /// Construct the 5 channels. Channels are value types (no allocator
     /// needed) since the ring buffer is inline.
@@ -282,6 +321,7 @@ pub const Channels = struct {
             .tui_to_tools = .{},
             .tools_to_agent = .{},
             .tools_to_tui = .{},
+            .submit_reply = .{},
         };
     }
 
@@ -292,6 +332,7 @@ pub const Channels = struct {
         self.tui_to_tools.close(io);
         self.tools_to_agent.close(io);
         self.tools_to_tui.close(io);
+        self.submit_reply.close(io);
     }
 };
 
@@ -337,20 +378,23 @@ pub fn pushSseChunk(io: std.Io, ch: *Channel(Event), seq: u64, text: []const u8)
 
 const testing = std.testing;
 
-test "Event union has 17 variants" {
+test "Event union has 18 variants" {
     // REQ-TUI-004 scenario 4 — every variant from design#408 §1.2 resolves.
     // PR 2 (tui-runtime-integration #441, REQ-TUI-042) added the `Relock`
     // variant for the 5-min idle relock: 15 → 16.
     // tui-verification (#1241, REQ-VER-011) added the `ConsentGrant`
     // variant: 16 → 17.
+    // WU-2 (tui-input-flow-bugfixes-2, CAP-03/04/08) added the
+    // `ValidateApiReply` variant for the async submit reply: 17 → 18.
     const fields = @typeInfo(Event).@"union".fields;
-    try testing.expectEqual(@as(usize, 17), fields.len);
+    try testing.expectEqual(@as(usize, 18), fields.len);
 }
 
 test "channels have capacity 256 (5 edges)" {
     // REQ-TUI-004 scenario 1 — every channel.capacity == 256.
     // The 5 channel edges all share Channel(Event), so assert via the
-    // type const. Per-instance field would be redundant.
+    // type const. Per-instance field would be redundant. WU-2 added
+    // the 6th edge (submit_reply); the same capacity rule applies.
     try testing.expectEqual(@as(usize, 256), Channel(Event).capacity);
     var c = Channels.init();
     defer c.closeAll(testing.io);
@@ -361,12 +405,14 @@ test "channels have capacity 256 (5 edges)" {
         try c.tui_to_tools.tryPut(testing.io, .{ .SubprocessExited = .{ .id = i, .exit_code = 0 } });
         try c.tools_to_agent.tryPut(testing.io, .{ .SubprocessExited = .{ .id = i, .exit_code = 0 } });
         try c.tools_to_tui.tryPut(testing.io, .{ .SubprocessExited = .{ .id = i, .exit_code = 0 } });
+        try c.submit_reply.tryPut(testing.io, .{ .SubprocessExited = .{ .id = i, .exit_code = 0 } });
     }
     try testing.expectError(error.Full, c.tui_to_agent.tryPut(testing.io, .{ .SubprocessExited = .{ .id = 999, .exit_code = 0 } }));
     try testing.expectError(error.Full, c.agent_to_tui.tryPut(testing.io, .{ .SubprocessExited = .{ .id = 999, .exit_code = 0 } }));
     try testing.expectError(error.Full, c.tui_to_tools.tryPut(testing.io, .{ .SubprocessExited = .{ .id = 999, .exit_code = 0 } }));
     try testing.expectError(error.Full, c.tools_to_agent.tryPut(testing.io, .{ .SubprocessExited = .{ .id = 999, .exit_code = 0 } }));
     try testing.expectError(error.Full, c.tools_to_tui.tryPut(testing.io, .{ .SubprocessExited = .{ .id = 999, .exit_code = 0 } }));
+    try testing.expectError(error.Full, c.submit_reply.tryPut(testing.io, .{ .SubprocessExited = .{ .id = 999, .exit_code = 0 } }));
 }
 
 test "pushSseChunk coalesces 5 chunks → 1 frame (REPLACE-on-newer)" {

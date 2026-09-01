@@ -88,14 +88,22 @@ const Tui = struct {
     pub const emitFrame = root.tui.emitFrame;
     pub const tuiThreadLoop = root.tui.tuiThreadLoop;
     pub const handleKeyInput = root.tui.handleKeyInput;
+    pub const drainSubmitReply = root.tui.drainSubmitReply;
 };
 
 /// Key-event driver helper (REQ-TIW-013). Mirrors the wiring in
 /// `tuiThreadLoop`'s `.key` arm: calls `handleKeyInput`, then sets
 /// `redraw_pending = true` when consumed. Used by every W2/W3 behavioral
 /// test in this slice to avoid duplicating inline driver code.
-fn feedKey(state: *M.State, lc: *Tui.Lifecycle, k: mibu.events.Key) !void {
-    const consumed = try Tui.handleKeyInput(testing.io, testing.allocator, state, k, null);
+///
+/// WU-2: handleKeyInput gained a `channels` parameter (CAP-03/04 — async
+/// submit replies are routed via channels.submit_reply). The driver
+/// helper threads the per-test channels ref so each test can verify the
+/// reply path locally.
+fn feedKey(state: *M.State, lc: *Tui.Lifecycle, k: mibu.events.Key, channels: *Ch.Channels) !void {
+    var ch: Ch.Channels = Ch.Channels.init();
+    defer ch.closeAll(testing.io);
+    const consumed = try Tui.handleKeyInput(testing.io, testing.allocator, state, k, null, channels);
     if (consumed) lc.redraw_pending.store(true, .seq_cst);
 }
 
@@ -1772,12 +1780,15 @@ test "T-TIW-1: handleKeyInput appends char to draft (REQ-TIW-004)" {
     // S-TIW-007: unlock_prompt path consumes char events.
     {
         var state: M.State = .{ .key_entry = .{} };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
         const consumed = try Tui.handleKeyInput(
             testing.io,
             testing.allocator,
             &state,
             .{ .code = .{ .char = 'a' }, .event = .press },
             null, // cancel_pipe — null for tests
+            &ch,
         );
         try testing.expect(consumed);
         try testing.expectEqual(@as(usize, 1), state.key_entry.draft_len);
@@ -1790,36 +1801,45 @@ test "T-TIW-1: handleKeyInput appends char to draft (REQ-TIW-004)" {
             .draft = draft_buf,
             .draft_len = 256,
         } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
         const consumed = try Tui.handleKeyInput(
             testing.io,
             testing.allocator,
             &state,
             .{ .code = .{ .char = 'a' }, .event = .press },
             null, // cancel_pipe — null for tests
+            &ch,
         );
         try testing.expect(!consumed);
         try testing.expectEqual(@as(usize, 256), state.key_entry.draft_len);
     }
     {
         var state: M.State = .{ .key_entry = .{} };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
         const consumed = try Tui.handleKeyInput(
             testing.io,
             testing.allocator,
             &state,
             .{ .code = .{ .char = 0x100 }, .event = .press },
             null, // cancel_pipe — null for tests
+            &ch,
         );
         try testing.expect(!consumed);
         try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
     }
     {
         var state: M.State = .{ .unlock_prompt = .{} };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
         const consumed = try Tui.handleKeyInput(
             testing.io,
             testing.allocator,
             &state,
             .{ .code = .{ .char = 'p' }, .event = .press },
             null, // cancel_pipe — null for tests
+            &ch,
         );
         try testing.expect(consumed);
         try testing.expectEqual(@as(usize, 1), state.unlock_prompt.draft_len);
@@ -1839,24 +1859,30 @@ test "T-TIW-2: handleKeyInput decrements draft on backspace (REQ-TIW-005)" {
             .draft = draft_buf,
             .draft_len = 3,
         } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
         const consumed = try Tui.handleKeyInput(
             testing.io,
             testing.allocator,
             &state,
             .{ .code = .backspace, .event = .press },
             null, // cancel_pipe — null for tests
+            &ch,
         );
         try testing.expect(consumed);
         try testing.expectEqual(@as(usize, 2), state.key_entry.draft_len);
     }
     {
         var state: M.State = .{ .key_entry = .{} };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
         const consumed = try Tui.handleKeyInput(
             testing.io,
             testing.allocator,
             &state,
             .{ .code = .backspace, .event = .press },
             null, // cancel_pipe — null for tests
+            &ch,
         );
         try testing.expect(!consumed);
         try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
@@ -1876,35 +1902,44 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
     // S-TIW-012: unlock_prompt + attempts==2 + .esc → cancelUnlock
     //           state transitions to .key_entry with default fields.
     // S-TIW-013: key_entry + .esc → no mutation, returns false.
-    // S-TIW-010: key_entry with 26-char valid-format draft + .enter.
+    // S-TIW-10: key_entry + .enter → submit path is wired.
+    // WU-2 (CAP-03): submitKeyEntryAsync now spawns a worker thread
+    // (offload target) — to keep the unit-test hermetic (no real DNS in
+    // CI), we exercise the SYNCHRONOUS format-fail branch via a too-
+    // short draft. The worker-spawn branch is covered by CAP-04 in
+    // src/modal.zig (timing assertion + validating flag).
     {
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
         var draft_buf: [256]u8 = .{0} ** 256;
-        const draft = "test-key-1234567890ABCDEF";
-        @memcpy(draft_buf[0..draft.len], draft);
+        @memcpy(draft_buf[0..2], "xx"); // too short — validateFormat fails
         var state: M.State = .{ .key_entry = .{
             .draft = draft_buf,
-            .draft_len = draft.len,
+            .draft_len = 2,
         } };
-        // submitKeyEntry will fail validateViaApi offline; we only care
-        // that the path is wired (handleKeyInput returns true; submit
-        // was called and mutated state).
         _ = Tui.handleKeyInput(
             testing.io,
             testing.allocator,
             &state,
             .{ .code = .enter, .event = .press },
             null, // cancel_pipe — null for tests
+            &ch,
         ) catch {};
-        // Either state stays in .key_entry with err_msg set (offline),
-        // OR state advanced to .consent_prompt (online success). Both
-        // prove the submit path is wired.
-        try testing.expect(
-            std.meta.activeTag(state) == .key_entry or
-                std.meta.activeTag(state) == .consent_prompt,
-        );
+        // Format pre-flight fails synchronously (no worker spawned).
+        // State stays in .key_entry with err_msg_buf populated.
+        try testing.expect(std.meta.activeTag(state) == .key_entry);
+        try testing.expect(state.key_entry.validating == false);
+        try testing.expect(state.key_entry.err_msg_len > 0);
+        try testing.expectEqualStrings("Invalid key format", state.key_entry.err_msg_buf[0..state.key_entry.err_msg_len]);
     }
     // S-TIW-011: unlock_prompt + .enter → attempts++ (or .error_modal).
+    // WU-2 (CAP-04): submitUnlockAsync is now async — the worker thread
+    // runs loadWithUnlock on a worker. attempts++ happens on reply
+    // consumption, not synchronously on submit. We drain the reply
+    // (TUI helper equivalent) before asserting.
     {
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
         var state: M.State = .{ .unlock_prompt = .{} };
         _ = Tui.handleKeyInput(
             testing.io,
@@ -1912,6 +1947,7 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
             &state,
             .{ .code = .enter, .event = .press },
             null, // cancel_pipe — null for tests
+            &ch,
         ) catch {};
         // Either attempts incremented or state transitioned to .error_modal
         // (when no storage path resolves — the CI environment).
@@ -1919,19 +1955,34 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
             std.meta.activeTag(state) == .unlock_prompt or
                 std.meta.activeTag(state) == .error_modal,
         );
+        // WU-2: drain submit_reply to consume the worker's reply. The
+        // worker thread completes fast (loadWithUnlock returns OpenFailed
+        // for the missing XDG file) and posts the reply within ~ms. The
+        // drain joins the worker via state.X.worker_thread so the test
+        // exits cleanly (no leaked ctx / path_copy / pass_copy).
+        var drain_iters: usize = 0;
+        while (drain_iters < 100) : (drain_iters += 1) {
+            if (Tui.drainSubmitReply(testing.io, &state, &ch)) break;
+            var ts = std.os.linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = std.os.linux.nanosleep(&ts, null);
+        }
         if (std.meta.activeTag(state) == .unlock_prompt) {
             try testing.expect(state.unlock_prompt.attempts >= 1);
+            try testing.expect(state.unlock_prompt.validating == false);
         }
     }
     // S-TIW-012: unlock_prompt + attempts==2 + .esc → cancelUnlock → .key_entry.
     {
         var state: M.State = .{ .unlock_prompt = .{ .attempts = 2 } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
         const consumed = try Tui.handleKeyInput(
             testing.io,
             testing.allocator,
             &state,
             .{ .code = .esc, .event = .press },
             null, // cancel_pipe — null for tests
+            &ch,
         );
         try testing.expect(consumed);
         try testing.expect(std.meta.activeTag(state) == .key_entry);
@@ -1946,12 +1997,15 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
             .draft = draft_buf,
             .draft_len = 5,
         } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
         const consumed = try Tui.handleKeyInput(
             testing.io,
             testing.allocator,
             &state,
             .{ .code = .esc, .event = .press },
             null, // cancel_pipe — null for tests
+            &ch,
         );
         try testing.expect(!consumed);
         try testing.expectEqual(@as(usize, 5), state.key_entry.draft_len);
@@ -1964,24 +2018,30 @@ test "T-TIW-4: handleKeyInput ignores .release; treats .repeat as .press (REQ-TI
     // S-TIW-015: .char('x') .repeat → draft[0]='x', len=1 (like .press).
     {
         var state: M.State = .{ .key_entry = .{} };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
         const consumed = try Tui.handleKeyInput(
             testing.io,
             testing.allocator,
             &state,
             .{ .code = .{ .char = 'a' }, .event = .release },
             null, // cancel_pipe — null for tests
+            &ch,
         );
         try testing.expect(!consumed);
         try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
     }
     {
         var state: M.State = .{ .key_entry = .{} };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
         const consumed = try Tui.handleKeyInput(
             testing.io,
             testing.allocator,
             &state,
             .{ .code = .{ .char = 'x' }, .event = .repeat },
             null, // cancel_pipe — null for tests
+            &ch,
         );
         try testing.expect(consumed);
         try testing.expectEqual(@as(usize, 1), state.key_entry.draft_len);
@@ -2041,6 +2101,8 @@ test "T-TIW-7: feedKey drives a full key sequence through handleKeyInput (REQ-TI
     // S-TIW-017: .char('a') .press is consumed (no Agent forward);
     //   .up .press is NOT consumed (forwarded to Agent).
     {
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
         var state: M.State = .{ .key_entry = .{} };
         var lc: Tui.Lifecycle = .{
             .raw_term = null,
@@ -2052,10 +2114,10 @@ test "T-TIW-7: feedKey drives a full key sequence through handleKeyInput (REQ-TI
             .height = 24,
         };
         // Drive 'a', 'b', 'c', 'd' (4 chars) then Enter.
-        try feedKey(&state, &lc, .{ .code = .{ .char = 'a' }, .event = .press });
-        try feedKey(&state, &lc, .{ .code = .{ .char = 'b' }, .event = .press });
-        try feedKey(&state, &lc, .{ .code = .{ .char = 'c' }, .event = .press });
-        try feedKey(&state, &lc, .{ .code = .{ .char = 'd' }, .event = .press });
+        try feedKey(&state, &lc, .{ .code = .{ .char = 'a' }, .event = .press }, &ch);
+        try feedKey(&state, &lc, .{ .code = .{ .char = 'b' }, .event = .press }, &ch);
+        try feedKey(&state, &lc, .{ .code = .{ .char = 'c' }, .event = .press }, &ch);
+        try feedKey(&state, &lc, .{ .code = .{ .char = 'd' }, .event = .press }, &ch);
         // 4 chars appended (Enter below will trigger submitKeyEntry which
         // will transition or set err_msg offline — we don't assert on
         // the post-submit state since validateViaApi is offline).
@@ -2079,22 +2141,26 @@ test "T-TIW-7: feedKey drives a full key sequence through handleKeyInput (REQ-TI
         };
         // Simulate the .key arm wiring directly: consumed → redraw;
         // unconsumed → forward to Agent.
+        defer ch.closeAll(testing.io);
         const consumed = try Tui.handleKeyInput(
             testing.io,
             testing.allocator,
             &state,
             .{ .code = .{ .char = 'a' }, .event = .press },
             null, // cancel_pipe — null for tests
+            &ch,
         );
         if (consumed) lc.redraw_pending.store(true, .seq_cst);
         try testing.expect(consumed);
         // Now the .up arrow:
+        defer ch.closeAll(testing.io);
         const up_consumed = try Tui.handleKeyInput(
             testing.io,
             testing.allocator,
             &state,
             .{ .code = .up, .event = .press },
             null, // cancel_pipe — null for tests
+            &ch,
         );
         try testing.expect(!up_consumed);
         // The .key arm would now forward; we simulate by pushing to the channel.
