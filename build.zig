@@ -250,6 +250,25 @@ pub fn build(b: *std.Build) void {
     cancel_e2e_test_decl.dependOn(&run_cancel_e2e_test.step);
     test_decl.dependOn(&run_cancel_e2e_test.step);
 
+    // test step: tests/termios_sim.zig (tui-input-flow-bugfixes-2 WU-3,
+    // CAP-09 + CAP-13). Static-grep guard verifying the new pipe-write
+    // call in src/tui.zig's Ctrl+C intercept + runtime roundtrip
+    // assertion. The full pty mibu/termios e2e (CAP-13) is deferred to
+    // WU-5 per design D3 follow-up.
+    const termios_sim_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/termios_sim.zig"),
+    });
+    const termios_sim_test_step = b.addTest(.{ .root_module = termios_sim_test_mod });
+    const run_termios_sim_test = b.addRunArtifact(termios_sim_test_step);
+    const termios_sim_test_decl = b.step(
+        "test-termios-sim",
+        "Run tests/termios_sim.zig (tui-input-flow-bugfixes-2 WU-3 CAP-09 wiring guard)",
+    );
+    termios_sim_test_decl.dependOn(&run_termios_sim_test.step);
+    test_decl.dependOn(&run_termios_sim_test.step);
+
     // =========================================================================
     // QA 0 — Static checks: `zig build check`
     //   - `zig fmt --check` for formatting (recursive on src/, tests/, tools/)
