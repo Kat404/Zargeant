@@ -206,10 +206,14 @@ pub const ErrorKind = enum {
 
 /// Payload for `.key_entry` (REQ-TUI-006). Draft buffer holds the typed key
 /// up to 256 bytes (no escape sequences; printable ASCII per validateFormat).
+/// ponytail: err_msg_buf is INLINE (Bug 1, 2026-09-01). Never alias a
+/// stack-local `var buf` into a `?[]const u8` — the slice would dangle
+/// when the producing fn returns. err_msg_buf[0..err_msg_len] survives.
 pub const KeyEntryState = struct {
     draft: [256]u8 = .{0} ** 256,
     draft_len: usize = 0,
-    err_msg: ?[]const u8 = null,
+    err_msg_buf: [128]u8 = .{0} ** 128,
+    err_msg_len: usize = 0,
 };
 
 /// Payload for `.unlock_prompt` (REQ-TUI-007). Same shape as KeyEntry but
@@ -217,10 +221,12 @@ pub const KeyEntryState = struct {
 /// validateFormat first; the password just needs to match the stored hash).
 /// `attempts` counts failed unlock submissions; submitUnlock transitions
 /// to `.error_modal` once the cap (3) is reached (REQ-VER-012).
+/// ponytail: err_msg_buf INLINE (Bug 1) — see KeyEntryState.
 pub const UnlockState = struct {
     draft: [256]u8 = .{0} ** 256,
     draft_len: usize = 0,
-    err_msg: ?[]const u8 = null,
+    err_msg_buf: [128]u8 = .{0} ** 128,
+    err_msg_len: usize = 0,
     attempts: u8 = 0,
 };
 
@@ -249,9 +255,14 @@ pub const AgentLoopState = struct {
 
 /// Payload for `.error_modal` (REQ-TUI-009). `prior` is non-recursive
 /// (PriorKind enum) to avoid State-in-State infinite size.
+/// ponytail: message_buf is INLINE (Bug 1, D2). The previous `message:
+/// []const u8` shape had the same dangling-pointer hazard as KeyEntryState
+/// (e.g. submitUnlock:480 stored a stack-local slice). openErrorModal
+/// copies the caller-provided msg into message_buf.
 pub const ErrorModalState = struct {
     kind: ErrorKind = .internal,
-    message: []const u8 = "",
+    message_buf: [128]u8 = .{0} ** 128,
+    message_len: usize = 0,
     prior: PriorKind = .welcome,
 };
 
@@ -343,7 +354,12 @@ pub fn drawKeyEntry(win: *WindowMock, state: *State) !void {
             win.cells[start_x + i] = .{ .ch = '*', .style = .{} };
         }
     }
-    if (payload.err_msg) |msg| {
+    if (payload.err_msg_len > 0) {
+        // WU-1 (Fix A): read inline err_msg_buf[0..err_msg_len]. The
+        // slice is owned by the state struct (lives as long as state);
+        // previously `payload.err_msg: ?[]const u8` aliased a stack-local
+        // `var buf` in submitKeyEntry/submitUnlock and dangled.
+        const msg = payload.err_msg_buf[0..payload.err_msg_len];
         // zargeant/tui-display-err: write err_msg to row 2 (cells[win.cols..])
         // instead of win.print(msg, ...) which starts at cells[0] and
         // overwrites the prompt. Mirrors drawAgentLoopView's row-tracking.
@@ -367,11 +383,19 @@ pub fn submitKeyEntry(io: std.Io, alloc: std.mem.Allocator, state: *State, cance
 
     // Format pre-flight (REQ-TUI-006 scenario 1).
     if (!api_auth.validateFormat(draft)) {
+        // WU-1 (Fix A): write "Invalid key format" into the inline buffer
+        // via copyInline; the previous `err_msg = "Invalid key format"`
+        // was already a string-literal slice (technically safe-ish because
+        // the literal lives in .rodata), but we want a uniform shape.
+        var buf: [128]u8 = .{0} ** 128;
+        const lit = "Invalid key format";
+        const len = copyInline(&buf, lit);
         state.* = .{
             .key_entry = .{
                 .draft = payload.draft,
                 .draft_len = payload.draft_len,
-                .err_msg = "Invalid key format",
+                .err_msg_buf = buf,
+                .err_msg_len = len,
             },
         };
         return;
@@ -381,13 +405,22 @@ pub fn submitKeyEntry(io: std.Io, alloc: std.mem.Allocator, state: *State, cance
     api_auth.validateViaApi(io, alloc, draft, cancel_pipe) catch |err| {
         // Map every error to "key rejected" so the user can re-type. The
         // error message is logged via the api_auth module's own logger.
-        var buf: [64]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "API rejected key: {s}", .{@errorName(err)}) catch "API rejected key";
+        // WU-1 (Fix A): write into the inline buffer; the previous
+        // format-free `var buf: [64]u8` + `state.err_msg = msg` aliased
+        // stack-local storage that was reclaimed on return (Bug 1).
+        var buf: [128]u8 = .{0} ** 128;
+        const written = std.fmt.bufPrint(&buf, "API rejected key: {s}", .{@errorName(err)}) catch blk: {
+            // Fallback if the formatted string would exceed 128 bytes
+            // (shouldn't happen for any single @errorName, but be safe).
+            @memcpy(buf[0.."API rejected key".len], "API rejected key");
+            break :blk "API rejected key";
+        };
         state.* = .{
             .key_entry = .{
                 .draft = payload.draft,
                 .draft_len = payload.draft_len,
-                .err_msg = msg,
+                .err_msg_buf = buf,
+                .err_msg_len = written.len,
             },
         };
         return;
@@ -424,7 +457,10 @@ pub fn drawUnlock(win: *WindowMock, state: *State) !void {
             win.cells[prefix_len + i] = .{ .ch = '*', .style = .{} };
         }
     }
-    if (payload.err_msg) |msg| {
+    if (payload.err_msg_len > 0) {
+        // WU-1 (Fix A): read inline err_msg_buf[0..err_msg_len]. See
+        // drawKeyEntry's mirror comment for the dangling-pointer rationale.
+        const msg = payload.err_msg_buf[0..payload.err_msg_len];
         // zargeant/tui-display-err: write err_msg to row 2 (cells[win.cols..])
         // instead of win.print(msg, ...) which starts at cells[0] and
         // overwrites the prompt. Mirrors drawAgentLoopView's row-tracking.
@@ -452,32 +488,47 @@ pub fn submitUnlock(io: std.Io, state: *State) !void {
     // prompt writes to. We compute it lazily here via api_auth (R-PR 4
     // exposes a helper; for now we hardcode the XDG lookup fallback).
     const path = storageCredentialsPath(&path_buf) orelse {
+        // WU-1 (Fix A): inline buffer (was `err_msg = "No storage path"`
+        // — string literal aliasing .rodata, technically safe but uniform
+        // shape is the contract).
+        var nopath_buf: [128]u8 = .{0} ** 128;
+        const nopath_len = copyInline(&nopath_buf, "No storage path");
         state.* = .{
             .unlock_prompt = .{
                 .draft = payload.draft,
                 .draft_len = payload.draft_len,
-                .err_msg = "No storage path",
+                .err_msg_buf = nopath_buf,
+                .err_msg_len = nopath_len,
                 .attempts = next_attempts,
             },
         };
         if (next_attempts >= UNLOCK_MAX_ATTEMPTS) {
+            var too_buf: [128]u8 = .{0} ** 128;
+            const too_len = copyInline(&too_buf, "Too many failed unlock attempts");
             state.* = .{ .error_modal = .{
                 .kind = .auth,
-                .message = "Too many failed unlock attempts",
+                .message_buf = too_buf,
+                .message_len = too_len,
                 .prior = .unlock_prompt,
             } };
         }
         return;
     };
     const key = api_auth.loadWithUnlock(io, path, draft) catch |err| {
-        var buf: [64]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "Unlock failed: {s}", .{@errorName(err)}) catch "Unlock failed";
+        // WU-1 (Fix A): write into inline buffer (was var buf: [64]u8 +
+        // state.err_msg = msg — aliased stack-local storage; Bug 1).
+        var buf: [128]u8 = .{0} ** 128;
+        const written = std.fmt.bufPrint(&buf, "Unlock failed: {s}", .{@errorName(err)}) catch blk: {
+            @memcpy(buf[0.."Unlock failed".len], "Unlock failed");
+            break :blk "Unlock failed";
+        };
         if (next_attempts >= UNLOCK_MAX_ATTEMPTS) {
             // REQ-VER-012 — 3rd (or later) wrong passphrase escalates
             // to .error_modal; user must Esc back to retry.
             state.* = .{ .error_modal = .{
                 .kind = .auth,
-                .message = msg,
+                .message_buf = buf,
+                .message_len = written.len,
                 .prior = .unlock_prompt,
             } };
             return;
@@ -486,7 +537,8 @@ pub fn submitUnlock(io: std.Io, state: *State) !void {
             .unlock_prompt = .{
                 .draft = payload.draft,
                 .draft_len = payload.draft_len,
-                .err_msg = msg,
+                .err_msg_buf = buf,
+                .err_msg_len = written.len,
                 .attempts = next_attempts,
             },
         };
@@ -630,7 +682,11 @@ pub fn drawErrorModal(win: *WindowMock, state: *State) !void {
     try win.print("Error: ", .{ .bold = true });
     try win.print(class_str, .{ .bold = true });
     try win.print(" ", .{});
-    try win.print(payload.message, .{});
+    // WU-1 (Fix A, D2): read inline message_buf[0..message_len]. See
+    // drawKeyEntry for the dangling-pointer rationale.
+    if (payload.message_len > 0) {
+        try win.print(payload.message_buf[0..payload.message_len], .{});
+    }
     if (payload.kind == .tls_gated) {
         try win.print(" — set ZARGEANT_RUN_TLS_HANDSHAKE=1", .{ .bold = true });
     }
@@ -646,6 +702,10 @@ pub fn dismissErrorModal(state: *State) void {
 
 /// Convenience: build an ErrorModal state from a runtime error and
 /// capture the current state's tag as `prior` so Esc can return.
+/// WU-1 (Fix A, D2): the `message` slice was dangling-prone — callers
+/// (e.g. `ae.message` from a TUI-thread channel payload) could pass a
+/// stack-local. We copy into the inline `message_buf` so the state
+/// owns its storage and survives the producing fn.
 pub fn openErrorModal(state: *State, kind: ErrorKind, message: []const u8) void {
     const prior: PriorKind = switch (std.meta.activeTag(state.*)) {
         .welcome => .welcome,
@@ -655,9 +715,12 @@ pub fn openErrorModal(state: *State, kind: ErrorKind, message: []const u8) void 
         .agent_loop => .agent_loop,
         .error_modal => .welcome, // fallback
     };
+    var msg_buf: [128]u8 = .{0} ** 128;
+    const msg_len = copyInline(&msg_buf, message);
     state.* = .{ .error_modal = .{
         .kind = kind,
-        .message = message,
+        .message_buf = msg_buf,
+        .message_len = msg_len,
         .prior = prior,
     } };
 }
@@ -766,6 +829,16 @@ pub fn runtimeDriverTick(io: std.Io, state: *State, channels: RuntimeDriverChann
 // =============================================================================
 // Internal helpers (test-friendly, no Zig std direct use beyond `std.Io`).
 // =============================================================================
+
+/// Copy `src` into a 128-byte inline buffer, returning the byte count
+/// actually written. Truncates if `src.len > 128`. Used to populate the
+/// inline `err_msg_buf` / `message_buf` fields without aliasing any
+/// stack-local storage (WU-1 / Bug 1 / 2026-09-01).
+inline fn copyInline(dst: *[128]u8, src: []const u8) usize {
+    const len: usize = @min(src.len, dst.len);
+    @memcpy(dst[0..len], src[0..len]);
+    return len;
+}
 
 /// Resolve the XDG credentials path without going through the heavy
 /// `api_auth.initialState` stat dance. Reads `$XDG_CONFIG_HOME` /
@@ -879,11 +952,12 @@ test "KeyEntry rejects malformed format (redisplay)" {
     const win = try WindowMock.init(testing.allocator, 80, 24);
     defer win.deinit();
     try drawKeyEntry(win, &state);
-    // Submit handler transitions back to key_entry with err_msg set.
+    // Submit handler transitions back to key_entry with err_msg_buf
+    // populated (WU-1 inline-buffer shape).
     submitKeyEntry(testing.io, testing.allocator, &state, null) catch {};
     try testing.expect(std.meta.activeTag(state) == .key_entry);
-    try testing.expect(state.key_entry.err_msg != null);
-    try testing.expectEqualStrings("Invalid key format", state.key_entry.err_msg.?);
+    try testing.expect(state.key_entry.err_msg_len > 0);
+    try testing.expectEqualStrings("Invalid key format", state.key_entry.err_msg_buf[0..state.key_entry.err_msg_len]);
 }
 
 test "KeyEntry advances to consent_prompt on API success" {
@@ -916,30 +990,34 @@ test "KeyEntry advances to consent_prompt on API success" {
     try testing.expectEqualStrings("CDEF", &state.consent_prompt.last_four);
 }
 
-test "KeyEntry redisplay on API validation failure" {
+test "drawKeyEntry renders err_msg_buf from inline buffer (renamed WU-1, REQ-TUI-006 scenario 3)" {
     // REQ-TUI-006 scenario 3 — when validateViaApi returns an error, the
-    // state stays in `.key_entry` with err_msg set (redisplay, not advance).
-    // We verify the redisplay path by setting an err_msg directly and
-    // rendering — the WindowMock snapshot shows the error banner text.
-    // (Calling submitKeyEntry here would time out on DNS; the redisplay
-    // behaviour is unit-verified through the state-shape contract.)
+    // state stays in `.key_entry` with err_msg_buf populated (redisplay,
+    // not advance). WU-1 renamed from "KeyEntry redisplay on API
+    // validation failure" after migrating to the inline-buffer shape
+    // (Fix A, 2026-09-01 Bug 1). Drawing reads err_msg_buf[0..err_msg_len]
+    // — no stack-local slice alias.
     var draft_buf: [256]u8 = .{0} ** 256;
     const draft = "test-key-1234567890ABCDEF";
     @memcpy(draft_buf[0..draft.len], draft);
+    const errmsg = "API rejected key: ConnectFailed";
+    var err_buf: [128]u8 = .{0} ** 128;
+    const err_len = copyInline(&err_buf, errmsg);
     var state: State = .{
         .key_entry = .{
             .draft = draft_buf,
             .draft_len = draft.len,
-            .err_msg = "API rejected key: ConnectFailed",
+            .err_msg_buf = err_buf,
+            .err_msg_len = err_len,
         },
     };
     const win = try WindowMock.init(testing.allocator, 80, 24);
     defer win.deinit();
     try drawKeyEntry(win, &state);
     try testing.expect(std.meta.activeTag(state) == .key_entry);
-    try testing.expect(state.key_entry.err_msg != null);
+    try testing.expect(state.key_entry.err_msg_len > 0);
     // The error message must be visible in the cell buffer (drawKeyEntry
-    // renders it via win.print()).
+    // renders err_msg_buf[0..err_msg_len] into row 2).
     var found = false;
     for (win.snapshot()) |cell| {
         if (cell.ch == 'A' or cell.ch == 'P') {
@@ -991,23 +1069,29 @@ test "Unlock Esc cancels to key_entry" {
     try testing.expect(std.meta.activeTag(state) == .key_entry);
 }
 
-test "Unlock wrong passphrase redisplay" {
+test "Unlock wrong passphrase redisplay (err_msg_buf inline, WU-1)" {
     // REQ-TUI-007 scenario 3 — submitUnlock returns error.DecryptFailed on
-    // wrong passphrase; state stays in unlock_prompt with err_msg set.
+    // wrong passphrase; state stays in unlock_prompt with err_msg_buf
+    // populated (WU-1 inline-buffer shape).
     var draft_buf: [256]u8 = .{0} ** 256;
     @memcpy(draft_buf[0..8], "bad-pass");
+    const errmsg = "Unlock failed: DecryptFailed";
+    var err_buf: [128]u8 = .{0} ** 128;
+    const err_len = copyInline(&err_buf, errmsg);
     var state: State = .{
         .unlock_prompt = .{
             .draft = draft_buf,
             .draft_len = 8,
-            .err_msg = "Unlock failed: DecryptFailed",
+            .err_msg_buf = err_buf,
+            .err_msg_len = err_len,
         },
     };
     const win = try WindowMock.init(testing.allocator, 80, 24);
     defer win.deinit();
     try drawUnlock(win, &state);
     try testing.expect(std.meta.activeTag(state) == .unlock_prompt);
-    try testing.expect(state.unlock_prompt.err_msg != null);
+    try testing.expect(state.unlock_prompt.err_msg_len > 0);
+    try testing.expectEqualStrings("Unlock failed: DecryptFailed", state.unlock_prompt.err_msg_buf[0..state.unlock_prompt.err_msg_len]);
 }
 
 // =============================================================================
@@ -1126,10 +1210,15 @@ test "submitConsentGrant writes <path>.sentinel at mode 0o600 (sentinel derivati
 
 test "ErrorModal tls_gated error surfaces env-var hint" {
     // REQ-TUI-009 scenario 1 — `ZARGEANT_RUN_TLS_HANDSHAKE=1` is rendered
-    // in the cell buffer when kind == .tls_gated.
+    // in the cell buffer when kind == .tls_gated. WU-1: seeded via the
+    // inline message_buf/message_len pair (no stack-local slice alias).
+    const msg = "real handshake not allowed";
+    var msg_buf: [128]u8 = .{0} ** 128;
+    const msg_len = copyInline(&msg_buf, msg);
     var state: State = .{ .error_modal = .{
         .kind = .tls_gated,
-        .message = "real handshake not allowed",
+        .message_buf = msg_buf,
+        .message_len = msg_len,
         .prior = .agent_loop,
     } };
     const win = try WindowMock.init(testing.allocator, 80, 24);
@@ -1154,10 +1243,15 @@ test "ErrorModal tls_gated error surfaces env-var hint" {
 
 test "ErrorModal dismiss returns to prior state" {
     // REQ-TUI-009 scenario 2 — Esc keypress transitions state from
-    // .error_modal back to the captured prior state.
+    // .error_modal back to the captured prior state. WU-1: inline
+    // message_buf shape.
+    const boom = "boom";
+    var boom_buf: [128]u8 = .{0} ** 128;
+    const boom_len = copyInline(&boom_buf, boom);
     var state: State = .{ .error_modal = .{
         .kind = .internal,
-        .message = "boom",
+        .message_buf = boom_buf,
+        .message_len = boom_len,
         .prior = .agent_loop,
     } };
     dismissErrorModal(&state);
@@ -1336,4 +1430,75 @@ test "WindowMock diff returns entries for cells that changed" {
     try testing.expectEqual(@as(u21, 'a'), entries[0].cell.ch);
     try testing.expectEqual(@as(u16, 3), entries[3].x);
     try testing.expectEqual(@as(u21, 'd'), entries[3].cell.ch);
+}
+
+// =============================================================================
+// CAP-12 — modal layout guards (WU-1, tui-input-flow-bugfixes-2).
+//
+// `err_msg_buf`/`err_msg_len` and `message_buf`/`message_len` MUST exist
+// on the three state payloads. The legacy `err_msg: ?[]const u8` and
+// `message: []const u8` fields MUST NOT exist (re-introducing them would
+// silently re-introduce Bug 1: stack-local slice dangling). These compile-
+// time-ish checks fail loudly if a contributor reverts the inline-buffer
+// shape.
+// =============================================================================
+
+test "CAP-12: KeyEntryState carries inline err_msg_buf (no dangling slice)" {
+    try testing.expect(@hasField(KeyEntryState, "err_msg_buf"));
+    try testing.expect(@hasField(KeyEntryState, "err_msg_len"));
+    try testing.expect(!@hasField(KeyEntryState, "err_msg"));
+
+    const s = KeyEntryState{};
+    try testing.expectEqual(@as(usize, 0), s.err_msg_len);
+    try testing.expectEqual(@as(u8, 0), s.err_msg_buf[0]);
+}
+
+test "CAP-12: UnlockState carries inline err_msg_buf (no dangling slice)" {
+    try testing.expect(@hasField(UnlockState, "err_msg_buf"));
+    try testing.expect(@hasField(UnlockState, "err_msg_len"));
+    try testing.expect(!@hasField(UnlockState, "err_msg"));
+
+    const s = UnlockState{};
+    try testing.expectEqual(@as(usize, 0), s.err_msg_len);
+    try testing.expectEqual(@as(u8, 0), s.err_msg_buf[0]);
+}
+
+test "CAP-12: ErrorModalState carries inline message_buf (no dangling slice, D2)" {
+    try testing.expect(@hasField(ErrorModalState, "message_buf"));
+    try testing.expect(@hasField(ErrorModalState, "message_len"));
+    try testing.expect(!@hasField(ErrorModalState, "message"));
+
+    const s = ErrorModalState{};
+    try testing.expectEqual(@as(usize, 0), s.message_len);
+    try testing.expectEqual(@as(u8, 0), s.message_buf[0]);
+}
+
+test "CAP-12: openErrorModal copies caller msg into inline buffer" {
+    // Regression guard for D2 — the previous `state.error_modal.message =
+    // msg` aliased the caller's stack-local. openErrorModal now copies
+    // the caller-provided msg into message_buf before returning.
+    var state: State = .{ .agent_loop = .{
+        .allocator = testing.allocator,
+        .cumulative = .empty,
+        .last_update_ms = 0,
+        .model = "",
+        .tokens = 0,
+    } };
+
+    // Caller-side buffer that will go out of scope after the call.
+    var caller_buf: [32]u8 = undefined;
+    const msg_src: []const u8 = blk: {
+        const lit = "stack-local test msg";
+        @memcpy(caller_buf[0..lit.len], lit);
+        break :blk caller_buf[0..lit.len];
+    };
+    openErrorModal(&state, .network, msg_src);
+
+    // The caller's local is no longer needed — verify the inline buffer
+    // owns a copy that survives its destruction.
+    @memset(&caller_buf, 0);
+    try testing.expect(std.meta.activeTag(state) == .error_modal);
+    try testing.expectEqual(ErrorKind.network, state.error_modal.kind);
+    try testing.expect(state.error_modal.message_len > 0);
+    try testing.expectEqualStrings("stack-local test msg", state.error_modal.message_buf[0..state.error_modal.message_len]);
 }
