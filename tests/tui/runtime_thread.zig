@@ -642,7 +642,7 @@ test "modal: initialModalState(.needs_first_entry) returns .key_entry" {
     const state = ModalAuth.initialModalState(Auth.AuthState.needs_first_entry);
     try testing.expect(std.meta.activeTag(state) == .key_entry);
     try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
-    try testing.expect(state.key_entry.err_msg == null);
+    try testing.expect(state.key_entry.err_msg_len == 0);
 }
 
 test "modal: initialModalState(.has_disk_file) returns .unlock_prompt" {
@@ -651,7 +651,7 @@ test "modal: initialModalState(.has_disk_file) returns .unlock_prompt" {
     const state = ModalAuth.initialModalState(Auth.AuthState.has_disk_file);
     try testing.expect(std.meta.activeTag(state) == .unlock_prompt);
     try testing.expectEqual(@as(usize, 0), state.unlock_prompt.draft_len);
-    try testing.expect(state.unlock_prompt.err_msg == null);
+    try testing.expect(state.unlock_prompt.err_msg_len == 0);
 }
 
 test "modal: initialModalState(.has_memory_key) returns .welcome (defensive)" {
@@ -1936,7 +1936,7 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
         try testing.expect(consumed);
         try testing.expect(std.meta.activeTag(state) == .key_entry);
         try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
-        try testing.expect(state.key_entry.err_msg == null);
+        try testing.expect(state.key_entry.err_msg_len == 0);
     }
     // S-TIW-013: key_entry + .esc → no mutation, returns false.
     {
