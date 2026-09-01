@@ -550,16 +550,16 @@ pub fn tuiThreadLoop(
                 // type a literal 'c' into the API-key draft, and so the
                 // user has a clean escape hatch from every screen.
                 if (k.code == .char and k.mods.ctrl) {
-                    // ponytail: per tui-input-flow-bugfixes-2 CAP-09
-                    // (R2a redirect) + design D3, this is the writer
-                    // side of the cancel-pipe now (replaces the SIGINT
-                    // handler at cancel_signal.zig:55-61 after WU-4
-                    // lands — for now both writers coexist, idempotent).
-                    // Async-signal-safe: single write(2) syscall, mirrors
-                    // cancel_signal.zig:55-61. Atomic first (downstream
-                    // readers stop), then pipe (worker aborts within
-                    // ≤100ms via REQ-NEW-006 invariant). `cancel_pipe`
-                    // is null only on test/no-TTY paths.
+                    // tui-input-flow-bugfixes-2 CAP-09 (R2a redirect,
+                    // design D3): this is THE writer of the cancel
+                    // pipe now (post-WU-4 R2a — the SIGINT handler
+                    // at src/cancel_signal.zig was removed). Async-
+                    // signal-safe: single write(2) syscall, no libc.
+                    // Atomic first (downstream readers stop), then
+                    // pipe (worker aborts within ≤100ms via REQ-NEW-
+                    // 006 invariant — verified by tests/cancel_e2e.zig
+                    // CAP-09 writer-side test). `cancel_pipe` is null
+                    // only on test/no-TTY paths.
                     shutdown.store(true, .seq_cst);
                     if (cancel_pipe) |p| _ = std.os.linux.write(p[1], &.{0x01}, 1);
                     // Also drain Shutdown on the channel so the inner

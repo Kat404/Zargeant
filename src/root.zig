@@ -26,16 +26,16 @@ pub const fixtures_test = @import("fixtures_test.zig");
 //
 // R-PR 2 re-exports: main_mod (entry point) + password_input (scaffold).
 // R-PR 3 re-exports: modal (WindowMock + State union + 5 draw fns).
+//
+// tui-input-flow-bugfixes-2 WU-4 (R2a): cancel_signal module was deleted
+// (no non-TUI callers remain after the SIGINT install in main.zig was
+// dropped). No re-export needed.
 pub const channels = @import("channels.zig");
 pub const runtime = @import("runtime.zig");
 pub const tui = @import("tui.zig");
 pub const main_mod = @import("main.zig");
 pub const password_input = @import("password_input.zig");
 pub const modal = @import("modal.zig");
-// tui-input-bugfixes-1: SIGINT bridge to cancel-pipe writer. Re-exported
-// at root so build.zig's lib_mod wiring (`src/root.zig` is the test
-// root) pulls in the cancel_signal module's in-file tests.
-pub const cancel_signal = @import("cancel_signal.zig");
 
 // R-PR 2 replaces the R-PR 0 build-toolchain placeholder main with the
 // real entry from src/main.zig. The exe is built with root.zig as the
@@ -79,10 +79,6 @@ comptime {
     _ = password_input.read;
     _ = password_input.State;
     _ = modal.WindowMock;
-    // tui-input-bugfixes-1: pull cancel_signal symbols so its tests run.
-    _ = cancel_signal.installSigintHandler;
-    _ = cancel_signal.clobber_window_active;
-    _ = cancel_signal.resetForTest;
     // tui-input-bugfixes-1 WU-D: pull mock_server Config + startWithConfig
     // so tests/cancel_e2e.zig can route through lib_mod.
     _ = mock_server.startWithConfig;
@@ -149,8 +145,9 @@ test "root.zig re-exports are wired" {
     try std.testing.expect(main == main_mod.main);
     // tui-recovery R-PR 3 re-export: modal.
     try std.testing.expect(modal == @import("modal.zig"));
-    // tui-input-bugfixes-1: cancel_signal re-export wired.
-    try std.testing.expect(cancel_signal == @import("cancel_signal.zig"));
+    // tui-input-flow-bugfixes-2 WU-4: cancel_signal module removed
+    // (no non-TUI callers remained). Re-export and comptime touches
+    // for cancel_signal symbols are gone.
     // tui-input-bugfixes-1 WU-D: mock_server Config + startWithConfig
     // re-exports resolve through lib_mod → tests/cancel_e2e.zig.
     try std.testing.expect(@TypeOf(mock_server.startWithConfig) ==
