@@ -75,6 +75,14 @@ pub const Config = struct {
     /// reads it via ThreadArgs to seed the modal state (`.key_entry` when
     /// `.needs_first_entry`, `.unlock_prompt` when `.has_disk_file`).
     initial_auth_state: @import("api_auth.zig").AuthState = .needs_first_entry,
+    /// tui-input-bugfixes-1 (REQ-BUGFIX1-003 / D5): optional cancel-pipe
+    /// fds from main() scope. Null = Runtime creates its own pipe (the
+    /// pre-bugfixes behavior, kept for back-compat with tools/debug_call.zig
+    /// and 17 headless test sites that pass `.{}`). Non-null = Runtime
+    /// COPIES the fds into its owned `cancel_pipe` field (and takes
+    /// ownership for deinit-close); the caller's pipe remains live for
+    /// the SIGINT handler in main(). Default null.
+    cancel_pipe: ?*const [2]i32 = null,
 };
 
 /// Agent-thread owned classification of ChunkEvent.err results (REQ-TUI-026).
@@ -217,10 +225,26 @@ pub const Runtime = struct {
     /// Create the runtime. Allocates a Linux pipe for cancel propagation
     /// and the 5 channel edges. Threads are NOT spawned yet — call
     /// `run(io)` for that.
+    ///
+    /// tui-input-bugfixes-1 (REQ-BUGFIX1-003 / D5): if
+    /// `config.cancel_pipe != null`, Runtime copies the fds from the
+    /// caller (typically main.zig's static-lifetime pipe) into its own
+    /// `cancel_pipe` field and takes ownership for deinit-close. The
+    /// caller's pipe remains live for the SIGINT handler registered
+    /// in main(). When `config.cancel_pipe == null` (the default for
+    /// tools/debug_call.zig and headless tests), Runtime allocates a
+    /// fresh pipe as before — preserving back-compat with 17 existing
+    /// callers that pass `.{}`.
     pub fn spawn(config: Config) !Runtime {
         var cancel_pipe: [2]i32 = .{ -1, -1 };
-        const rc = std.os.linux.pipe(&cancel_pipe);
-        if (rc != 0) return error.PipeFailed;
+        if (config.cancel_pipe) |src| {
+            // Copy fds from caller (caller retains its own copy for the
+            // SIGINT handler in main.zig's static-lifetime array).
+            cancel_pipe = src.*;
+        } else {
+            const rc = std.os.linux.pipe(&cancel_pipe);
+            if (rc != 0) return error.PipeFailed;
+        }
 
         return .{
             .config = config,
@@ -375,6 +399,14 @@ fn tuiRealMain(args: *const ThreadArgs) void {
             @import("modal.zig").Cell,
             n,
         ) catch null;
+        // REQ-BUGFIX1-004: zero-init the prev_snapshot buffer. Without
+        // this, alloc returns undefined memory and the first frame's diff
+        // compares against garbage, triggering a full-frame emit of
+        // ~38 KB that stalls slow terminals for ~2 s on the first 2
+        // keystrokes (see explore obs#1378 §Bug 3).
+        if (lc.prev_snapshot != null) {
+            @memset(lc.prev_snapshot.?, .{ .ch = ' ', .style = .{} });
+        }
     }
 
     // Stage 2: per-frame loop. Real TTY: tuiThreadLoop brackets renders

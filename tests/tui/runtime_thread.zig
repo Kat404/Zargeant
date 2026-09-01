@@ -1292,6 +1292,38 @@ test "W1-2: tuiRealMain allocates prev_snapshot via args.allocator.alloc" {
     try testing.expect(std.mem.indexOfPos(u8, content, sig, "args.allocator.alloc") != null);
 }
 
+test "W1-3: prev_snapshot is zero-initialized at allocation (REQ-BUGFIX1-004)" {
+    // REQ-BUGFIX1-004 — `lifecycle.prev_snapshot` MUST be zero-initialized
+    // immediately after allocation. Without the @memset, alloc returns
+    // undefined memory and the first frame's diff compares against
+    // garbage, triggering a full-frame emit of ~38 KB that stalls slow
+    // terminals for ~2 s on the first 2 keystrokes (obs#1378 §Bug 3).
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/runtime.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+
+    // Locate the prev_snapshot alloc site.
+    const alloc_pos = std.mem.indexOf(u8, content, "prev_snapshot = args.allocator.alloc") orelse {
+        try testing.expect(false);
+        return;
+    };
+    // The @memset MUST appear AFTER the alloc (within the same function
+    // body — within a generous window of 1024 bytes is plenty for the
+    // guarded null-check + @memset pair).
+    const slice_after_alloc = content[alloc_pos..@min(alloc_pos + 1024, content.len)];
+    try testing.expect(std.mem.indexOf(u8, slice_after_alloc, "@memset") != null);
+    // The @memset MUST use the canonical Cell-zero form: ch=' ' and
+    // style=Style{} (default). Zero-init to all-zero bytes would set
+    // ch=0 (NUL), which is NOT the same as ' ' (0x20) and would
+    // re-trigger the same first-frame full-emit bug.
+    try testing.expect(std.mem.indexOf(u8, slice_after_alloc, ".ch = ' '") != null);
+    try testing.expect(std.mem.indexOf(u8, slice_after_alloc, ".style = .{}") != null);
+}
+
 // =============================================================================
 // tui-render-wiring W3 tests (REQ-RW-003, REQ-RW-005, REQ-RW-007)
 // =============================================================================

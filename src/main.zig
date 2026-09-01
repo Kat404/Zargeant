@@ -21,6 +21,7 @@ const logger = @import("logger.zig");
 const sandbox = @import("sandbox.zig");
 const runtime = @import("runtime.zig");
 const api_auth = @import("api_auth.zig");
+const cancel_signal = @import("cancel_signal.zig");
 
 // =============================================================================
 // Linux-only comptime guard (matches every other module in the project).
@@ -196,6 +197,34 @@ pub fn main(init: std.process.Init) !void {
         defer mock_handle.?.deinit();
     }
 
+    // tui-input-bugfixes-1 (REQ-BUGFIX1-003 / D1): hoist cancel_pipe to
+    // main() scope. Runtime.spawn copies the fds into its own field
+    // (and takes ownership for deinit-close); our copy remains live for
+    // the SIGINT handler below. The pointer outlives the handler
+    // because main() outlives the SIGINT install — process exits before
+    // main() returns, by which time the handler is irrelevant.
+    var main_cancel_pipe: [2]i32 = .{ -1, -1 };
+    {
+        const rc = std.os.linux.pipe(&main_cancel_pipe);
+        if (rc != 0) std.process.exit(1);
+    }
+    defer {
+        // Close our copy of the fds on exit. Runtime.deinit will close
+        // ITS copy independently. Closing twice on the same fd would
+        // EBADF — Runtime's copy has its own values (copied at spawn),
+        // so this is safe.
+        if (main_cancel_pipe[0] >= 0) _ = std.os.linux.close(main_cancel_pipe[0]);
+        if (main_cancel_pipe[1] >= 0) _ = std.os.linux.close(main_cancel_pipe[1]);
+    }
+
+    // tui-input-bugfixes-1 (REQ-BUGFIX1-001 / D2 / D3): install SIGINT
+    // handler BEFORE std.Io.Threaded.init. The handler writes 1 byte to
+    // main_cancel_pipe[1] on Ctrl+C, unblocking the watchCancelPipe
+    // thread (bridge_sync_async.zig:71) during the 1-3s TLS handshake
+    // when mibu's raw mode (ISIG=false) prevents kernel-generated
+    // SIGINT (obs#1342).
+    cancel_signal.installSigintHandler(&main_cancel_pipe[1]);
+
     // Runtime.run() delegation. R-PR 2 ships the R-PR 1 Runtime stub;
     // R-PR 4 replaces the TUI thread body with the real mibu lifecycle.
     var rt = runtime.Runtime.spawn(.{
@@ -203,6 +232,7 @@ pub fn main(init: std.process.Init) !void {
         .tls_gated = parsed.tls_gated,
         .initial_auth_state = auth_state,
         .mock_handle = mock_handle,
+        .cancel_pipe = &main_cancel_pipe,
     }) catch {
         std.process.exit(1);
     };
@@ -219,7 +249,15 @@ pub fn main(init: std.process.Init) !void {
     // production builds swap to page_allocator + leak suppression.
     var debug_alloc: std.heap.DebugAllocator(.{}) = .init;
     defer _ = debug_alloc.deinit();
+
+    // tui-input-bugfixes-1 (R6): mark the stdlib-init window so the
+    // SIGINT handler can detect signals fired during std.Io.Threaded.init
+    // (where Zig 0.16's Threaded backend MAY clobber our handler per
+    // obs#1382 D4). Counter is incremented before init and decremented
+    // after — any SIGINT in the window is observable in a debugger.
+    _ = cancel_signal.clobber_window_active.fetchAdd(1, .seq_cst);
     var threaded = std.Io.Threaded.init(debug_alloc.allocator(), .{ .async_limit = null });
+    _ = cancel_signal.clobber_window_active.fetchSub(1, .seq_cst);
     defer threaded.deinit();
     const stdlib_io = threaded.io();
 
