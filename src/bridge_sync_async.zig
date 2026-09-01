@@ -1,23 +1,38 @@
 // src/bridge_sync_async.zig — sync→async bridge for stdlib networking.
 //
 // Per design obs#1369 + investigation docs/io-async-bug-investigation.md.
-// Spawns a side-thread cancel watcher that forwards cancel_pipe[0]
-// readability to Future.cancel(io) — which delivers SIGIO to the worker
-// (Section 4.1). The blocking await(io) on the calling thread is woken
-// by the futex signal triggered inside Future.cancel. No busy-poll, no
-// atomic flag, no runBlockingVoid variant. ponytail: cancel_pipe is
-// threaded from Runtime.cancel_pipe[0] (runtime.zig:222) — never created
-// per call (REQ-NEW-006).
+//
+// tui-input-flow-bugfixes-2 WU-4 (R2a, CAP-R2): the side-thread
+// watchCancelPipe that forwarded cancel_pipe[0] readability to
+// Future.cancel(io) has been REMOVED. The watchdog called Future.cancel
+// from a non-awaiter thread, which is stdlib UB per
+// /usr/lib/zig/std/Io.zig:1190 ("Idempotent. Not threadsafe"). After R2a,
+// the TUI validation path no longer calls runBlocking — the worker thread
+// (CAP-11, WU-2) calls validateViaApiWithTarget directly. Cancel-pipe
+// readability is observed by the worker via poll(2) inside api_client
+// (api_client.zig:376 pollWithCancel), NOT by a side-thread watcher.
+//
+// The TUI's Ctrl+C keystroke writes 1 byte to cancel_pipe[1] via the
+// key-event intercept at src/tui.zig:564 (CAP-09, WU-3). The worker
+// observes the readable pipe within ≤100ms (REQ-NEW-006 invariant,
+// verified by tests/termios_sim.zig and tests/cancel_e2e.zig).
+//
+// runBlocking + runBlockingStream are retained as the io.async+await
+// wrappers used by api_auth.validateViaApiWithTarget (api_auth.zig:246).
+// The cancel_pipe_read_fd parameter is now vestigial (no watcher reads
+// it) but kept for source-compat with the api_auth caller; pass -1.
+//
+// ponytail: cancel_pipe is threaded from Runtime.cancel_pipe[0]
+// (runtime.zig:222) — never created per call (REQ-NEW-006).
 
 const std = @import("std");
 
 pub const BridgeError = error{ Cancelled, BridgeFailed };
 
 /// Run `f(args)` synchronously on the calling thread. `cancel_pipe_read_fd`
-/// ≥ 0 spawns a watcher that calls Future.cancel(io) on pipe readability
-/// (which SIGIO-interrupts the worker). Pass -1 to skip the watcher
-/// (unit tests without a runtime). Returns `error.BridgeFailed` if
-/// `io.async` returns the eager-fallback path (D9).
+/// is vestigial after WU-4 (R2a removed the watcher thread); pass -1.
+/// Returns `error.BridgeFailed` if `io.async` returns the eager-fallback
+/// path (D9).
 pub fn runBlockingStream(
     io: std.Io,
     cancel_pipe_read_fd: i32,
@@ -30,27 +45,24 @@ pub fn runBlockingStream(
 /// Run `f(args)` synchronously on the calling thread. Generic — works for
 /// any async fn return type (with or without error union). The result type
 /// is inferred from `f`'s return type (which includes any error union).
-/// Used by T3.2 (the TLS path in `validateViaApiWithTarget`) so
-/// `Future.cancel(io)` interrupts the stdlib worker via SIGIO during the
-/// handshake, per investigation Section 4.1 + REQ-NEW-006 ≤100 ms abort.
+/// Used by T3.2 (the TLS path in `validateViaApiWithTarget`).
+///
+/// ponytail: `cancel_pipe_read_fd` is no longer consumed (R2a / WU-4
+/// removed watchCancelPipe). The worker that calls validateViaApiWithTarget
+/// observes cancel_pipe[0] via poll(2) directly inside api_client.zig's
+/// pollWithCancel. Kept as a parameter for source-compat.
 pub fn runBlocking(
     io: std.Io,
     cancel_pipe_read_fd: i32,
     f: anytype,
     args: anytype,
 ) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
+    _ = cancel_pipe_read_fd; // vestigial after R2a (WU-4)
     const Result = @typeInfo(@TypeOf(f)).@"fn".return_type.?;
     var fut: std.Io.Future(Result) = io.async(f, args);
     defer cancelFuture(@TypeOf(fut), &fut, io);
 
     if (fut.any_future != null) {
-        var watcher: ?std.Thread = null;
-        if (cancel_pipe_read_fd >= 0) {
-            watcher = std.Thread.spawn(.{}, watchCancelPipe, .{
-                @TypeOf(fut), cancel_pipe_read_fd, &fut, io,
-            }) catch null;
-        }
-        defer if (watcher) |w| w.join();
         return try fut.await(io);
     }
     return error.BridgeFailed;
@@ -65,22 +77,6 @@ fn cancelFuture(comptime Fut: type, fut: *Fut, io: std.Io) void {
     } else _ = fut.cancel(io);
 }
 
-/// Side-thread watcher: polls `read_fd`; on readability, cancels the
-/// Future. Exits on fd error (ERR/HUP/NVAL). Per Section 4.1, Future.cancel
-/// invokes pthread_kill/tgkill → worker EINTR.
-fn watchCancelPipe(comptime Fut: type, read_fd: i32, future: *Fut, io: std.Io) void {
-    var pfds: [1]std.os.linux.pollfd = .{.{ .fd = read_fd, .events = std.os.linux.POLL.IN, .revents = 0 }};
-    while (true) {
-        const n = std.os.linux.poll(&pfds, 1, -1);
-        if (n == std.math.maxInt(usize)) break;
-        if (pfds[0].revents & (std.os.linux.POLL.ERR | std.os.linux.POLL.HUP | std.os.linux.POLL.NVAL) != 0) break;
-        if (pfds[0].revents & std.os.linux.POLL.IN != 0) {
-            cancelFuture(Fut, future, io);
-            break;
-        }
-    }
-}
-
 const testing = std.testing;
 
 test "runBlockingStream propagates function error" {
@@ -90,64 +86,4 @@ test "runBlockingStream propagates function error" {
         }
     };
     try testing.expectError(error.FailingForTest, runBlockingStream(testing.io, -1, FailingFn.f, .{testing.io}));
-}
-
-test "watchCancelPipe exits cleanly on HUP (write end closed)" {
-    var p: [2]i32 = .{ -1, -1 };
-    try testing.expectEqual(@as(usize, 0), std.os.linux.pipe(&p));
-    _ = std.os.linux.close(p[1]);
-    p[1] = -1;
-    defer _ = std.os.linux.close(p[0]);
-    const Fut = std.Io.Future(std.Io.net.Stream);
-    var fut: Fut = .{ .any_future = null, .result = undefined };
-    const t = try std.Thread.spawn(.{}, watchCancelPipe, .{ Fut, p[0], &fut, testing.io });
-    t.join();
-}
-
-// T3.7 — Synthetic cancel-latency test (Opción B WU-3, REQ-NEW-006 acceptance).
-// Verifies that the cancel-pipe watcher detects pipe readability and calls
-// cancel within 100 ms. Deterministic — does not require real network or DNS.
-//
-// Implementation note: stdlib's `Future.cancel(io)` panics if called from a
-// thread other than the awaiter (the `.pending_awaited => unreachable` arm
-// in Threaded.zig:2507). The bridge's watcher races with the caller's await
-// for that reason, so we instead measure the watcher's poll() latency with
-// a no-op Future (any_future == null) — this is the meaningful REQ-NEW-006
-// invariant: "when a byte is written to cancel_pipe[1], the in-flight op
-// SHALL abort within 100 ms". The watcher is the only component that detects
-// pipe readability; the SIGIO dispatch (Threaded.zig:654-686) is a pure
-// mechanical consequence of the watcher firing.
-//
-// ponytail: A full SIGIO-dispatch test would require spinning up a real
-// std.Io.Threaded + Future + worker thread, then racing the cancel watcher
-// against the await — the stdlib's state machine makes that racy and the
-// test would be flaky. Watcher-poll latency is the measurable proxy.
-test "watchCancelPipe detects pipe readability within 100 ms (REQ-NEW-006)" {
-    var pipe: [2]i32 = .{ -1, -1 };
-    try testing.expectEqual(@as(usize, 0), std.os.linux.pipe(&pipe));
-
-    // No-op Future (any_future == null) so cancel() inside the watcher is a
-    // no-op — we measure how fast the watcher DETECTS readability, not how
-    // fast stdlib dispatches SIGIO.
-    const Fut = std.Io.Future(u32);
-    var fut: Fut = .{ .any_future = null, .result = undefined };
-
-    const watcher = try std.Thread.spawn(.{}, watchCancelPipe, .{ Fut, pipe[0], &fut, testing.io });
-
-    // Sleep 20 ms then write a byte to the cancel pipe.
-    var ts = std.os.linux.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
-    _ = std.os.linux.nanosleep(&ts, null);
-
-    const write_at = std.Io.Clock.real.now(testing.io);
-    const byte: [1]u8 = .{0x01};
-    _ = std.os.linux.write(pipe[1], &byte, 1);
-
-    watcher.join();
-    _ = std.os.linux.close(pipe[0]);
-    _ = std.os.linux.close(pipe[1]);
-
-    const elapsed_ns = std.Io.Clock.real.now(testing.io).nanoseconds - write_at.nanoseconds;
-    const elapsed_ms: u64 = @intCast(@divFloor(elapsed_ns, std.time.ns_per_ms));
-    std.debug.print("\n[cancel-latency-test] watcher detected readability in {d} ms\n", .{elapsed_ms});
-    try testing.expect(elapsed_ms < 100);
 }

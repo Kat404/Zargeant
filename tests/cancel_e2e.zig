@@ -1,21 +1,21 @@
-// tests/cancel_e2e.zig — tui-input-bugfixes-1 automated cancel-path tests.
+// tests/cancel_e2e.zig — cancel-path tests for the TUI.
 //
-// Spec:    sdd/tui-input-bugfixes-1/spec     REQ-BUGFIX1-002, REQ-BUGFIX1-006
-// Design:  sdd/tui-input-bugfixes-1/design  WU-C static-grep + WU-D e2e
+// tui-input-bugfixes-1 WU-D landed the original e2e test
+// (REQ-BUGFIX1-006) and the SIGINT install-order static-grep
+// (REQ-BUGFIX1-002, since removed by WU-4).
 //
-// Two test layers:
-//
-// 1. Static-grep guard (REQ-BUGFIX1-002): verifies the SIGINT handler
-//    install call appears BEFORE `std.Io.Threaded.init` in main.zig. A
-//    later install would race with stdlib's signal-init window and
-//    get clobbered, breaking Ctrl+C during TLS handshake.
-//
-// 2. End-to-end cancel (REQ-BUGFIX1-006): starts mock_server with
-//    cancel_delay_ms=5000 (simulated slow handshake), calls
-//    `validateViaApiWithTarget` against the mock server, writes a
-//    byte to cancel_pipe[1] after 100ms, asserts the call returns
-//    `error.Cancelled` within 1000ms wall-clock. Gated by
-//    `ZARGEANT_RUN_TUI_CANCEL_E2E=1` to keep fast CI green.
+// tui-input-flow-bugfixes-2:
+//   - WU-3 (CAP-09) added a writer-side latency assertion — the
+//     Ctrl+C key-event intercept at src/tui.zig writes 1 byte to
+//     cancel_pipe[1] after setting shutdown; this test verifies the
+//     byte is observable on cancel_pipe[0] within ≤1ms (POSIX kernel
+//     roundtrip is microseconds).
+//   - WU-4 (R2a) removed the SIGINT-handler static-grep test (CAP-R3)
+//     because the SIGINT install was deleted from main.zig. The e2e
+//     cancel-pipe test is RETAINED: it exercises api_auth's cancel
+//     path end-to-end (validateViaApiWithTarget → cancel-pipe poll →
+//     error.Cancelled), which is still the property the regression
+//     test exists to guard.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -31,43 +31,6 @@ comptime {
 const testing = std.testing;
 const api_auth = @import("api_auth");
 const mock_server = @import("mock_server");
-
-// =============================================================================
-// Static-grep guard: handler install BEFORE std.Io.Threaded.init
-// =============================================================================
-
-test "static-grep: installSigintHandler appears BEFORE std.Io.Threaded.init in main.zig (REQ-BUGFIX1-002)" {
-    // REQ-BUGFIX1-002 — SIGINT handler installation SHALL complete
-    // BEFORE `std.Io.Threaded.init(allocator, .{...})` is called in
-    // main.zig. Install order matters: Zig 0.16's Threaded backend may
-    // register its own signal handlers during init, clobbering ours.
-    const content = try std.Io.Dir.cwd().readFileAlloc(
-        testing.io,
-        "src/main.zig",
-        testing.allocator,
-        .limited(1 << 20),
-    );
-    defer testing.allocator.free(content);
-
-    // Locate both call sites. The naive `std.Io.Threaded.init` substring
-    // would also match doc-comment occurrences (e.g. line 221 mentions
-    // the call in a comment that describes the BEFORE requirement), so
-    // we anchor on the statement form `var threaded = std.Io.Threaded.init`
-    // to find the actual call site. The install_pos anchor is
-    // `installSigintHandler(` (with the open paren) which only matches
-    // the call expression, never the comment that uses the bare name.
-    const install_pos = std.mem.indexOf(u8, content, "installSigintHandler(") orelse {
-        try testing.expect(false); // installSigintHandler call MUST exist in main.zig
-        return;
-    };
-    const threaded_init_pos = std.mem.indexOf(u8, content, "var threaded = std.Io.Threaded.init") orelse {
-        try testing.expect(false); // Threaded.init statement MUST exist in main.zig
-        return;
-    };
-
-    // The install MUST precede the Threaded.init.
-    try testing.expect(install_pos < threaded_init_pos);
-}
 
 // =============================================================================
 // End-to-end cancel test (gated by env var)
