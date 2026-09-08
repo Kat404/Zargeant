@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const mibu = @import("mibu");
+const terminal = @import("terminal");
 const logger = @import("logger.zig");
 
 // =============================================================================
@@ -66,7 +66,7 @@ pub const AuthKind = enum {
 /// storage after the worker exits.
 pub const Event = union(enum) {
     // TUI→Agent (7)
-    KeyPress: mibu.events.Key,
+    KeyPress: terminal.event.Key,
     ApiKeySubmitted: []const u8,
     UnlockPasswordSubmitted: []const u8,
     UserToolRequest: UserToolArgs,

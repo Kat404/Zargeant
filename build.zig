@@ -173,6 +173,10 @@ pub fn build(b: *std.Build) void {
     // `terminal.event.pollReadable` exists on the namespace.
     terminal_mod.addImport("event", event_mod);
     exe_mod.addImport("terminal", terminal_mod);
+    // PR 6 (terminal-control-lib-from-scratch, WU 6.3): lib_mod now needs
+    // `terminal` so src/tui.zig + src/channels.zig can `@import("terminal")`.
+    // mibu is kept for WU 6.5 removal.
+    lib_mod.addImport("terminal", terminal_mod);
 
     // test step
     const test_mod = b.createModule(.{
@@ -181,6 +185,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .imports = &.{
             .{ .name = "mibu", .module = mibu_mod },
+            .{ .name = "terminal", .module = terminal_mod },
         },
     });
     test_mod.addIncludePath(b.path("test"));
@@ -266,6 +271,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/tui/runtime_thread.zig"),
         .imports = &.{
             .{ .name = "mibu", .module = mibu_mod },
+            .{ .name = "terminal", .module = terminal_mod },
             .{ .name = "api_auth", .module = lib_mod },
             .{ .name = "api_client", .module = lib_mod },
             .{ .name = "channels", .module = lib_mod },
