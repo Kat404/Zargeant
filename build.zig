@@ -167,6 +167,11 @@ pub fn build(b: *std.Build) void {
     terminal_mod.addImport("style", style_mod);
     terminal_mod.addImport("dpm", dpm_mod);
     terminal_mod.addImport("kitty", kitty_mod);
+    // PR 3 (terminal-control-lib-from-scratch WU 3.3) — terminal_mod
+    // re-exports event types so src/tui.zig (in PR 6) can do
+    // `terminal.event.nextWithTimeout(...)` and the test file can verify
+    // `terminal.event.pollReadable` exists on the namespace.
+    terminal_mod.addImport("event", event_mod);
     exe_mod.addImport("terminal", terminal_mod);
 
     // test step

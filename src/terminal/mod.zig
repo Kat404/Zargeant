@@ -14,6 +14,19 @@ pub const cursor = @import("cursor");
 pub const style = @import("style");
 pub const dpm = @import("dpm");
 pub const kitty = @import("kitty");
+pub const event = @import("event");
+
+// Top-level re-exports for convenience (mirrors PR 1+2 pattern; PR 6 will
+// reference `terminal.event.Key` rather than `terminal.event.event.Key`).
+pub const RawTerm = term.RawTerm;
+pub const TermSize = term.TermSize;
+pub const KittyFlags = kitty.KittyFlags;
+pub const Mode = dpm.Mode;
+pub const Key = event.Key;
+pub const Event = event.Event;
+pub const KeyCode = event.KeyCode;
+pub const Mods = event.Mods;
+pub const EventKind = event.EventKind;
 
 test {
     std.testing.refAllDecls(@This());

@@ -185,28 +185,60 @@ pub const Parser = struct {
     }
 
     /// Drive the parser until one Event can be returned, the timeout
-    /// elapses, or the read returns EOF/error. The 3-arg skeleton in WU 3.2;
-    /// WU 3.3 adds the 4th `pending` parameter and the C9 EINTR branch.
-    pub fn next(self: *Parser, _: std.Io, file: std.Io.File, timeout_ms: u32) anyerror!Event {
-        // ponytail: WU 3.2 implements the base parser. EINTR/pending handling
-        // and `pending` parameter arrive in WU 3.3 alongside the locked 4-arg
-        // signature. Poll/read are sequential here; the production driver
-        // (PR 6 caller) is the only consumer of this stub.
+    /// elapses, or the read returns EOF/error. The WU 3.3 form takes the
+    /// `pending` atomic pointer (C22, C9) and an injected `poll_fn`
+    /// (D4/C35 fix). Production callers use the free function
+    /// `nextWithTimeout`; tests use this method directly with a mock
+    /// `poll_fn` to drive C9 EINTR scenarios deterministically.
+    ///
+    /// C9 contract: when `poll_fn` returns `error.Interrupted` (EINTR from
+    /// SIGWINCH), the parser checks `pending.load(.seq_cst)` (D1). If the
+    /// caller stored `true` in the atomic (the SIGWINCH handler at
+    /// src/tui.zig:153-157 does this), the parser returns the void
+    /// `.resize` event. Otherwise it returns `.none`. The parser does NOT
+    /// call `getSize` — the caller at src/tui.zig:578-583 handles
+    /// dimension refresh in the `.resize` arm.
+    pub fn next(
+        self: *Parser,
+        _: std.Io,
+        file: std.Io.File,
+        timeout_ms: u32,
+        pending: *const std.atomic.Value(bool),
+        poll_fn: *const fn (fds: []linux.pollfd, timeout: i32) anyerror!usize,
+    ) anyerror!Event {
         if (builtin.os.tag != .linux) {
             return .timeout;
         }
-        const deadline_ns: u64 = @as(u64, timeout_ms) * std.time.ns_per_ms;
 
-        // 1) Poll for readability.
+        // 1) Poll for readability. On EINTR (C9), check `pending` and
+        // return early — the parser does not retry the poll (the SIGWINCH
+        // handler has already stored into the atomic).
         var pfd: linux.pollfd = .{
             .fd = file.handle,
             .events = linux.POLL.IN,
             .revents = 0,
         };
-        const ready = std.posix.poll((&pfd)[0..1], @intCast(@as(i64, @intCast(deadline_ns))));
-        _ = ready catch return .timeout;
+        const timeout_i32: i32 = std.math.cast(i32, timeout_ms) orelse std.math.maxInt(i32);
+        const ready = poll_fn((&pfd)[0..1], timeout_i32) catch |err| switch (err) {
+            // C9 — EINTR after SIGWINCH delivery. Per design D1, load
+            // with `.seq_cst` to match the handler's `.seq_cst` store at
+            // src/tui.zig:153-157. On x86_64 and AArch64, `.seq_cst` and
+            // `.acquire` emit identical instructions; `.seq_cst` is the
+            // chosen safety margin (peer-review C33).
+            error.Interrupted => {
+                if (pending.load(.seq_cst)) {
+                    return .resize;
+                }
+                return .none;
+            },
+            else => return .timeout,
+        };
 
-        // 2) Read available bytes into the ring buffer.
+        // 2) Read available bytes only if poll(2) indicated readability.
+        // Reading unconditionally would block on a fd with no data (e.g.
+        // stdin when the test runner redirected it). poll(2) returning 0
+        // means timeout; we report `.none` (no event arrived in the window).
+        if (ready == 0) return .none;
         _ = try self.readMore(file);
 
         // 3) Decode from the ring buffer. The decoder consumes bytes from
@@ -458,22 +490,42 @@ pub fn pollReadable(io: std.Io, file: std.Io.File) bool {
 }
 
 // =============================================================================
-// WU 3.2 — `nextWithTimeout` 3-arg skeleton.
+// WU 3.3 — locked `nextWithTimeout` 4-arg signature (C22) + `anyerror!Event`
+// return (C28) + C9 EINTR-with-pending branch (D1 `.seq_cst` load).
 //
-// Creates a fresh `Parser` per call (the ring buffer does not persist across
-// calls — split sequences are NOT supported in this skeleton). WU 3.3 replaces
-// this stub with the locked 4-arg form carrying the `pending` pointer and
-// adds the C9 EINTR-with-pending branch.
+// The 4th argument is the caller's atomic pointer (NOT a private module-level
+// atomic). PR 6 updates src/tui.zig:540 from `mibu.events.nextWithTimeout(io,
+// file, 16)` to `terminal.event.nextWithTimeout(io, file, 16, &lifecycle.
+// redraw_pending)`. This is the ONLY non-1:1 PR 6 call-site adjustment
+// alongside C27 at src/tui.zig:245 (enableRawMode 2-arg).
 //
-// ponytail: the 3-arg form is enough to drive the WU 3.2 RED tests
-// (ASCII decode, multi-byte UTF-8, standalone Esc, truncated CSI). Split
-// sequences across calls require a caller-owned parser (PR 4+ design
-// refinement; not in scope for PR 3).
+// The `pending` pointer is loaded with `.seq_cst` (D1) to match the
+// SIGWINCH handler's `.seq_cst` store at src/tui.zig:153-157. The parser
+// does NOT call `getSize` — the caller at src/tui.zig:578-582 handles
+// dimension refresh in the `.resize` arm. Returning `.resize` (void) on
+// EINTR+pending is the C9 lock-in; returning `.none` on EINTR-no-pending
+// is the C9 complement.
+//
+// ponytail: the wrapper creates a fresh Parser per call (the ring buffer
+// does not persist across calls). Split sequences across calls require a
+// caller-owned parser instance — out of scope for PR 3 (the apply-prompt
+// spec lands this as a PR 4+ design refinement).
 // =============================================================================
 
-pub fn nextWithTimeout(io: std.Io, file: std.Io.File, timeout_ms: u32) anyerror!Event {
+/// Default poll function used by the public `nextWithTimeout`. Tests inject
+/// their own mock via `Parser.nextWithPoll` (D4/C35 fix — no mutable global).
+fn defaultPollFn(fds: []linux.pollfd, timeout: i32) anyerror!usize {
+    return std.posix.poll(fds, timeout);
+}
+
+pub fn nextWithTimeout(
+    io: std.Io,
+    file: std.Io.File,
+    timeout_ms: u32,
+    pending: *const std.atomic.Value(bool),
+) anyerror!Event {
     var parser = Parser.init();
-    return parser.next(io, file, timeout_ms);
+    return parser.next(io, file, timeout_ms, pending, &defaultPollFn);
 }
 
 // =============================================================================
