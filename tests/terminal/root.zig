@@ -29,5 +29,6 @@ test {
     _ = @import("event_parser.zig"); // PR 3 — WU 3.2 (streaming UTF-8 + base parser)
     _ = @import("event_critical.zig"); // PR 3 — WU 3.3 (C9/C11/C22/C28 lock-ins)
     _ = @import("event_kitty.zig"); // PR 4 — WU 4.1 (kitty kb CSI ... u parser)
+    _ = @import("probe_lexer.zig"); // PR 5 — WU 5.1 (DECRPM reply lexer + 4 C14 failure modes)
     std.testing.refAllDecls(terminal);
 }
