@@ -194,17 +194,25 @@ pub fn build(b: *std.Build) void {
     const test_decl = b.step("test", "Run unit tests");
     test_decl.dependOn(&run_test.step);
 
-    // test step: tests/tui/mibu_smoke.zig (PR 1, task 1.1 RED guard).
-    // Wired as a separate test artifact so its import of `@import("mibu")`
-    // resolves against the zig-fetched mibu source. Mirrors the
+    // test step: tests/tui/terminal_smoke.zig (PR 6, WU 6.4).
+    // Renamed from tests/tui/mibu_smoke.zig (per WU 6.4). Wired as a
+    // separate test artifact so its import of `@import("terminal")`
+    // resolves against the in-tree src/terminal/ module. Mirrors the
     // tools/debug_call test-step pattern (C6 from tls-handrolled
     // remediation, engram id=331).
+    //
+    // PR 6 (terminal-control-lib-from-scratch): the mibu.* → terminal.*
+    // namespace retarget moved the canary from the zig-fetched mibu
+    // source to the in-tree src/terminal/ module. After WU 6.5 the
+    // mibu dep is fully removed; the smoke canary is the single
+    // authoritative check that the in-tree module keeps the public
+    // surface stable.
     const tui_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("tests/tui/mibu_smoke.zig"),
+        .root_source_file = b.path("tests/tui/terminal_smoke.zig"),
         .imports = &.{
-            .{ .name = "mibu", .module = mibu_mod },
+            .{ .name = "terminal", .module = terminal_mod },
         },
     });
     const tui_test_step = b.addTest(.{ .root_module = tui_test_mod });
@@ -213,20 +221,13 @@ pub fn build(b: *std.Build) void {
     tui_test_decl.dependOn(&run_tui_test.step);
     test_decl.dependOn(&run_tui_test.step);
 
-    // test step: tests/tui/mibu_pin.zig (R-PR 4, REQ-TUI-020).
-    // Pin reproducibility assertion — reads build.zig.zon and asserts
-    // both the git SHA fragment + the Zig hash form. Hash drift fails
-    // the build before any code change happens.
-    const mibu_pin_test_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("tests/tui/mibu_pin.zig"),
-    });
-    const mibu_pin_test_step = b.addTest(.{ .root_module = mibu_pin_test_mod });
-    const run_mibu_pin_test = b.addRunArtifact(mibu_pin_test_step);
-    const mibu_pin_test_decl = b.step("test-tui-mibu-pin", "Run tests/tui/mibu_pin.zig (REQ-TUI-020)");
-    mibu_pin_test_decl.dependOn(&run_mibu_pin_test.step);
-    test_decl.dependOn(&run_mibu_pin_test.step);
+    // test step: tests/tui/mibu_pin.zig (R-PR 4, REQ-TUI-020) — DELETED.
+    // PR 6 (terminal-control-lib-from-scratch, WU 6.4) deletes both the
+    // test file and this build step. REQ-TUI-020 has no object after
+    // the mibu dep removal (WU 6.5); the pin enforcement is moot. The
+    // `test-tui-mibu-pin` step name is intentionally retained as a
+    // deliberate broken step (asserted by apply-progress verification:
+    // `zig build test-tui-mibu-pin` MUST error as "step does not exist").
 
     // test step: tests/terminal/root.zig (PR 1, task obs#1514 §3 WU 1.3).
     // Single-entrypoint test runner for the in-tree src/terminal/ module.
@@ -355,24 +356,31 @@ pub fn build(b: *std.Build) void {
     cancel_e2e_test_decl.dependOn(&run_cancel_e2e_test.step);
     test_decl.dependOn(&run_cancel_e2e_test.step);
 
-    // test step: tests/termios_sim.zig (tui-input-flow-bugfixes-2 WU-3,
+    // test step: tests/tui/cancel_path.zig (tui-input-flow-bugfixes-2 WU-3,
     // CAP-09 + CAP-13). Static-grep guard verifying the new pipe-write
     // call in src/tui.zig's Ctrl+C intercept + runtime roundtrip
     // assertion. The full pty mibu/termios e2e (CAP-13) is deferred to
     // WU-5 per design D3 follow-up.
-    const termios_sim_test_mod = b.createModule(.{
+    //
+    // PR 6 (terminal-control-lib-from-scratch, WU 6.4, Q4): renamed from
+    // tests/termios_sim.zig to tests/tui/cancel_path.zig. The contents
+    // were always a cancel-path static-guard artifact (see file header
+    // at tests/tui/cancel_path.zig:1-34), not a termios simulator; the
+    // new name matches the actual contents and lives alongside the
+    // other tui/ tests.
+    const cancel_path_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("tests/termios_sim.zig"),
+        .root_source_file = b.path("tests/tui/cancel_path.zig"),
     });
-    const termios_sim_test_step = b.addTest(.{ .root_module = termios_sim_test_mod });
-    const run_termios_sim_test = b.addRunArtifact(termios_sim_test_step);
-    const termios_sim_test_decl = b.step(
-        "test-termios-sim",
-        "Run tests/termios_sim.zig (tui-input-flow-bugfixes-2 WU-3 CAP-09 wiring guard)",
+    const cancel_path_test_step = b.addTest(.{ .root_module = cancel_path_test_mod });
+    const run_cancel_path_test = b.addRunArtifact(cancel_path_test_step);
+    const cancel_path_test_decl = b.step(
+        "test-cancel-path",
+        "Run tests/tui/cancel_path.zig (tui-input-flow-bugfixes-2 WU-3 CAP-09 wiring guard)",
     );
-    termios_sim_test_decl.dependOn(&run_termios_sim_test.step);
-    test_decl.dependOn(&run_termios_sim_test.step);
+    cancel_path_test_decl.dependOn(&run_cancel_path_test.step);
+    test_decl.dependOn(&run_cancel_path_test.step);
 
     // =========================================================================
     // QA 0 — Static checks: `zig build check`
