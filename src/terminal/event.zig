@@ -5,6 +5,8 @@
 //! the C11 unconditional in-band resize, C9 EINTR-with-pending handling, and
 //! the locked 4-arg `nextWithTimeout` signature. Per design C37 the parser's
 //! internal ring buffer (PR 3 land 2) is per-parser-instance, never module-level.
+//! PR 4 extends with the kitty kb CSI ... u parser (REQ-TCL-004 5b) and
+//! extends Mods with shift/alt/super_ to carry the kitty kb modifier bitmask.
 //!
 //! Spec coverage:
 //!   REQ-TCL-004 — CAP-33 `terminal-event-parser`
@@ -12,16 +14,17 @@
 //!     C11 in-band resize parsing is UNCONDITIONAL (PR 3 land 3)
 //!     C21 `.resize` is a void tag (matches src/tui.zig:578-583 bare match)
 //!     C22 4th parameter is `pending: *const std.atomic.Value(bool)` (PR 3 land 3)
-//!     C23 `pollReadable` exposed on terminal.event namespace (THIS LAND)
+//!     C23 `pollReadable` exposed on terminal.event namespace (PR 3 land 1)
 //!     C28 returns `anyerror!Event` (so caller `catch continue` compiles, PR 3 land 3)
 //!     C30 `Mods.ctrl = false` default + `Key.mods = .{}` default for anonymous-struct coercion
 //!     C35 comptime-generic parser injection (PR 3 land 3)
 //!     D1  `pending.load(.seq_cst)` inside the parser (matches SIGWINCH handler at src/tui.zig:156)
+//!     5b  Kitty keyboard sub-capability (PR 4): CSI ... u press/repeat/release + modifier carry
 //!
 //! Protocol citations (clean-room per CONTRIBUTING.md:41 + ADR 0001 §Negative):
 //!   - xterm ctlseqs §Resize Event / §CSI Ps;Ps;Ps t (in-band resize)
 //!   - ECMA-48 §CSI / §SS3 dispatch
-//!   - kitty keyboard protocol §Push / §Pop / §Query
+//!   - kitty keyboard protocol §Push / §Pop / §Query / §Event encoding (PR 4)
 //!   - POSIX termios(3) for the underlying tty discipline (parser is termios-agnostic)
 //!   - RFC 3629 (UTF-8) §Decoding (PR 3 land 2)
 
@@ -39,11 +42,32 @@ const linux = std.os.linux;
 // (`if (k.code == .char and k.mods.ctrl)`) which depends on `mods.ctrl`.
 // =============================================================================
 
-/// Modifier set carried in `Key.mods`. Only `ctrl` lives here for PR 3; the
-/// protocol carries shift/alt/super in later slices (kitty kb in PR 4).
+/// Modifier set carried in `Key.mods`. PR 3 carries only `ctrl` (CAP-09 +
+/// Ctrl+C intercept at src/tui.zig:552); PR 4 extends with shift/alt/super_
+/// to carry the kitty kb modifier bitmask (REQ-TCL-004 5b).
+///
+/// Per the kitty keyboard protocol spec the modifier bitmask is:
+///     shift=1, alt=2, ctrl=4, super=8, hyper=16, meta=32, capslock=64, numlock=128.
+/// PR 4 decodes the common 4 (shift/alt/ctrl/super); hyper/meta/capslock/
+/// numlock remain undecoded until a consumer needs them. Ponytail: ship the
+/// minimum field set the byte-level protocol needs, expand on consumer demand.
+///
+/// All fields default to false (C30 lock-in) so `Key{ .code = ..., .event =
+/// .press }` continues to coerce without specifying `.mods` (preserves
+/// anonymous-struct-literal coercion at tests/tui/runtime_thread.zig:2117, 2167
+/// and the CAP-09 literal grep at tests/termios_sim.zig:69).
 pub const Mods = struct {
     ctrl: bool = false,
-    // ponytail: future expansion fields (shift, alt, super) when consumers need them
+    // PR 4 extension (C30): shift/alt/super_ carry the kitty kb modifier bits.
+    // Populated only when kitty kb mode is active (caller-side check in PR 6
+    // via lifecycle.kitty_flags_pushed); PR 4 unconditionally parses `u`
+    // sequences as kitty kb key events.
+    shift: bool = false,
+    alt: bool = false,
+    // ponytail: 'super' would be the natural name (matches kitty kb spec)
+    // but the apply prompt flagged it as a potential Zig keyword. PR 4 uses
+    // `super_`; PR 6+ can rename to `super` if Zig confirms it's free.
+    super_: bool = false,
 };
 
 /// Key code identifying the physical key pressed. `char` carries a Unicode
@@ -347,6 +371,105 @@ pub const Parser = struct {
         return .timeout;
     }
 
+    // =============================================================================
+    // PR 4 — Kitty keyboard protocol parser (REQ-TCL-004 5b).
+    //
+    // Per the kitty keyboard protocol spec
+    // (https://sw.kovidgoyal.net/kitty/keyboard-protocol/) the key event
+    // format when `report_event_types` flag is enabled is:
+    //
+    //     CSI codepoint[:shifted_key] ; modifiers [:[event_type]] u
+    //
+    // PR 4 implements the colon-shorthand event_type detection:
+    //     - nothing after modifiers → press (default)
+    //     - `:`  (no semicolon) after modifiers → repeat
+    //     - `:;` (colon-semicolon) after modifiers → release
+    //
+    // Modifier bitmask (kitty kb spec): shift=1, alt=2, ctrl=4, super=8,
+    // hyper=16, meta=32, capslock=64, numlock=128. PR 4 decodes the common 4
+    // (shift/alt/ctrl/super); hyper/meta/capslock/numlock remain undecoded
+    // until a consumer needs them.
+    //
+    // PR 4 only uses the BASE codepoint (before the optional `:` shifted-key
+    // separator); the shifted variant is intentionally dropped. PR 6 may
+    // surface it via a separate field if a TUI consumer needs the distinction.
+    //
+    // For PR 4 we assume kitty kb mode is ACTIVE for all `u` sequences (the
+    // caller-side gating flag `lifecycle.kitty_flags_pushed` lands in PR 6
+    // per the apply prompt's PR 6 caller check). The push format `CSI > N u`
+    // is rejected explicitly (params starts with `>`) so we never interpret
+    // our own push commands as key events.
+    // =============================================================================
+
+    /// Parse kitty kb parameter buffer `codepoint[:shifted] ; modifiers [:[event]]`.
+    /// Returns the parsed `Key` on success, or `null` if the buffer is malformed,
+    /// empty, or represents a push command (`>` first param).
+    ///
+    /// The returned `Key.code` is always `KeyCode.char` carrying the BASE
+    /// codepoint (the part before `:` in `codepoint[:shifted]`). `Key.event`
+    /// carries press/repeat/release per the event_type detection above.
+    /// `Key.mods` carries the decoded shift/alt/ctrl/super bits.
+    fn parseKittyKb(params: []const u8) ?Key {
+        // Reject empty params (defensive — the dispatcher already checks).
+        if (params.len == 0) return null;
+        // Reject push format: `CSI > N u` has params starting with `>`.
+        if (params[0] == '>') return null;
+
+        // Split on `;` — first segment is `codepoint[:shifted]`, second is
+        // `modifiers[:event]`. Ignore any third+ segment (text_as_code_points
+        // in the full kitty kb spec; out of scope for PR 4).
+        var iter = std.mem.splitScalar(u8, params, ';');
+        const key_str = iter.next() orelse return null;
+        const mods_str_raw = iter.next() orelse return null;
+
+        // Parse base codepoint from "codepoint[:shifted]". Take the slice
+        // BEFORE the first `:` if present — that's the base layout key.
+        const colon_in_key = std.mem.indexOfScalar(u8, key_str, ':');
+        const codepoint_slice = if (colon_in_key) |i| key_str[0..i] else key_str;
+        const codepoint_trimmed = std.mem.trim(u8, codepoint_slice, " ");
+        const key_code = std.fmt.parseInt(u21, codepoint_trimmed, 10) catch return null;
+
+        // Parse modifiers and detect event type.
+        //
+        // Detection rules (apply prompt §"Implementation requirements" item 3):
+        //     - params ends with `:;` → release
+        //     - params ends with `:` (but not `:;`) → repeat
+        //     - params doesn't end with `:` or `:;` → press (default)
+        //
+        // We look at the END of the full params buffer (not just the mods
+        // segment after the `;` split) because the trailing `:;` release
+        // signal spans the `;` separator — splitting on `;` would put the
+        // trailing `:` in segments[1] and the empty remainder in segments[2],
+        // making the release indicator invisible from mods_str_raw alone.
+        //
+        // Modifier VALUE parsing: take the slice of mods_str_raw BEFORE the
+        // `:` (if any). This handles the press/repeat cases correctly; for
+        // release, mods_str_raw still has the `:` prefix which we strip.
+        const mods_trimmed = std.mem.trim(u8, mods_str_raw, " ");
+        const colon_in_mods = std.mem.indexOfScalar(u8, mods_trimmed, ':');
+        const mods_val_slice = if (colon_in_mods) |i| mods_trimmed[0..i] else mods_trimmed;
+        const mods_val_trimmed = std.mem.trim(u8, mods_val_slice, " ");
+        const mods_val = std.fmt.parseInt(u8, mods_val_trimmed, 10) catch 0;
+
+        const event_kind: EventKind = if (std.mem.endsWith(u8, params, ":;"))
+            .release
+        else if (std.mem.endsWith(u8, params, ":"))
+            .repeat
+        else
+            .press;
+
+        return Key{
+            .code = .{ .char = key_code },
+            .mods = .{
+                .shift = (mods_val & 1) != 0,
+                .alt = (mods_val & 2) != 0,
+                .ctrl = (mods_val & 4) != 0,
+                .super_ = (mods_val & 8) != 0,
+            },
+            .event = event_kind,
+        };
+    }
+
     fn dispatchCsi(self: *Parser, consume_to: usize, final: u8) Event {
         // The parameter buffer is ring_buf[2..consume_to-1].
         const params = self.ring_buf[2 .. consume_to - 1];
@@ -356,6 +479,22 @@ pub const Parser = struct {
         // multiplexers emit `CSI 8 ; rows ; cols t` regardless of DEC 2048.
         if (final == 't' and params.len > 0 and params[0] == '8') {
             return .resize;
+        }
+
+        // PR 4 — Kitty keyboard protocol (REQ-TCL-004 5b). When the terminal
+        // emits a CSI ... u sequence, parse it as a modified key event with
+        // press/repeat/release distinction + shift/alt/ctrl/super modifiers.
+        //
+        // For PR 4 we assume kitty kb mode is ACTIVE for every `u` sequence
+        // (the caller-side `lifecycle.kitty_flags_pushed` gate lands in PR 6
+        // per the apply prompt's PR 6 caller check). The push format
+        // `CSI > N u` is rejected inside parseKittyKb (params[0] == '>').
+        // If parseKittyKb returns null (malformed input), control falls
+        // through to the existing dispatch logic which returns `.invalid`.
+        if (final == 'u' and params.len > 0) {
+            if (parseKittyKb(params)) |key| {
+                return .{ .key = key };
+            }
         }
 
         // Standard ANSI cursor keys (no parameters).
@@ -534,9 +673,16 @@ pub fn nextWithTimeout(
 // signatures so they're discoverable through the test-terminal build step.
 // =============================================================================
 
-test "Mods default value is all-false" {
-    try std.testing.expect(Mods{} == .{ .ctrl = false });
-    try std.testing.expect((Mods{}).ctrl == false);
+test "Mods default value is all-false (PR 3 ctrl + PR 4 shift/alt/super_)" {
+    // PR 3 carried only `ctrl`; PR 4 extends with shift/alt/super_ for the
+    // kitty kb modifier bitmask. All four default to false (C30 lock-in).
+    // Field-by-field assertions here because the cross-field-struct equality
+    // shorthand `Mods{} == .{ .ctrl = false }` no longer captures the
+    // extended struct shape.
+    try testing.expect((Mods{}).ctrl == false);
+    try testing.expect((Mods{}).shift == false);
+    try testing.expect((Mods{}).alt == false);
+    try testing.expect((Mods{}).super_ == false);
 }
 
 test "Key anonymous-struct coercion omits mods (C30)" {
