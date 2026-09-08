@@ -700,16 +700,19 @@ test "no automatic key sources" {
     };
     const targets = [_][]const u8{
         // 4 original targets (per tui spec#379):
-        "src/api_client.zig",   "src/api_sse.zig",      "src/api_auth.zig",
+        "src/api_client.zig",      "src/api_sse.zig",        "src/api_auth.zig",
         "tools/debug_call.zig",
         // 6 new TUI targets (tui-recovery R-PR 1 per design#408 §2.3):
-        "src/channels.zig",     "src/runtime.zig",
-        "src/tui.zig",          "src/main.zig",         "src/password_input.zig",
+           "src/channels.zig",       "src/runtime.zig",
+        "src/tui.zig",             "src/main.zig",           "src/password_input.zig",
         "src/modal.zig",
         // PR 1 terminal-control-lib-from-scratch (obs#1506 C20 / obs#1513 C26-C32):
         // terminal-control modules use POSIX + ECMA-48 + kitty keyboard only
         // and must NOT fall back to env-var or file-based key sources.
-               "src/terminal/mod.zig", "src/terminal/term.zig",
+                  "src/terminal/mod.zig",   "src/terminal/term.zig",
+        // PR 2 WU 2.1 (cursor + style emitters): byte-exact CSI/SGR, no env
+        // lookup, no file I/O — appended to keep the guard in lock-step.
+        "src/terminal/cursor.zig", "src/terminal/style.zig",
     };
     const io = testing.io;
     for (targets) |path| {
