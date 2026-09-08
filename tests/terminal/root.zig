@@ -25,6 +25,7 @@ test {
     _ = @import("style.zig"); // PR 2 — WU 2.1
     _ = @import("dpm.zig"); // PR 2 — WU 2.2
     _ = @import("kitty.zig"); // PR 2 — WU 2.3
-    _ = @import("event_types.zig"); // PR 3 — WU 3.1 (basic type-coercion tests; PR 3 WUs 3.2+3.3 add event_parser.zig + event_critical.zig)
+    _ = @import("event_types.zig"); // PR 3 — WU 3.1 (basic type-coercion tests)
+    _ = @import("event_parser.zig"); // PR 3 — WU 3.2 (streaming UTF-8 + base parser)
     std.testing.refAllDecls(terminal);
 }

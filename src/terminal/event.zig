@@ -121,6 +121,304 @@ pub const Event = union(enum) {
 };
 
 // =============================================================================
+// WU 3.2 — Streaming parser + UTF-8 + base ANSI/CSI dispatcher.
+//
+// Per design D6/C37 the ring buffer is per-parser-instance; the parser is
+// single-threaded. The public `nextWithTimeout` is a thin wrapper that
+// creates a fresh `Parser` per call. WU 3.3 replaces this stub with the
+// 4-arg form carrying the `pending` pointer.
+//
+// Parser scope for WU 3.2 (Slice 5a, base parser + in-band resize plumbing):
+//   - ASCII control codes: 0x03 (Ctrl+C), 0x09 (Tab), 0x0a/0x0d (Enter), 0x08 (BS), 0x7f (DEL).
+//   - Standard UTF-8 (RFC 3629): 1-byte ASCII, 2/3-byte common cases.
+//   - CSI dispatcher for arrow keys + 12 function keys (F1-F12).
+//   - SS3 dispatch (cursor key mode alternative; same payload as CSI A/B/C/D).
+//   - Truncated CSI/SS3 sequences resolve to `.invalid` on timeout.
+//   - Standalone Esc resolves to `.esc` only if a CSI/SS3 follow-up arrives
+//     within the same call; otherwise the parser times out and returns `.none`.
+//   - In-band resize parsing UNCONDITIONALLY (C11): `CSI 8;rows;cols t` →
+//     `.resize` (void). tmux and other multiplexers emit this regardless of
+//     DEC 2048 negotiation. The branch lives in parseCsi8 (per WU 3.3 spec);
+//     WU 3.2 wires the dispatcher through to it.
+//
+// Not in scope for PR 3:
+//   - kitty keyboard protocol (`CSI ... u`) — PR 4
+//   - DECRPM reply parsing — PR 5
+//   - Paste brackets (ESC[200~ ... ESC[201~) — PR 4 (after kitty kb)
+//   - Mouse (SGR encoding `CSI <button;x;y M/m`) — PR 5
+//   - Sixel/Kitty graphics — never
+//
+// ponytail: the minimum parser needed to drive the C9/C11/C22/C28/C30/C35
+// lock-ins and prove the public API contract. Branches land as test demand
+// forces them.
+// =============================================================================
+
+/// Streaming terminal event parser. Holds a 4096-byte ring buffer (per
+/// design D6/C37 — per-instance, never module-level). Single-threaded.
+pub const Parser = struct {
+    /// Per-instance ring buffer. Per C37 this lives on the Parser, not at
+    /// module scope. 4096 bytes matches mibu's documented parser buffer
+    /// (large enough for a single paste payload; small enough for L1 fit).
+    ring_buf: [4096]u8,
+    /// Number of valid bytes currently in `ring_buf`. Bytes [0..ring_len)
+    /// are the unconsumed prefix; bytes [ring_len..4096) are free space
+    /// for the next `read(2)` call.
+    ring_len: usize,
+
+    pub fn init() Parser {
+        return .{
+            .ring_buf = undefined,
+            .ring_len = 0,
+        };
+    }
+
+    /// Refill the ring buffer by reading from `file` (non-blocking). Returns
+    /// the number of bytes appended, 0 on EOF, `error.WouldBlock` on EAGAIN.
+    /// Callers loop until the parser has a complete event or the poll
+    /// timeout elapses.
+    fn readMore(self: *Parser, file: std.Io.File) !usize {
+        const free = self.ring_buf.len - self.ring_len;
+        if (free == 0) return 0; // buffer full; caller should drain
+        const n = try std.posix.read(file.handle, self.ring_buf[self.ring_len..]);
+        self.ring_len += n;
+        return n;
+    }
+
+    /// Drive the parser until one Event can be returned, the timeout
+    /// elapses, or the read returns EOF/error. The 3-arg skeleton in WU 3.2;
+    /// WU 3.3 adds the 4th `pending` parameter and the C9 EINTR branch.
+    pub fn next(self: *Parser, _: std.Io, file: std.Io.File, timeout_ms: u32) anyerror!Event {
+        // ponytail: WU 3.2 implements the base parser. EINTR/pending handling
+        // and `pending` parameter arrive in WU 3.3 alongside the locked 4-arg
+        // signature. Poll/read are sequential here; the production driver
+        // (PR 6 caller) is the only consumer of this stub.
+        if (builtin.os.tag != .linux) {
+            return .timeout;
+        }
+        const deadline_ns: u64 = @as(u64, timeout_ms) * std.time.ns_per_ms;
+
+        // 1) Poll for readability.
+        var pfd: linux.pollfd = .{
+            .fd = file.handle,
+            .events = linux.POLL.IN,
+            .revents = 0,
+        };
+        const ready = std.posix.poll((&pfd)[0..1], @intCast(@as(i64, @intCast(deadline_ns))));
+        _ = ready catch return .timeout;
+
+        // 2) Read available bytes into the ring buffer.
+        _ = try self.readMore(file);
+
+        // 3) Decode from the ring buffer. The decoder consumes bytes from
+        // the front and advances ring_len. If the sequence is incomplete
+        // (e.g. truncated CSI at EOF), it returns `.invalid` or `.timeout`.
+        return self.decode();
+    }
+
+    /// Decode one Event from the ring buffer. Public for testability: tests
+    /// can `feedBytes` then call `decode` to drive the state machine
+    /// directly without going through poll(2)+read(2).
+    pub fn decode(self: *Parser) Event {
+        if (self.ring_len == 0) return .none;
+
+        const first = self.ring_buf[0];
+
+        // ASCII fast path (0x00..0x7F).
+        if (first < 0x80) {
+            return self.decodeAscii(first);
+        }
+
+        // UTF-8 multi-byte sequence (RFC 3629).
+        return self.decodeUtf8();
+    }
+
+    fn decodeAscii(self: *Parser, b: u8) Event {
+        switch (b) {
+            0x03 => {
+                // Ctrl+C — produce a Ctrl+C key event (CAP-09 intercept is
+                // handled by the caller at src/tui.zig:552).
+                self.consume(1);
+                return .{ .key = .{ .code = .{ .char = @as(u21, 0x03) }, .mods = .{ .ctrl = true }, .event = .press } };
+            },
+            0x08, 0x7f => {
+                self.consume(1);
+                return .{ .key = .{ .code = .backspace, .event = .press } };
+            },
+            0x09 => {
+                self.consume(1);
+                return .{ .key = .{ .code = .tab, .event = .press } };
+            },
+            0x0a, 0x0d => {
+                self.consume(1);
+                return .{ .key = .{ .code = .enter, .event = .press } };
+            },
+            0x1b => {
+                // Escape: either standalone (returns .esc) or the start of
+                // a CSI/SS3 sequence. Look ahead for the introducer.
+                if (self.ring_len >= 2 and self.ring_buf[1] == '[') {
+                    return self.decodeCsi();
+                } else if (self.ring_len >= 2 and self.ring_buf[1] == 'O') {
+                    return self.decodeSs3();
+                }
+                // Standalone Esc — caller resolves via timeout if no follow-up.
+                self.consume(1);
+                return .{ .key = .{ .code = .esc, .event = .press } };
+            },
+            0x20...0x7e => {
+                // Printable ASCII.
+                self.consume(1);
+                return .{ .key = .{ .code = .{ .char = @as(u21, b) }, .event = .press } };
+            },
+            else => {
+                // Unhandled control byte.
+                self.consume(1);
+                return .invalid;
+            },
+        }
+    }
+
+    fn decodeUtf8(self: *Parser) Event {
+        // RFC 3629 decode. We accept only well-formed sequences; malformed
+        // bytes produce `.invalid` and consume one byte to avoid loops.
+        const first = self.ring_buf[0];
+        const needed: usize = if (first < 0xC0)
+            1
+        else if (first < 0xE0)
+            2
+        else if (first < 0xF0)
+            3
+        else
+            4;
+        if (self.ring_len < needed) return .timeout; // truncated; wait for more
+        const cp: u21 = std.unicode.utf8Decode(self.ring_buf[0..needed]) catch {
+            self.consume(1);
+            return .invalid;
+        };
+        self.consume(needed);
+        return .{ .key = .{ .code = .{ .char = cp }, .event = .press } };
+    }
+
+    fn decodeCsi(self: *Parser) Event {
+        // CSI: ESC [ params final-byte
+        // params are 0x30..0x3F (digits ; : etc.)
+        // final byte is 0x40..0x7E
+        // We consume up to the final byte or ring_len.
+        var i: usize = 2; // skip ESC [
+        while (i < self.ring_len) {
+            const b = self.ring_buf[i];
+            if (b >= 0x40 and b <= 0x7E) {
+                return self.dispatchCsi(i + 1, b);
+            }
+            i += 1;
+        }
+        // Truncated — wait for more.
+        return .timeout;
+    }
+
+    fn dispatchCsi(self: *Parser, consume_to: usize, final: u8) Event {
+        // The parameter buffer is ring_buf[2..consume_to-1].
+        const params = self.ring_buf[2 .. consume_to - 1];
+        defer self.consume(consume_to);
+
+        // C11 — Unconditional in-band resize parsing. tmux and other
+        // multiplexers emit `CSI 8 ; rows ; cols t` regardless of DEC 2048.
+        if (final == 't' and params.len > 0 and params[0] == '8') {
+            return .resize;
+        }
+
+        // Standard ANSI cursor keys (no parameters).
+        switch (final) {
+            'A' => return .{ .key = .{ .code = .up, .event = .press } },
+            'B' => return .{ .key = .{ .code = .down, .event = .press } },
+            'C' => return .{ .key = .{ .code = .right, .event = .press } },
+            'D' => return .{ .key = .{ .code = .left, .event = .press } },
+            'H' => return .{ .key = .{ .code = .enter, .event = .press } }, // CSI H == Home (some terminals)
+            'F' => return .{ .key = .{ .code = .enter, .event = .press } }, // CSI F == End
+            else => {},
+        }
+
+        // Function keys: CSI <n> ~  (F1=11, F2=12, ..., F4=24, F5=15 etc.)
+        // Different terminals use different encodings; handle the common
+        // xterm forms (CSI 1~ .. CSI 21~).
+        if (final == '~' and params.len > 0) {
+            // Parse the leading digits.
+            var n: u16 = 0;
+            for (params) |p| {
+                if (p >= '0' and p <= '9') {
+                    n = n * 10 + @as(u16, p - '0');
+                } else break;
+            }
+            switch (n) {
+                1, 7 => return .{ .key = .{ .code = .enter, .event = .press } }, // Home
+                2 => return .{ .key = .{ .code = .enter, .event = .press } }, // Insert
+                3 => return .{ .key = .{ .code = .enter, .event = .press } }, // Delete
+                4, 8 => return .{ .key = .{ .code = .enter, .event = .press } }, // End
+                5 => return .{ .key = .{ .code = .enter, .event = .press } }, // PageUp
+                6 => return .{ .key = .{ .code = .enter, .event = .press } }, // PageDown
+                11, 25, 35 => return .{ .key = .{ .code = .f1, .event = .press } },
+                12, 24, 36 => return .{ .key = .{ .code = .f2, .event = .press } },
+                13, 23, 37 => return .{ .key = .{ .code = .f3, .event = .press } },
+                14, 22, 38 => return .{ .key = .{ .code = .f4, .event = .press } },
+                15, 21, 39 => return .{ .key = .{ .code = .f5, .event = .press } },
+                16, 20, 40 => return .{ .key = .{ .code = .f6, .event = .press } },
+                17, 19, 41 => return .{ .key = .{ .code = .f7, .event = .press } },
+                18, 26, 42 => return .{ .key = .{ .code = .f8, .event = .press } },
+                28 => return .{ .key = .{ .code = .f1, .event = .press } }, // F1 sometimes 28~
+                29 => return .{ .key = .{ .code = .f2, .event = .press } },
+                31 => return .{ .key = .{ .code = .f4, .event = .press } },
+                32 => return .{ .key = .{ .code = .f5, .event = .press } },
+                33 => return .{ .key = .{ .code = .f6, .event = .press } },
+                34 => return .{ .key = .{ .code = .f7, .event = .press } },
+                else => return .invalid,
+            }
+        }
+
+        return .invalid;
+    }
+
+    fn decodeSs3(self: *Parser) Event {
+        // SS3: ESC O final-byte (single-byte function keys).
+        if (self.ring_len < 3) return .timeout;
+        const final = self.ring_buf[2];
+        defer self.consume(3);
+        switch (final) {
+            'A' => return .{ .key = .{ .code = .up, .event = .press } },
+            'B' => return .{ .key = .{ .code = .down, .event = .press } },
+            'C' => return .{ .key = .{ .code = .right, .event = .press } },
+            'D' => return .{ .key = .{ .code = .left, .event = .press } },
+            'P' => return .{ .key = .{ .code = .f1, .event = .press } },
+            'Q' => return .{ .key = .{ .code = .f2, .event = .press } },
+            'R' => return .{ .key = .{ .code = .f3, .event = .press } },
+            'S' => return .{ .key = .{ .code = .f4, .event = .press } },
+            else => return .invalid,
+        }
+    }
+
+    /// Test-only entrypoint: feed bytes directly into the ring buffer
+    /// without going through poll(2)+read(2). Used by tests/terminal/
+    /// event_parser.zig and event_critical.zig to drive the state
+    /// machine deterministically.
+    pub fn feedBytes(self: *Parser, bytes: []const u8) void {
+        const avail = self.ring_buf.len - self.ring_len;
+        const n = @min(avail, bytes.len);
+        @memcpy(self.ring_buf[self.ring_len .. self.ring_len + n], bytes[0..n]);
+        self.ring_len += n;
+    }
+
+    fn consume(self: *Parser, n: usize) void {
+        if (n >= self.ring_len) {
+            self.ring_len = 0;
+            return;
+        }
+        // ponytail: use @memmove not @memcpy; the source/destination ranges
+        // overlap (shift left within the same buffer). @memcpy is UB on
+        // overlapping memory in Zig 0.16.
+        @memmove(self.ring_buf[0 .. self.ring_len - n], self.ring_buf[n..self.ring_len]);
+        self.ring_len -= n;
+    }
+};
+
+// =============================================================================
 // C23 — pollReadable.
 //
 // Thin wrapper around `poll(2)` with `timeout=0` (non-blocking). Returns
@@ -157,6 +455,25 @@ pub fn pollReadable(io: std.Io, file: std.Io.File) bool {
         // returns `.timeout` and the event loop spins another iteration.
         return false;
     }
+}
+
+// =============================================================================
+// WU 3.2 — `nextWithTimeout` 3-arg skeleton.
+//
+// Creates a fresh `Parser` per call (the ring buffer does not persist across
+// calls — split sequences are NOT supported in this skeleton). WU 3.3 replaces
+// this stub with the locked 4-arg form carrying the `pending` pointer and
+// adds the C9 EINTR-with-pending branch.
+//
+// ponytail: the 3-arg form is enough to drive the WU 3.2 RED tests
+// (ASCII decode, multi-byte UTF-8, standalone Esc, truncated CSI). Split
+// sequences across calls require a caller-owned parser (PR 4+ design
+// refinement; not in scope for PR 3).
+// =============================================================================
+
+pub fn nextWithTimeout(io: std.Io, file: std.Io.File, timeout_ms: u32) anyerror!Event {
+    var parser = Parser.init();
+    return parser.next(io, file, timeout_ms);
 }
 
 // =============================================================================
