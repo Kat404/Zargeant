@@ -8,26 +8,16 @@ pub fn build(b: *std.Build) void {
         "Prioritize performance, safety, or fast compilation (Debug, ReleaseSafe, ReleaseFast)",
     ) orelse .Debug;
 
-    // mibu dep (github.com/xyaman/mibu, MIT, Zig 0.16 tested). Pinned at
-    // 636a36a353614da2a537b060c33f17d608915eab per build.zig.zon. The
-    // module is wired into tui_mod (always), test_mod (always), and
-    // tui-recovery R-PR 2 added lib_mod + exe_mod so main.zig can
-    // transitively pull in src/tui.zig → @import("mibu"). R-PR 4
-    // formalizes this addition per design#408 §2.3.
-    const mibu_dep = b.dependency("mibu", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const mibu_mod = mibu_dep.module("mibu");
+    // mibu dep removed (PR 6, terminal-control-lib-from-scratch, WU 6.5).
+    // The terminal control layer is now an in-tree src/terminal/ module
+    // (ADR 0003); no third-party TUI dep is required. See ADR 0001 §
+    // "Negative" for the contingency this change implements.
 
     // lib: harness (static library)
     const lib_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/root.zig"),
-        .imports = &.{
-            .{ .name = "mibu", .module = mibu_mod },
-        },
     });
     const lib = b.addLibrary(.{
         .name = "harness",
@@ -41,9 +31,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/root.zig"),
-        .imports = &.{
-            .{ .name = "mibu", .module = mibu_mod },
-        },
     });
     exe_mod.single_threaded = false;
     const exe = b.addExecutable(.{
@@ -87,29 +74,17 @@ pub fn build(b: *std.Build) void {
     const debug_call_step = b.step("tools-debug", "Run tools/debug_call.zig with stdin key");
     debug_call_step.dependOn(&debug_call_run.step);
 
-    // tui_mod: exposes mibu (github.com/xyaman/mibu, MIT, Zig 0.16 tested)
-    // under `@import("mibu")` so that src/tui.zig and tests/tui/* can
-    // consume mibu symbols via the build system's `addImport` indirection.
-    // tui (PR 1, sdd id=381 task 1.1) is the first slice to add a dep since
-    // the project bootstrap. mibu replaced libvaxis (was vendored at
-    // vendor/libvaxis/ in the squashed-away 5 libvaxis commits, now wiped
-    // from this branch) because libvaxis v0.5.1 transitive deps don't
-    // compile on Zig 0.16 -- see obs#399 for the full replacement research.
-    const tui_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("src/tui.zig"),
-    });
-    tui_mod.addImport("mibu", mibu_mod);
-
     // terminal-control-lib-from-scratch (PR 1, task obs#1514 §3 WU 1.3).
     // In-tree src/terminal/ module replacing mibu over 6 chained PRs. PR 1
     // exposes only the `term` slice; PRs 2-5 extend mod.zig with cursor,
-    // style, dpm, kitty, event. Mirrors the mibu_dep + mibu_mod pattern
-    // above but without an external dependency (the module is in-tree).
-    // The exe_mod import is wired now for symmetry with mibu but unused
-    // until PR 6 atomically re-points src/tui.zig from mibu.* to terminal.*
-    // (per obs#1506 N11-N13 / C17 / obs#1514 §4 chain strategy).
+    // style, dpm, kitty, event. The module is in-tree; no external
+    // dependency is required (ADR 0003 — the mibu replacement).
+    //
+    // PR 6 (WU 6.5) removed the mibu_dep / mibu_mod / tui_mod blocks.
+    // The legacy tui_mod served only as a wrapper to wire `mibu_mod`
+    // under the `@import("mibu")` name; with mibu gone, tui_mod is no
+    // longer needed (the live tests use lib_mod through
+    // runtime_thread_test_mod + the renamed terminal_smoke test step).
     //
     // term_mod is the standalone slice root (src/terminal/term.zig).
     // terminal_mod (mod.zig) imports it via `addImport("term", term_mod)`.
@@ -184,7 +159,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/root.zig"),
         .imports = &.{
-            .{ .name = "mibu", .module = mibu_mod },
             .{ .name = "terminal", .module = terminal_mod },
         },
     });
@@ -271,7 +245,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("tests/tui/runtime_thread.zig"),
         .imports = &.{
-            .{ .name = "mibu", .module = mibu_mod },
             .{ .name = "terminal", .module = terminal_mod },
             .{ .name = "api_auth", .module = lib_mod },
             .{ .name = "api_client", .module = lib_mod },
