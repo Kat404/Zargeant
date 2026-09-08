@@ -713,6 +713,10 @@ test "no automatic key sources" {
         // PR 2 WU 2.1 (cursor + style emitters): byte-exact CSI/SGR, no env
         // lookup, no file I/O — appended to keep the guard in lock-step.
         "src/terminal/cursor.zig", "src/terminal/style.zig",
+        // PR 2 WU 2.2 (DPM emitters + DECRQM probe emit + Mode stub):
+        // 6 enter/exit emit helpers + DECRQM probe + Mode struct return;
+        // no env/file I/O.
+        "src/terminal/dpm.zig",
     };
     const io = testing.io;
     for (targets) |path| {

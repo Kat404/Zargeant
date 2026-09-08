@@ -12,6 +12,7 @@
 pub const term = @import("term");
 pub const cursor = @import("cursor");
 pub const style = @import("style");
+pub const dpm = @import("dpm");
 
 test {
     std.testing.refAllDecls(@This());

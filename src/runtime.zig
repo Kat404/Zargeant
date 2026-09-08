@@ -732,6 +732,7 @@ test "no stray Thread.spawn outside runtime.zig" {
         "src/terminal/term.zig",
         "src/terminal/cursor.zig",
         "src/terminal/style.zig",
+        "src/terminal/dpm.zig",
     };
     const io = testing.io;
     for (forbidden_targets) |path| {
@@ -798,6 +799,7 @@ test "no std.debug.print or getStdOut in TUI sources (stdios guard)" {
         "src/terminal/term.zig",
         "src/terminal/cursor.zig",
         "src/terminal/style.zig",
+        "src/terminal/dpm.zig",
     };
     const io = testing.io;
     for (targets) |path| {

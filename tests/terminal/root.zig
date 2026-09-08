@@ -23,7 +23,7 @@ test {
     _ = @import("term.zig"); // PR 1
     _ = @import("cursor.zig"); // PR 2 — WU 2.1
     _ = @import("style.zig"); // PR 2 — WU 2.1
-    // _ = @import("dpm.zig");   // PR 2 — WU 2.2 (appended in its own commit)
+    _ = @import("dpm.zig"); // PR 2 — WU 2.2
     // _ = @import("kitty.zig"); // PR 2 — WU 2.3 (appended in its own commit)
     std.testing.refAllDecls(terminal);
 }
