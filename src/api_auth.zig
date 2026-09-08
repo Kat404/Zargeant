@@ -720,6 +720,9 @@ test "no automatic key sources" {
         // PR 2 WU 2.3 (kitty keyboard protocol push/pop + probe stub):
         // kitty keyboard protocol emitters only; no env/file I/O.
         "src/terminal/kitty.zig",
+        // PR 3 WU 3.1 — public event types (REQ-TCL-004 CAP-33). Parser
+        // implementation lands in WU 3.2 (streaming UTF-8) and 3.3 (C11/C9).
+         "src/terminal/event.zig",
     };
     const io = testing.io;
     for (targets) |path| {
