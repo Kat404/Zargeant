@@ -13,15 +13,17 @@
 const std = @import("std");
 const testing = std.testing;
 
-// `term` is the imported term.zig file directly. Tests use the public API
-// (Backend, PosixBackend, MockBackend, RawTerm, TermSize, enableRawMode).
+// `term` is the imported src/terminal/term.zig module via build dep. Tests
+// use the public API (Backend, PosixBackend, MockBackend, RawTerm, TermSize,
+// enableRawMode). The build wires `term` as a build dep on the test module
+// (see build.zig terminal_test_mod).
+//
+// ponytail: keep references qualified (`term.PosixBackend`) instead of
+// creating local aliases (`const PosixBackend = term.PosixBackend`).
+// Qualified references sidestep the Zig compiler's value-evaluation
+// recursion that triggers a self-dependency error when resolving aliases
+// of public structs during module-root test discovery.
 const term = @import("term");
-const Backend = term.Backend;
-const PosixBackend = term.PosixBackend;
-const MockBackend = term.MockBackend;
-const RawTerm = term.RawTerm;
-const TermSize = term.TermSize;
-const enableRawMode = term.enableRawMode;
 
 // =============================================================================
 // Scenario 1 — termios round-trip (REQ-TCL-001).
@@ -35,14 +37,14 @@ const enableRawMode = term.enableRawMode;
 test "termios round-trip: MockBackend saves original + applies raw + restores" {
     var original = std.mem.zeroes(std.posix.termios);
     original.ispeed = .B9600; // arbitrary distinct value to verify copy semantics
-    var backend = MockBackend.init(.{ .original_termios = original });
+    var backend = term.MockBackend.init(.{ .original_termios = original });
     defer backend.deinit();
     backend.activate();
     defer backend.deactivate();
     const backend_value = backend.backend();
     const dummy_handle: std.Io.File.Handle = -1;
 
-    var rt = try enableRawMode(dummy_handle, backend_value);
+    var rt = try term.enableRawMode(dummy_handle, backend_value);
     // Assertion 1: after enable, MockBackend saw exactly 1 tcgetattr (save)
     // and exactly 1 tcsetattr (apply raw-mode). Original termios was copied.
     try testing.expectEqual(@as(u32, 1), backend.tcgetattr_count);
@@ -64,14 +66,14 @@ test "termios round-trip: MockBackend saves original + applies raw + restores" {
 // =============================================================================
 
 test "no-TTY error path: tcgetattr error propagates through enableRawMode" {
-    var backend = MockBackend.init(.{ .fail_tcgetattr = error.NotATerminal });
+    var backend = term.MockBackend.init(.{ .fail_tcgetattr = error.NotATerminal });
     defer backend.deinit();
     backend.activate();
     defer backend.deactivate();
     const backend_value = backend.backend();
     const dummy_handle: std.Io.File.Handle = -1;
 
-    const result = enableRawMode(dummy_handle, backend_value);
+    const result = term.enableRawMode(dummy_handle, backend_value);
     try testing.expectError(error.NotATerminal, result);
     try testing.expectEqual(@as(u32, 1), backend.tcgetattr_count);
     try testing.expectEqual(@as(u32, 0), backend.tcsetattr_count);
@@ -85,7 +87,7 @@ test "no-TTY error path: tcgetattr error propagates through enableRawMode" {
 // =============================================================================
 
 test "getSize happy: MockBackend.ioctl_gwinsz → TermSize{width, height}" {
-    var backend = MockBackend.init(.{
+    var backend = term.MockBackend.init(.{
         .winsize = .{ .row = 40, .col = 120, .xpixel = 0, .ypixel = 0 },
     });
     defer backend.deinit();
@@ -109,7 +111,7 @@ test "getSize happy: MockBackend.ioctl_gwinsz → TermSize{width, height}" {
 // =============================================================================
 
 test "getSize failure: ioctl error propagates" {
-    var backend = MockBackend.init(.{ .fail_ioctl_gwinsz = error.IoctlError });
+    var backend = term.MockBackend.init(.{ .fail_ioctl_gwinsz = error.IoctlError });
     defer backend.deinit();
     backend.activate();
     defer backend.deactivate();
@@ -130,7 +132,7 @@ test "getSize failure: ioctl error propagates" {
 // =============================================================================
 
 test "PosixBackend returns populated Backend" {
-    const b = PosixBackend.backend();
+    const b = term.PosixBackend.backend();
     try testing.expect(@intFromPtr(b.tcgetattr) != 0);
     try testing.expect(@intFromPtr(b.tcsetattr) != 0);
     try testing.expect(@intFromPtr(b.ioctl_gwinsz) != 0);
@@ -144,7 +146,7 @@ test "PosixBackend returns populated Backend" {
 // refactor `getSize` to take an explicit backend (mirroring `enableRawMode`).
 // =============================================================================
 
-fn getSizeViaBackend(handle: std.Io.File.Handle, backend: Backend) anyerror!TermSize {
+fn getSizeViaBackend(handle: std.Io.File.Handle, backend: term.Backend) anyerror!term.TermSize {
     const ws = try backend.ioctl_gwinsz(handle);
     return .{ .width = ws.col, .height = ws.row };
 }

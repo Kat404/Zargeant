@@ -102,6 +102,31 @@ pub fn build(b: *std.Build) void {
     });
     tui_mod.addImport("mibu", mibu_mod);
 
+    // terminal-control-lib-from-scratch (PR 1, task obs#1514 §3 WU 1.3).
+    // In-tree src/terminal/ module replacing mibu over 6 chained PRs. PR 1
+    // exposes only the `term` slice; PRs 2-5 extend mod.zig with cursor,
+    // style, dpm, kitty, event. Mirrors the mibu_dep + mibu_mod pattern
+    // above but without an external dependency (the module is in-tree).
+    // The exe_mod import is wired now for symmetry with mibu but unused
+    // until PR 6 atomically re-points src/tui.zig from mibu.* to terminal.*
+    // (per obs#1506 N11-N13 / C17 / obs#1514 §4 chain strategy).
+    //
+    // term_mod is the standalone slice root (src/terminal/term.zig).
+    // terminal_mod (mod.zig) imports it via `addImport("term", term_mod)`.
+    // tests/terminal/root.zig imports both via the test module's imports.
+    const term_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/term.zig"),
+    });
+    const terminal_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/mod.zig"),
+    });
+    terminal_mod.addImport("term", term_mod);
+    exe_mod.addImport("terminal", terminal_mod);
+
     // test step
     const test_mod = b.createModule(.{
         .target = target,
@@ -150,6 +175,28 @@ pub fn build(b: *std.Build) void {
     const mibu_pin_test_decl = b.step("test-tui-mibu-pin", "Run tests/tui/mibu_pin.zig (REQ-TUI-020)");
     mibu_pin_test_decl.dependOn(&run_mibu_pin_test.step);
     test_decl.dependOn(&run_mibu_pin_test.step);
+
+    // test step: tests/terminal/root.zig (PR 1, task obs#1514 §3 WU 1.3).
+    // Single-entrypoint test runner for the in-tree src/terminal/ module.
+    // Closes the phantom-test CI trap (obs#1508 C8 / obs#1510 REQ-TCL-012):
+    // `zig build test-terminal --summary all` proves the terminal test
+    // count is non-zero, so PRs 1-5 cannot silently compile-zero tests.
+    // Per-PR test slices append `_ = @import("<slice>.zig");` to root.zig
+    // in the same commit that creates src/terminal/<slice>.zig.
+    const terminal_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/terminal/root.zig"),
+        .imports = &.{
+            .{ .name = "terminal", .module = terminal_mod },
+            .{ .name = "term", .module = term_mod },
+        },
+    });
+    const terminal_test_step = b.addTest(.{ .root_module = terminal_test_mod });
+    const run_terminal_test = b.addRunArtifact(terminal_test_step);
+    const terminal_test_decl = b.step("test-terminal", "Run src/terminal/ + tests/terminal/ in isolation");
+    terminal_test_decl.dependOn(&run_terminal_test.step);
+    test_decl.dependOn(&run_terminal_test.step);
 
     // test step: tests/tui/runtime_thread.zig (tui-runtime-integration PR 1,
     // design#441 drift D-5). Dedicated artifact for runtime × mock_server
