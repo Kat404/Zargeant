@@ -138,6 +138,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/terminal/dpm.zig"),
     });
+    const kitty_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/kitty.zig"),
+    });
     // term_mod needs `dpm` as a build dep so src/terminal/term.zig can do
     // `@import("dpm")` to re-export the 6 DPM functions (design C31 fix).
     // Without this, term_mod's `@import("dpm.zig")` collides with the
@@ -152,6 +157,7 @@ pub fn build(b: *std.Build) void {
     terminal_mod.addImport("cursor", cursor_mod);
     terminal_mod.addImport("style", style_mod);
     terminal_mod.addImport("dpm", dpm_mod);
+    terminal_mod.addImport("kitty", kitty_mod);
     exe_mod.addImport("terminal", terminal_mod);
 
     // test step
@@ -220,6 +226,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "cursor", .module = cursor_mod },
             .{ .name = "style", .module = style_mod },
             .{ .name = "dpm", .module = dpm_mod },
+            .{ .name = "kitty", .module = kitty_mod },
         },
     });
     const terminal_test_step = b.addTest(.{ .root_module = terminal_test_mod });

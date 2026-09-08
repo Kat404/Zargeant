@@ -717,6 +717,9 @@ test "no automatic key sources" {
         // 6 enter/exit emit helpers + DECRQM probe + Mode struct return;
         // no env/file I/O.
         "src/terminal/dpm.zig",
+        // PR 2 WU 2.3 (kitty keyboard protocol push/pop + probe stub):
+        // kitty keyboard protocol emitters only; no env/file I/O.
+        "src/terminal/kitty.zig",
     };
     const io = testing.io;
     for (targets) |path| {
