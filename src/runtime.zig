@@ -728,6 +728,8 @@ test "no stray Thread.spawn outside runtime.zig" {
         "src/root.zig",
         "src/password_input.zig",
         "src/main.zig",
+        "src/terminal/mod.zig",
+        "src/terminal/term.zig",
     };
     const io = testing.io;
     for (forbidden_targets) |path| {
@@ -790,6 +792,8 @@ test "no std.debug.print or getStdOut in TUI sources (stdios guard)" {
         "src/modal.zig",
         "src/password_input.zig",
         "src/main.zig",
+        "src/terminal/mod.zig",
+        "src/terminal/term.zig",
     };
     const io = testing.io;
     for (targets) |path| {
