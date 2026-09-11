@@ -780,6 +780,16 @@ pub fn handleKeyInput(
                 return true;
             },
             .backspace => {
+                // REQ-TIW-005 + REQ-TIRFIX-005 (tui-input-rendering-fixes
+                // #1576) — backspace UX contract: cursor visually retreats
+                // one cell to the LEFT; rightmost `*` is blanked on the
+                // next frame; no intermediate `*` appears. Contract holds
+                // because REQ-TIRFIX-002 places the trailing cursor at
+                // `last_x + 1` after each frame; on backspace,
+                // `draft_len -= 1` makes the next frame's `last_x` one
+                // smaller, so the trailing CUP retreats left. The
+                // "append-then-delete flash" was a perceptual artifact of
+                // the old on-cell trailing cursor (Bug 5).
                 if (ke.draft_len == 0) return false; // REQ-TIW-005 empty-draft no-op
                 ke.draft_len -= 1;
                 return true;
@@ -808,6 +818,10 @@ pub fn handleKeyInput(
                 return true;
             },
             .backspace => {
+                // REQ-TIW-005 + REQ-TIRFIX-005 (tui-input-rendering-fixes
+                // #1576) — mirror of key_entry's backspace handler. See
+                // the .key_entry backspace comment above for the full
+                // cursor-retreat UX contract.
                 if (up.draft_len == 0) return false;
                 up.draft_len -= 1;
                 return true;
