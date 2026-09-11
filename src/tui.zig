@@ -111,6 +111,21 @@ pub fn exitAltScreenAndResize(writer: *std.Io.Writer) !void {
     try terminal.term.disableInBandResize(writer);
 }
 
+/// WU-2 (tui-keyentry-rebuild, REQ-NEW-002): enable DEC 2004 bracketed
+/// paste mode. Writes CSI ?2004h. Pairs with `disableBracketedPaste`.
+/// The terminal emulator then wraps pasted content in ESC[200~...ESC[201~
+/// so the parser can deliver the full payload via per-char .key events
+/// (see WU-3 paste-bracket detection).
+pub fn enableBracketedPaste(writer: *std.Io.Writer) !void {
+    try terminal.term.enableBracketedPaste(writer);
+}
+
+/// WU-2 (tui-keyentry-rebuild, REQ-NEW-002): disable DEC 2004. Writes
+/// CSI ?2004l. Pairs with `enableBracketedPaste` on the shutdown path.
+pub fn disableBracketedPaste(writer: *std.Io.Writer) !void {
+    try terminal.term.disableBracketedPaste(writer);
+}
+
 /// Probe DEC 2048 support via DECRQM. Returns true when the terminal
 /// sets the mode (or has it permanently set; `:supported()` covers
 /// `set | reset | permanently_set`). Used by SIGWINCH dual-path
@@ -284,6 +299,15 @@ pub fn tuiThreadInit(
         enterAltScreenAndResize(writer) catch {};
     }
 
+    // 3.5 WU-2 (tui-keyentry-rebuild, REQ-NEW-002): enable DEC 2004
+    // bracketed paste AFTER alt-screen + in-band-resize and BEFORE
+    // kitty-kb push (per design R-DES-5 wire order). With DEC 2004
+    // active, the terminal wraps pasted content in ESC[200~...ESC[201~
+    // so the WU-3 parser can detect the boundaries.
+    if (!lc.no_tty) {
+        enableBracketedPaste(writer) catch {};
+    }
+
     // 3. Probe DEC 2048 (REQ-TUI-019). Failure → false (legacy fallback).
     //    Skip in no-TTY mode (no terminal to probe).
     if (!lc.no_tty) {
@@ -317,6 +341,11 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
     if (lc.kitty_flags_pushed) {
         popKittyKb(writer) catch {};
     }
+
+    // 1.5 WU-2 (tui-keyentry-rebuild, REQ-NEW-002): disable DEC 2004
+    // bracketed paste AFTER kitty-kb pop and BEFORE alt-screen exit
+    // (symmetric wire order with init — design R-DES-5).
+    disableBracketedPaste(writer) catch {};
 
     // 2. Exit alt screen + disable in-band resize.
     exitAltScreenAndResize(writer) catch {};

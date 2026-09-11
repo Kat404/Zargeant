@@ -228,6 +228,13 @@ pub const enableInBandResize = @import("dpm").enableInBandResize;
 pub const disableInBandResize = @import("dpm").disableInBandResize;
 pub const beginSynchronizedUpdate = @import("dpm").beginSynchronizedUpdate;
 pub const endSynchronizedUpdate = @import("dpm").endSynchronizedUpdate;
+// WU-2 (tui-keyentry-rebuild, REQ-NEW-002): DEC 2004 bracketed paste
+// enable/disable. Re-exported so callers reach them via terminal.term
+// (matches the existing 6 DPM entry points). tuiThreadInit wires the
+// enable pair AFTER enterAltScreenAndResize; tuiThreadShutdown wires
+// the disable pair BEFORE exitAltScreenAndResize.
+pub const enableBracketedPaste = @import("dpm").enableBracketedPaste;
+pub const disableBracketedPaste = @import("dpm").disableBracketedPaste;
 
 // =============================================================================
 // Inline tests (REQTCL-013 — every public API has at least one inline test).
@@ -271,6 +278,8 @@ test "term.zig re-exports the 6 DPM entry points (design C31)" {
     // Renamed smoke canary at tests/tui/terminal_smoke.zig:64-91 iterates the
     // terminal.term namespace and asserts these 6 names. The names must
     // resolve at compile time even before PR 2 lands the real impls.
+    // WU-2 (tui-keyentry-rebuild, REQ-NEW-002) extends the list with the
+    // 2 DEC 2004 entry points so the namespace stays discoverable.
     const term_info: std.builtin.Type = @typeInfo(@import("term.zig"));
     const decls = term_info.@"struct".decls;
     const required = [_][]const u8{
@@ -280,6 +289,8 @@ test "term.zig re-exports the 6 DPM entry points (design C31)" {
         "disableInBandResize",
         "beginSynchronizedUpdate",
         "endSynchronizedUpdate",
+        "enableBracketedPaste",
+        "disableBracketedPaste",
         "enableRawMode",
         "getSize",
     };

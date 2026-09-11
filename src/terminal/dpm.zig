@@ -61,6 +61,27 @@ pub fn endSynchronizedUpdate(writer: *std.Io.Writer) anyerror!void {
     try emitDecSetReset(writer, 2026, false);
 }
 
+/// Mode 2004 — bracketed paste (DECSET). Writes `ESC[?2004h`. When
+/// enabled, conforming terminal emulators wrap pasted content between
+/// the start (`ESC[200~`) and end (`ESC[201~`) brackets so the consumer
+/// can reconstruct the full payload verbatim. Per xterm ctlseqs §"Private
+/// Mode Set" + design D4 — the WU-2 wire in src/tui.zig:tuiThreadInit
+/// emits this AFTER `enterAltScreenAndResize` and BEFORE `pushKittyKb`,
+/// so the parser sees bracket-wrapped payloads on the very first paste.
+/// ponytail: not bundled into `enableRawMode` (term.zig:177) because
+/// enableRawMode has no writer param (REQ-NEW-009 — no signature break).
+pub fn enableBracketedPaste(writer: *std.Io.Writer) anyerror!void {
+    try emitDecSetReset(writer, 2004, true);
+}
+
+/// Mode 2004 — bracketed paste (DECRST). Writes `ESC[?2004l`. Paired
+/// with `enableBracketedPaste` on the shutdown path. Emitted BEFORE
+/// `exitAltScreenAndResize` (and AFTER `popKittyKb`) so the terminal
+/// sees a clean bracketed-paste-disabled state before alt-screen exit.
+pub fn disableBracketedPaste(writer: *std.Io.Writer) anyerror!void {
+    try emitDecSetReset(writer, 2004, false);
+}
+
 /// Emit a DECSET (`h`) or DECRST (`l`) sequence for a single mode number.
 /// Buffer sized for "ESC[?" + up-to-4-digit mode + "h|l" = 9 bytes; our
 /// modes (1049, 2026, 2048) are all 4 digits so 12 is plenty.
