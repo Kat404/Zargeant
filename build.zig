@@ -143,6 +143,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/terminal/kitty.zig"),
     });
+    // PR 3 (terminal-control-lib-from-scratch WU 3.1) — event.zig is its own
+    // module root. Owned by event_mod; terminal_mod re-exports event types in
+    // PR 3 land 3 (WU 3.3); terminal_test_mod imports event so tests/terminal/
+    // event_types.zig can resolve `@import("event")` against the build dep.
+    const event_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/event.zig"),
+    });
     // term_mod needs `dpm` as a build dep so src/terminal/term.zig can do
     // `@import("dpm")` to re-export the 6 DPM functions (design C31 fix).
     // Without this, term_mod's `@import("dpm.zig")` collides with the
@@ -158,6 +167,11 @@ pub fn build(b: *std.Build) void {
     terminal_mod.addImport("style", style_mod);
     terminal_mod.addImport("dpm", dpm_mod);
     terminal_mod.addImport("kitty", kitty_mod);
+    // PR 3 (terminal-control-lib-from-scratch WU 3.3) — terminal_mod
+    // re-exports event types so src/tui.zig (in PR 6) can do
+    // `terminal.event.nextWithTimeout(...)` and the test file can verify
+    // `terminal.event.pollReadable` exists on the namespace.
+    terminal_mod.addImport("event", event_mod);
     exe_mod.addImport("terminal", terminal_mod);
 
     // test step
@@ -227,6 +241,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "style", .module = style_mod },
             .{ .name = "dpm", .module = dpm_mod },
             .{ .name = "kitty", .module = kitty_mod },
+            .{ .name = "event", .module = event_mod },
         },
     });
     const terminal_test_step = b.addTest(.{ .root_module = terminal_test_mod });

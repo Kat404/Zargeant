@@ -734,6 +734,9 @@ test "no stray Thread.spawn outside runtime.zig" {
         "src/terminal/style.zig",
         "src/terminal/dpm.zig",
         "src/terminal/kitty.zig",
+        // PR 3 WU 3.1 — public event types (REQ-TCL-004 CAP-33). Parser
+        // implementation lands in WU 3.2 (streaming UTF-8) and 3.3 (C11/C9).
+        "src/terminal/event.zig",
     };
     const io = testing.io;
     for (forbidden_targets) |path| {
@@ -802,6 +805,9 @@ test "no std.debug.print or getStdOut in TUI sources (stdios guard)" {
         "src/terminal/style.zig",
         "src/terminal/dpm.zig",
         "src/terminal/kitty.zig",
+        // PR 3 WU 3.1 — public event types (REQ-TCL-004 CAP-33). Parser
+        // implementation lands in WU 3.2 (streaming UTF-8) and 3.3 (C11/C9).
+        "src/terminal/event.zig",
     };
     const io = testing.io;
     for (targets) |path| {
