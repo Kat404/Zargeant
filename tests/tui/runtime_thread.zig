@@ -51,6 +51,8 @@ const M = struct {
     pub const Cell = root.modal.Cell;
     pub const Style = root.modal.Style;
     pub const WindowMock = root.modal.WindowMock;
+    pub const drawKeyEntry = root.modal.drawKeyEntry;
+    pub const drawUnlock = root.modal.drawUnlock;
     pub const appendStreamChunk = root.modal.appendStreamChunk;
 };
 const MS = struct {
@@ -1885,6 +1887,83 @@ test "T-TIRFIX-003b: second frame is diff only (no 2J preamble)" {
     // REQ-TIRFIX-002: trailing cursor lands at last_x + 1.
     // last emitted cell is current[5] at col=5; trailing CUP is col=7.
     try testing.expect(std.mem.endsWith(u8, out, "\x1b[1;7H"));
+}
+
+// =============================================================================
+// tui-input-rendering-fixes W4 tests (REQ-TIRFIX-004 — display_offset +
+// `<` indicator in drawKeyEntry / drawUnlock).
+//
+// Bug 4 root cause: the renderer clamped iteration count but didn't
+// shift the displayed window, so long drafts overflow onto row 1 below
+// the prompt via terminal auto-wrap. The fix: compute `display_offset`,
+// shift the visible window to the LAST `max_visible` chars, and prepend
+// a `<` scroll indicator at `start_x`.
+// =============================================================================
+
+test "T-TIRFIX-004a: drawKeyEntry does NOT scroll on short draft" {
+    // cols=80, prefix_len=15, draft_len=10 → max_visible=64, display_offset=0.
+    const W: u16 = 80;
+    const H: u16 = 24;
+    var win = try M.WindowMock.init(testing.allocator, W, H);
+    defer win.deinit();
+
+    var state: M.State = .{ .key_entry = .{} };
+    @memset(state.key_entry.draft[0..10], 'A');
+    state.key_entry.draft_len = 10;
+
+    try M.drawKeyEntry(win, &state);
+
+    // No `<` indicator at prefix position.
+    try testing.expect(win.cells[15].ch != '<');
+    // 10 `*`s at cells[15..25].
+    for (win.cells[15..25], 0..) |cell, i| {
+        try testing.expectEqual(@as(u21, '*'), cell.ch);
+        _ = i;
+    }
+}
+
+test "T-TIRFIX-004b: drawKeyEntry scrolls on long draft (REQ-TIRFIX-004 S2)" {
+    // cols=80, prefix_len=15, draft_len=70 → max_visible=64, display_offset=6.
+    const W: u16 = 80;
+    const H: u16 = 24;
+    var win = try M.WindowMock.init(testing.allocator, W, H);
+    defer win.deinit();
+
+    var state: M.State = .{ .key_entry = .{} };
+    @memset(state.key_entry.draft[0..70], 'A');
+    state.key_entry.draft_len = 70;
+
+    try M.drawKeyEntry(win, &state);
+
+    // `<` indicator at prefix position.
+    try testing.expectEqual(@as(u21, '<'), win.cells[15].ch);
+    // 64 `*`s at cells[16..80] (cols - 1 = 79 inclusive).
+    for (win.cells[16..80], 0..) |cell, i| {
+        try testing.expectEqual(@as(u21, '*'), cell.ch);
+        _ = i;
+    }
+}
+
+test "T-TIRFIX-004c: drawUnlock scrolls on long passphrase (REQ-TIRFIX-004 S3)" {
+    // cols=80, prefix_len=19, draft_len=70 → max_visible=60, display_offset=10.
+    const W: u16 = 80;
+    const H: u16 = 24;
+    var win = try M.WindowMock.init(testing.allocator, W, H);
+    defer win.deinit();
+
+    var state: M.State = .{ .unlock_prompt = .{} };
+    @memset(state.unlock_prompt.draft[0..70], 'P');
+    state.unlock_prompt.draft_len = 70;
+
+    try M.drawUnlock(win, &state);
+
+    // `<` indicator at prefix position.
+    try testing.expectEqual(@as(u21, '<'), win.cells[19].ch);
+    // 60 `*`s at cells[20..80].
+    for (win.cells[20..80], 0..) |cell, i| {
+        try testing.expectEqual(@as(u21, '*'), cell.ch);
+        _ = i;
+    }
 }
 
 // =============================================================================
