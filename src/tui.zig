@@ -419,9 +419,20 @@ pub fn emitFrame(
         try writer.writeByte(@intCast(entry.cell.ch));
     }
     try terminal.style.reset(writer, false);
-    // REQ-TIW-001 — trailing cursor position. Only fires when at least
-    // one diff entry existed (otherwise no position to land on).
-    if (diffs.len > 0) try terminal.cursor.goTo(writer, last_x, last_y);
+    // REQ-TIRFIX-002 (tui-input-rendering-fixes #1576) — trailing cursor
+    // lands ONE COLUMN PAST the last rendered cell, clamped to `cols - 1`
+    // to keep the cursor inside the field (a CUP to (cols, y) places the
+    // cursor in the wrap zone). For input fields this is the correct
+    // position: the next empty cell where the next keystroke will be
+    // typed. The previous on-cell positioning was glued the blink cursor
+    // to the rightmost `*` (Bug 2) and to the cell-being-erased during
+    // backspace (Bug 5 perceptual artifact). ECMA-48 §8.3.21 (CSI CUP)
+    // semantics — `terminal.cursor.goTo` adds +1 internally to convert
+    // 0-indexed caller coords to 1-indexed wire coords.
+    if (diffs.len > 0) {
+        const col: u16 = if (last_x + 1 > cols -| 1) cols -| 1 else last_x + 1;
+        try terminal.cursor.goTo(writer, col, last_y);
+    }
 }
 
 // =============================================================================
