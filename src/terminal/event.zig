@@ -272,7 +272,19 @@ pub const Parser = struct {
         // Reading unconditionally would block on a fd with no data (e.g.
         // stdin when the test runner redirected it). poll(2) returning 0
         // means timeout; we report `.none` (no event arrived in the window).
-        if (ready == 0) return .none;
+        if (ready == 0) {
+            // WU-3 (tui-keyentry-rebuild, REQ-NEW-003, design D6): if
+            // paste_active is true and the close bracket never arrives
+            // within the poll window, surface .paste_end so the caller
+            // exits paste-active mode. Auto-recovery handles malformed
+            // pastes (truncated, dropped close bracket) without
+            // consuming the undecoded bytes.
+            if (self.paste_active) {
+                self.paste_active = false;
+                return .paste_end;
+            }
+            return .none;
+        }
         _ = try self.readMore(file);
 
         // 3) Decode from the ring buffer. The decoder consumes bytes from
@@ -287,6 +299,19 @@ pub const Parser = struct {
     pub fn decode(self: *Parser) Event {
         if (self.ring_len == 0) return .none;
 
+        // WU-3 (tui-keyentry-rebuild, REQ-NEW-003): when paste_active is
+        // true, short-circuit the dispatcher and emit one .key per UTF-8
+        // codepoint (or ASCII byte). The existing ring_buf carries the
+        // paste payload (YAGNI per design D5 — no separate paste_buffer).
+        // Embedded ESC bytes emit .invalid (0x1B is not a valid Unicode
+        // scalar per design D6 §"Embedded ESC handling"). The close
+        // bracket \x1b[201~ is detected via a direct prefix match BEFORE
+        // any byte is consumed, so the close sequence never reaches the
+        // dispatch loop as payload.
+        if (self.paste_active) {
+            return self.decodePastePayload();
+        }
+
         const first = self.ring_buf[0];
 
         // ASCII fast path (0x00..0x7F).
@@ -295,6 +320,35 @@ pub const Parser = struct {
         }
 
         // UTF-8 multi-byte sequence (RFC 3629).
+        return self.decodeUtf8();
+    }
+
+    /// Decode one byte/codepoint of paste payload while paste_active is
+    /// true. Looks for the \x1b[201~ close bracket prefix and emits
+    /// .paste_end if found; otherwise emits one .key event per byte or
+    /// UTF-8 codepoint. Per design D6: embedded ESC bytes emit .invalid.
+    fn decodePastePayload(self: *Parser) Event {
+        const close_seq = "\x1b[201~";
+        // Check the close-bracket prefix match against ring_buf.
+        if (self.ring_len >= close_seq.len and
+            std.mem.eql(u8, self.ring_buf[0..close_seq.len], close_seq))
+        {
+            self.consume(close_seq.len);
+            self.paste_active = false;
+            return .paste_end;
+        }
+        const first = self.ring_buf[0];
+        if (first < 0x80) {
+            // ASCII byte in paste payload. ESC (0x1B) emits .invalid
+            // (per design D6 — not a valid Unicode scalar).
+            if (first == 0x1B) {
+                self.consume(1);
+                return .invalid;
+            }
+            self.consume(1);
+            return .{ .key = .{ .code = .{ .char = @as(u21, first) }, .event = .press } };
+        }
+        // UTF-8 multi-byte inside paste payload.
         return self.decodeUtf8();
     }
 
@@ -529,6 +583,24 @@ pub const Parser = struct {
                     n = n * 10 + @as(u16, p - '0');
                 } else break;
             }
+
+            // WU-3 (tui-keyentry-rebuild, REQ-NEW-003): bracketed paste
+            // boundaries — n=200 → .paste_start, n=201 → .paste_end. The
+            // start sets paste_active so subsequent bytes are emitted as
+            // per-char .key events via decodePastePayload. The end is
+            // defensive — normal close is matched in decodePastePayload's
+            // prefix check (so the end here only fires when the close
+            // arrives WHILE NOT paste_active, which is a malformed
+            // terminal emit; we surface it as .paste_end for symmetry).
+            switch (n) {
+                200 => {
+                    self.paste_active = true;
+                    return .paste_start;
+                },
+                201 => return .paste_end,
+                else => {},
+            }
+
             switch (n) {
                 1, 7 => return .{ .key = .{ .code = .enter, .event = .press } }, // Home
                 2 => return .{ .key = .{ .code = .enter, .event = .press } }, // Insert

@@ -310,3 +310,151 @@ test "setCurrentParser round-trip: set → use → clear" {
     const parser_addr_after = @intFromPtr(&parser);
     try testing.expectEqual(parser_addr_before, parser_addr_after);
 }
+
+// =============================================================================
+// WU-3 — Paste-bracket detection (REQ-NEW-003)
+//
+// Per design D2/D5/D6 + REQ-NEW-003:
+//   - dispatchCsi emits .paste_start when final='~' and n=200
+//   - dispatchCsi emits .paste_end when final='~' and n=201
+//   - While paste_active=true, decode() short-circuits and emits one
+//     .key event per UTF-8 codepoint (or ASCII byte), skipping CSI
+//     dispatch entirely. The existing ring_buf carries the payload.
+//   - Parser.next() converts .none on poll-timeout to .paste_end when
+//     paste_active=true (auto-recovery per design D6).
+// =============================================================================
+
+test "bracketed paste: simple round-trip 'hello world'" {
+    // Scenario from REQ-NEW-003 — feed \x1b[200~hello world\x1b[201~,
+    // expect 13 events: paste_start, 11 .key (h,e,l,l,o,' ',w,o,r,l,d),
+    // paste_end.
+    var parser = event.Parser.init();
+    parser.feedBytes("\x1b[200~hello world\x1b[201~");
+
+    // First event: paste_start
+    const e1 = parser.decode();
+    try testing.expect(e1 == .paste_start);
+    try testing.expect(parser.paste_active);
+
+    // 11 .key events for "hello world"
+    const expected = "hello world";
+    var i: usize = 0;
+    while (i < expected.len) : (i += 1) {
+        const ev = parser.decode();
+        try testing.expect(ev == .key);
+        try testing.expectEqual(@as(u21, expected[i]), ev.key.code.char);
+    }
+
+    // Final event: paste_end
+    const e_last = parser.decode();
+    try testing.expect(e_last == .paste_end);
+    try testing.expect(!parser.paste_active);
+}
+
+test "bracketed paste: embedded ESC sequence captured verbatim" {
+    // Per REQ-NEW-003 scenario 2 — a paste containing an embedded CSI
+    // sequence (e.g. \x1b[31m) must NOT be routed to CSI dispatch; the
+    // bytes are part of the payload. Per design D6, embedded ESC bytes
+    // emit .invalid (0x1B is not a valid Unicode scalar), and the
+    // subsequent bytes ([, 3, 1, m) are emitted individually as
+    // per-char .key events. Total payload events:
+    //   5 chars "hello" + ESC(.invalid) + 4 chars "[31m" + 5 chars "world"
+    // = 5 + 1 + 4 + 5 = 15 events between paste_start and paste_end.
+    var parser = event.Parser.init();
+    parser.feedBytes("\x1b[200~hello\x1b[31mworld\x1b[201~");
+
+    const e1 = parser.decode();
+    try testing.expect(e1 == .paste_start);
+
+    // "hello" — 5 chars
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        const ev = parser.decode();
+        try testing.expect(ev == .key);
+        try testing.expectEqual(@as(u21, "hello"[i]), ev.key.code.char);
+    }
+    // The embedded ESC byte emits .invalid (per D6 design — 0x1B is
+    // not a valid Unicode scalar).
+    const esc_event = parser.decode();
+    try testing.expect(esc_event == .invalid);
+
+    // The rest of the embedded "CSI sequence" payload is 4 individual
+    // ASCII chars: '[', '3', '1', 'm' (NOT routed to CSI dispatcher).
+    const rest1 = "[31m";
+    var j: usize = 0;
+    while (j < rest1.len) : (j += 1) {
+        const ev = parser.decode();
+        try testing.expect(ev == .key);
+        try testing.expectEqual(@as(u21, rest1[j]), ev.key.code.char);
+    }
+
+    // "world" — 5 chars
+    var k: usize = 0;
+    while (k < 5) : (k += 1) {
+        const ev = parser.decode();
+        try testing.expect(ev == .key);
+        try testing.expectEqual(@as(u21, "world"[k]), ev.key.code.char);
+    }
+
+    // paste_end
+    const e_end = parser.decode();
+    try testing.expect(e_end == .paste_end);
+}
+
+test "bracketed paste: malformed (no close) recovers on next feed" {
+    // Per REQ-NEW-003 scenario 3 — paste-start + content arrive; the
+    // close bracket arrives in a separate feedBytes call. The parser
+    // must not infinite-loop and must emit .paste_end when the close
+    // arrives.
+    var parser = event.Parser.init();
+    parser.feedBytes("\x1b[200~abc");
+
+    const e1 = parser.decode();
+    try testing.expect(e1 == .paste_start);
+    try testing.expect(parser.paste_active);
+
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        const ev = parser.decode();
+        try testing.expect(ev == .key);
+        try testing.expectEqual(@as(u21, "abc"[i]), ev.key.code.char);
+    }
+
+    // Buffer is now empty; paste_active still true. Next feedBytes
+    // appends the close bracket.
+    parser.feedBytes("\x1b[201~");
+    const e_end = parser.decode();
+    try testing.expect(e_end == .paste_end);
+    try testing.expect(!parser.paste_active);
+}
+
+test "bracketed paste: split-CSI start sequence across calls" {
+    // Per REQ-NEW-003 scenario 4 — \x1b[ in call N, 200~ in call N+1.
+    // The split bytes must combine to a single .paste_start event
+    // (not two .timeout fragments). Without parser persistence this
+    // test cannot pass — the pre-WU-1 code would only see one chunk
+    // per call.
+    var parser = event.Parser.init();
+    parser.feedBytes("\x1b[");
+    const e_first = parser.decode();
+    try testing.expect(e_first == .timeout); // truncated — no final byte yet
+    try testing.expectEqual(@as(usize, 2), parser.ring_len);
+
+    parser.feedBytes("200~hi\x1b[201~");
+    const e_start = parser.decode();
+    try testing.expect(e_start == .paste_start);
+    try testing.expect(parser.paste_active);
+
+    // Drain the 2-char payload "hi" — proves per-char events arrive.
+    const e_h = parser.decode();
+    try testing.expect(e_h == .key);
+    try testing.expectEqual(@as(u21, 'h'), e_h.key.code.char);
+    const e_i = parser.decode();
+    try testing.expect(e_i == .key);
+    try testing.expectEqual(@as(u21, 'i'), e_i.key.code.char);
+
+    // Final: .paste_end (close bracket arrived in the same feed).
+    const e_end = parser.decode();
+    try testing.expect(e_end == .paste_end);
+    try testing.expect(!parser.paste_active);
+}
