@@ -188,11 +188,21 @@ pub const Parser = struct {
     /// are the unconsumed prefix; bytes [ring_len..4096) are free space
     /// for the next `read(2)` call.
     ring_len: usize,
+    /// WU-1 — paste-active flag. Set when the parser decodes the
+    /// `CSI 200 ~` (bracketed paste start) bracket; cleared when the
+    /// parser decodes `CSI 201 ~` (close) or after a poll-timeout
+    /// escape (auto-recovery per design D6). When true, `decode()`
+    /// short-circuits to per-char `.key` emission and treats any
+    /// embedded escape as payload (no CSI dispatch until `.paste_end`).
+    /// WU-1 lands the field + thread-local access; WU-3 adds the
+    /// paste-active short-circuit and dispatchCsi branches.
+    paste_active: bool = false,
 
     pub fn init() Parser {
         return .{
             .ring_buf = undefined,
             .ring_len = 0,
+            .paste_active = false,
         };
     }
 
@@ -657,12 +667,54 @@ fn defaultPollFn(fds: []linux.pollfd, timeout: i32) anyerror!usize {
     return std.posix.poll(fds, timeout);
 }
 
+// =============================================================================
+// WU-1 — Thread-local parser handle (REQ-NEW-001 + REQ-NEW-008)
+//
+// The parser is now a value field on `tui.Lifecycle` (not stack-local to
+// `nextWithTimeout`). Production wiring in `tuiThreadInit` calls
+// `setCurrentParser(&lc.parser)` after `enableRawMode` succeeds;
+// `tuiThreadShutdown` calls `setCurrentParser(null)` after raw-mode
+// teardown. Tests inject a Parser via the same setter (per design D3 —
+// holds `?*Parser`, not `?*Lifecycle`, to avoid circular dep).
+//
+// Why a thread-local: the TUI thread is single-threaded (terminal-
+// control-lib C8 lock-in). A module-level `pub var` with thread-local
+// storage is the minimum-machinery seam that lets `nextWithTimeout`
+// stay signature-stable (terminal-control-lib C22 lock-in) while
+// routing through a persistent ring buffer.
+//
+// ponytail: the pre-WU-1 code at src/terminal/event.zig:666 (before
+// this commit) created `var parser = Parser.init()` per call, which
+// destroyed the ring buffer (and any undecoded bytes) on return. A
+// split CSI sequence across calls returned `.timeout` forever and
+// paste payloads collapsed to 1 event. See sdd/tui-keyentry-rebuild
+// explore obs#1555 for the symptom timeline (2026-09-10).
+// =============================================================================
+
+threadlocal var current_parser: ?*Parser = null;
+
+/// Set or clear the thread-local parser handle. Production callers
+/// (`tuiThreadInit` / `tuiThreadShutdown`) symmetrically set then
+/// clear it; tests inject a `Parser` to drive `nextWithTimeout` without
+/// a real TTY. The setter is the only mutation point (REQ-NEW-008).
+pub fn setCurrentParser(p: ?*Parser) void {
+    current_parser = p;
+}
+
 pub fn nextWithTimeout(
     io: std.Io,
     file: std.Io.File,
     timeout_ms: u32,
     pending: *const std.atomic.Value(bool),
 ) anyerror!Event {
+    // WU-1: route through the thread-local parser if set. Fallback to a
+    // fresh stack-local parser for tests / non-TUI callers that never
+    // invoke `setCurrentParser`. The fallback path preserves
+    // pre-WU-1 behavior (1 event per call; split bytes lost) so existing
+    // callers without a set parser continue to compile + pass.
+    if (current_parser) |p| {
+        return p.next(io, file, timeout_ms, pending, &defaultPollFn);
+    }
     var parser = Parser.init();
     return parser.next(io, file, timeout_ms, pending, &defaultPollFn);
 }

@@ -79,6 +79,14 @@ pub const Lifecycle = struct {
     /// in shutdown. `null` on the first frame → `emitFrame` receives
     /// `current` as both `prev` and `current` arg (full-frame emit).
     prev_snapshot: ?[]@import("modal.zig").Cell = null,
+    /// WU-1 (tui-keyentry-rebuild, REQ-NEW-001): the persistent Parser
+    /// for the TUI thread. Lives on Lifecycle so the ring buffer
+    /// survives across `nextWithTimeout` calls. Wired via
+    /// `terminal.event.setCurrentParser(&lc.parser)` in `tuiThreadInit`
+    /// after `enableRawMode` succeeds; cleared in `tuiThreadShutdown`
+    /// after raw-mode teardown. The 4 KiB ring buffer is part of the
+    /// stack-allocated Lifecycle (not heap-allocated; see design D1).
+    parser: terminal.event.Parser = .{ .ring_buf = undefined, .ring_len = 0, .paste_active = false },
 };
 
 // =============================================================================
@@ -261,6 +269,11 @@ pub fn tuiThreadInit(
         lc.no_tty = true;
     }
 
+    // WU-1 (REQ-NEW-001 + REQ-NEW-008): publish the persistent Parser
+    // to the thread-local so `nextWithTimeout` routes through it.
+    // Production-only wire; tests inject via the same setter.
+    terminal.event.setCurrentParser(&lc.parser);
+
     // 2. Install SIGWINCH fallback handler (REQ-TUI-019 scenario 2). The
     // handler sets redraw_pending via the global pointer installed here.
     installSigwinch(&lc.redraw_pending);
@@ -312,6 +325,12 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
     if (lc.raw_term) |*rt| {
         rt.disableRawMode() catch {};
     }
+
+    // WU-1 (REQ-NEW-008): clear the thread-local parser handle AFTER
+    // raw-mode teardown so no caller of `nextWithTimeout` reaches a
+    // dangling Parser pointer during shutdown. Symmetric with the
+    // setCurrentParser call in tuiThreadInit.
+    terminal.event.setCurrentParser(null);
 }
 
 // =============================================================================
@@ -946,8 +965,10 @@ test "Lifecycle struct exposes required fields" {
     // Compile-time assertion via typeinfo. PR 2 adds the `no_tty` field
     // (REQ-TUI-047); the count rises from 7 to 8. tui-render-wiring
     // (#1259, REQ-RW-002) adds `prev_snapshot`; the count rises to 9.
+    // WU-1 (tui-keyentry-rebuild, REQ-NEW-001) adds `parser: Parser`
+    // for the persistent parser; the count rises to 10.
     const fields = @typeInfo(Lifecycle).@"struct".fields;
-    try testing.expectEqual(@as(usize, 9), fields.len);
+    try testing.expectEqual(@as(usize, 10), fields.len);
 }
 
 test "redraw_pending is std.atomic.Value(bool) with seq_cst contract" {
