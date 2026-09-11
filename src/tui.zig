@@ -79,6 +79,14 @@ pub const Lifecycle = struct {
     /// in shutdown. `null` on the first frame → `emitFrame` receives
     /// `current` as both `prev` and `current` arg (full-frame emit).
     prev_snapshot: ?[]@import("modal.zig").Cell = null,
+    /// WU-1 (tui-keyentry-rebuild, REQ-NEW-001): the persistent Parser
+    /// for the TUI thread. Lives on Lifecycle so the ring buffer
+    /// survives across `nextWithTimeout` calls. Wired via
+    /// `terminal.event.setCurrentParser(&lc.parser)` in `tuiThreadInit`
+    /// after `enableRawMode` succeeds; cleared in `tuiThreadShutdown`
+    /// after raw-mode teardown. The 4 KiB ring buffer is part of the
+    /// stack-allocated Lifecycle (not heap-allocated; see design D1).
+    parser: terminal.event.Parser = .{ .ring_buf = undefined, .ring_len = 0, .paste_active = false },
 };
 
 // =============================================================================
@@ -101,6 +109,21 @@ pub fn enterAltScreenAndResize(writer: *std.Io.Writer) !void {
 pub fn exitAltScreenAndResize(writer: *std.Io.Writer) !void {
     try terminal.term.exitAlternateScreen(writer);
     try terminal.term.disableInBandResize(writer);
+}
+
+/// WU-2 (tui-keyentry-rebuild, REQ-NEW-002): enable DEC 2004 bracketed
+/// paste mode. Writes CSI ?2004h. Pairs with `disableBracketedPaste`.
+/// The terminal emulator then wraps pasted content in ESC[200~...ESC[201~
+/// so the parser can deliver the full payload via per-char .key events
+/// (see WU-3 paste-bracket detection).
+pub fn enableBracketedPaste(writer: *std.Io.Writer) !void {
+    try terminal.term.enableBracketedPaste(writer);
+}
+
+/// WU-2 (tui-keyentry-rebuild, REQ-NEW-002): disable DEC 2004. Writes
+/// CSI ?2004l. Pairs with `enableBracketedPaste` on the shutdown path.
+pub fn disableBracketedPaste(writer: *std.Io.Writer) !void {
+    try terminal.term.disableBracketedPaste(writer);
 }
 
 /// Probe DEC 2048 support via DECRQM. Returns true when the terminal
@@ -261,6 +284,11 @@ pub fn tuiThreadInit(
         lc.no_tty = true;
     }
 
+    // WU-1 (REQ-NEW-001 + REQ-NEW-008): publish the persistent Parser
+    // to the thread-local so `nextWithTimeout` routes through it.
+    // Production-only wire; tests inject via the same setter.
+    terminal.event.setCurrentParser(&lc.parser);
+
     // 2. Install SIGWINCH fallback handler (REQ-TUI-019 scenario 2). The
     // handler sets redraw_pending via the global pointer installed here.
     installSigwinch(&lc.redraw_pending);
@@ -269,6 +297,15 @@ pub fn tuiThreadInit(
     // (no terminal to switch into).
     if (!lc.no_tty) {
         enterAltScreenAndResize(writer) catch {};
+    }
+
+    // 3.5 WU-2 (tui-keyentry-rebuild, REQ-NEW-002): enable DEC 2004
+    // bracketed paste AFTER alt-screen + in-band-resize and BEFORE
+    // kitty-kb push (per design R-DES-5 wire order). With DEC 2004
+    // active, the terminal wraps pasted content in ESC[200~...ESC[201~
+    // so the WU-3 parser can detect the boundaries.
+    if (!lc.no_tty) {
+        enableBracketedPaste(writer) catch {};
     }
 
     // 3. Probe DEC 2048 (REQ-TUI-019). Failure → false (legacy fallback).
@@ -305,6 +342,11 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
         popKittyKb(writer) catch {};
     }
 
+    // 1.5 WU-2 (tui-keyentry-rebuild, REQ-NEW-002): disable DEC 2004
+    // bracketed paste AFTER kitty-kb pop and BEFORE alt-screen exit
+    // (symmetric wire order with init — design R-DES-5).
+    disableBracketedPaste(writer) catch {};
+
     // 2. Exit alt screen + disable in-band resize.
     exitAltScreenAndResize(writer) catch {};
 
@@ -312,6 +354,12 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
     if (lc.raw_term) |*rt| {
         rt.disableRawMode() catch {};
     }
+
+    // WU-1 (REQ-NEW-008): clear the thread-local parser handle AFTER
+    // raw-mode teardown so no caller of `nextWithTimeout` reaches a
+    // dangling Parser pointer during shutdown. Symmetric with the
+    // setCurrentParser call in tuiThreadInit.
+    terminal.event.setCurrentParser(null);
 }
 
 // =============================================================================
@@ -946,8 +994,10 @@ test "Lifecycle struct exposes required fields" {
     // Compile-time assertion via typeinfo. PR 2 adds the `no_tty` field
     // (REQ-TUI-047); the count rises from 7 to 8. tui-render-wiring
     // (#1259, REQ-RW-002) adds `prev_snapshot`; the count rises to 9.
+    // WU-1 (tui-keyentry-rebuild, REQ-NEW-001) adds `parser: Parser`
+    // for the persistent parser; the count rises to 10.
     const fields = @typeInfo(Lifecycle).@"struct".fields;
-    try testing.expectEqual(@as(usize, 9), fields.len);
+    try testing.expectEqual(@as(usize, 10), fields.len);
 }
 
 test "redraw_pending is std.atomic.Value(bool) with seq_cst contract" {

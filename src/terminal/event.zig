@@ -188,11 +188,21 @@ pub const Parser = struct {
     /// are the unconsumed prefix; bytes [ring_len..4096) are free space
     /// for the next `read(2)` call.
     ring_len: usize,
+    /// WU-1 — paste-active flag. Set when the parser decodes the
+    /// `CSI 200 ~` (bracketed paste start) bracket; cleared when the
+    /// parser decodes `CSI 201 ~` (close) or after a poll-timeout
+    /// escape (auto-recovery per design D6). When true, `decode()`
+    /// short-circuits to per-char `.key` emission and treats any
+    /// embedded escape as payload (no CSI dispatch until `.paste_end`).
+    /// WU-1 lands the field + thread-local access; WU-3 adds the
+    /// paste-active short-circuit and dispatchCsi branches.
+    paste_active: bool = false,
 
     pub fn init() Parser {
         return .{
             .ring_buf = undefined,
             .ring_len = 0,
+            .paste_active = false,
         };
     }
 
@@ -262,7 +272,19 @@ pub const Parser = struct {
         // Reading unconditionally would block on a fd with no data (e.g.
         // stdin when the test runner redirected it). poll(2) returning 0
         // means timeout; we report `.none` (no event arrived in the window).
-        if (ready == 0) return .none;
+        if (ready == 0) {
+            // WU-3 (tui-keyentry-rebuild, REQ-NEW-003, design D6): if
+            // paste_active is true and the close bracket never arrives
+            // within the poll window, surface .paste_end so the caller
+            // exits paste-active mode. Auto-recovery handles malformed
+            // pastes (truncated, dropped close bracket) without
+            // consuming the undecoded bytes.
+            if (self.paste_active) {
+                self.paste_active = false;
+                return .paste_end;
+            }
+            return .none;
+        }
         _ = try self.readMore(file);
 
         // 3) Decode from the ring buffer. The decoder consumes bytes from
@@ -277,6 +299,19 @@ pub const Parser = struct {
     pub fn decode(self: *Parser) Event {
         if (self.ring_len == 0) return .none;
 
+        // WU-3 (tui-keyentry-rebuild, REQ-NEW-003): when paste_active is
+        // true, short-circuit the dispatcher and emit one .key per UTF-8
+        // codepoint (or ASCII byte). The existing ring_buf carries the
+        // paste payload (YAGNI per design D5 — no separate paste_buffer).
+        // Embedded ESC bytes emit .invalid (0x1B is not a valid Unicode
+        // scalar per design D6 §"Embedded ESC handling"). The close
+        // bracket \x1b[201~ is detected via a direct prefix match BEFORE
+        // any byte is consumed, so the close sequence never reaches the
+        // dispatch loop as payload.
+        if (self.paste_active) {
+            return self.decodePastePayload();
+        }
+
         const first = self.ring_buf[0];
 
         // ASCII fast path (0x00..0x7F).
@@ -285,6 +320,35 @@ pub const Parser = struct {
         }
 
         // UTF-8 multi-byte sequence (RFC 3629).
+        return self.decodeUtf8();
+    }
+
+    /// Decode one byte/codepoint of paste payload while paste_active is
+    /// true. Looks for the \x1b[201~ close bracket prefix and emits
+    /// .paste_end if found; otherwise emits one .key event per byte or
+    /// UTF-8 codepoint. Per design D6: embedded ESC bytes emit .invalid.
+    fn decodePastePayload(self: *Parser) Event {
+        const close_seq = "\x1b[201~";
+        // Check the close-bracket prefix match against ring_buf.
+        if (self.ring_len >= close_seq.len and
+            std.mem.eql(u8, self.ring_buf[0..close_seq.len], close_seq))
+        {
+            self.consume(close_seq.len);
+            self.paste_active = false;
+            return .paste_end;
+        }
+        const first = self.ring_buf[0];
+        if (first < 0x80) {
+            // ASCII byte in paste payload. ESC (0x1B) emits .invalid
+            // (per design D6 — not a valid Unicode scalar).
+            if (first == 0x1B) {
+                self.consume(1);
+                return .invalid;
+            }
+            self.consume(1);
+            return .{ .key = .{ .code = .{ .char = @as(u21, first) }, .event = .press } };
+        }
+        // UTF-8 multi-byte inside paste payload.
         return self.decodeUtf8();
     }
 
@@ -519,6 +583,24 @@ pub const Parser = struct {
                     n = n * 10 + @as(u16, p - '0');
                 } else break;
             }
+
+            // WU-3 (tui-keyentry-rebuild, REQ-NEW-003): bracketed paste
+            // boundaries — n=200 → .paste_start, n=201 → .paste_end. The
+            // start sets paste_active so subsequent bytes are emitted as
+            // per-char .key events via decodePastePayload. The end is
+            // defensive — normal close is matched in decodePastePayload's
+            // prefix check (so the end here only fires when the close
+            // arrives WHILE NOT paste_active, which is a malformed
+            // terminal emit; we surface it as .paste_end for symmetry).
+            switch (n) {
+                200 => {
+                    self.paste_active = true;
+                    return .paste_start;
+                },
+                201 => return .paste_end,
+                else => {},
+            }
+
             switch (n) {
                 1, 7 => return .{ .key = .{ .code = .enter, .event = .press } }, // Home
                 2 => return .{ .key = .{ .code = .enter, .event = .press } }, // Insert
@@ -657,12 +739,54 @@ fn defaultPollFn(fds: []linux.pollfd, timeout: i32) anyerror!usize {
     return std.posix.poll(fds, timeout);
 }
 
+// =============================================================================
+// WU-1 — Thread-local parser handle (REQ-NEW-001 + REQ-NEW-008)
+//
+// The parser is now a value field on `tui.Lifecycle` (not stack-local to
+// `nextWithTimeout`). Production wiring in `tuiThreadInit` calls
+// `setCurrentParser(&lc.parser)` after `enableRawMode` succeeds;
+// `tuiThreadShutdown` calls `setCurrentParser(null)` after raw-mode
+// teardown. Tests inject a Parser via the same setter (per design D3 —
+// holds `?*Parser`, not `?*Lifecycle`, to avoid circular dep).
+//
+// Why a thread-local: the TUI thread is single-threaded (terminal-
+// control-lib C8 lock-in). A module-level `pub var` with thread-local
+// storage is the minimum-machinery seam that lets `nextWithTimeout`
+// stay signature-stable (terminal-control-lib C22 lock-in) while
+// routing through a persistent ring buffer.
+//
+// ponytail: the pre-WU-1 code at src/terminal/event.zig:666 (before
+// this commit) created `var parser = Parser.init()` per call, which
+// destroyed the ring buffer (and any undecoded bytes) on return. A
+// split CSI sequence across calls returned `.timeout` forever and
+// paste payloads collapsed to 1 event. See sdd/tui-keyentry-rebuild
+// explore obs#1555 for the symptom timeline (2026-09-10).
+// =============================================================================
+
+threadlocal var current_parser: ?*Parser = null;
+
+/// Set or clear the thread-local parser handle. Production callers
+/// (`tuiThreadInit` / `tuiThreadShutdown`) symmetrically set then
+/// clear it; tests inject a `Parser` to drive `nextWithTimeout` without
+/// a real TTY. The setter is the only mutation point (REQ-NEW-008).
+pub fn setCurrentParser(p: ?*Parser) void {
+    current_parser = p;
+}
+
 pub fn nextWithTimeout(
     io: std.Io,
     file: std.Io.File,
     timeout_ms: u32,
     pending: *const std.atomic.Value(bool),
 ) anyerror!Event {
+    // WU-1: route through the thread-local parser if set. Fallback to a
+    // fresh stack-local parser for tests / non-TUI callers that never
+    // invoke `setCurrentParser`. The fallback path preserves
+    // pre-WU-1 behavior (1 event per call; split bytes lost) so existing
+    // callers without a set parser continue to compile + pass.
+    if (current_parser) |p| {
+        return p.next(io, file, timeout_ms, pending, &defaultPollFn);
+    }
     var parser = Parser.init();
     return parser.next(io, file, timeout_ms, pending, &defaultPollFn);
 }

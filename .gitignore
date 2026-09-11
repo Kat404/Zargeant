@@ -28,3 +28,6 @@ zig-pkg/
 
 # Tooling caches (regenerable, contiene paths locales)
 .atl/
+
+# Graphify output (regenerable via `graphify`, contiene paths locales + datos variables)
+graphify-out/

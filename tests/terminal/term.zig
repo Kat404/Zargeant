@@ -150,3 +150,49 @@ fn getSizeViaBackend(handle: std.Io.File.Handle, backend: term.Backend) anyerror
     const ws = try backend.ioctl_gwinsz(handle);
     return .{ .width = ws.col, .height = ws.row };
 }
+
+// =============================================================================
+// WU-2 — DEC 2004 (bracketed paste) enable/disable (REQ-NEW-002)
+//
+// Bracketed paste is a CSI ?2004 mode set/reset pair per xterm ctlseqs.
+// The terminal emulator wraps pasted content in \x1b[200~ ... \x1b[201~
+// when mode 2004 is set; the parser then emits .paste_start + per-char
+// .key events + .paste_end (per WU-3).
+//
+// The helpers live in src/terminal/dpm.zig (matches the alt-screen +
+// in-band-resize pattern). enableRawMode has no writer param so we do
+// NOT bundle DEC 2004 into enableRawMode (REQ-NEW-009 + design D4).
+// =============================================================================
+
+test "enableBracketedPaste writes CSI ? 2004 h" {
+    var buf: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try term.enableBracketedPaste(&w);
+    try testing.expectEqualStrings("\x1b[?2004h", buf[0..w.end]);
+}
+
+test "disableBracketedPaste writes CSI ? 2004 l" {
+    var buf: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try term.disableBracketedPaste(&w);
+    try testing.expectEqualStrings("\x1b[?2004l", buf[0..w.end]);
+}
+
+test "enableBracketedPaste is idempotent (no internal dedup)" {
+    // Per design D4 / spec REQ-NEW-002: idempotent across cycles means
+    // a clean round-trip — one sequence per call. No internal dedup
+    // (caller controls enable/disable symmetry). Two enables emit two
+    // ?2004h bytes; the test asserts the writer received exactly two.
+    var buf: [32]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try term.enableBracketedPaste(&w);
+    try term.disableBracketedPaste(&w);
+    try term.enableBracketedPaste(&w);
+    try term.disableBracketedPaste(&w);
+    const out = buf[0..w.end];
+    // Two ?2004h sequences + two ?2004l sequences, alternating.
+    const h_count = std.mem.count(u8, out, "\x1b[?2004h");
+    const l_count = std.mem.count(u8, out, "\x1b[?2004l");
+    try testing.expectEqual(@as(usize, 2), h_count);
+    try testing.expectEqual(@as(usize, 2), l_count);
+}

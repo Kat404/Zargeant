@@ -15,7 +15,7 @@ Zargeant is a **terminal-native AI agent harness**: a TUI that lets you drive an
 - **Minimal binary.** Zig 0.16 + stdlib only; ~200 KB–1.5 MB stripped, cold start < 50 ms.
 - **Hardened by design.** Every tool subprocess runs in a sandboxed copy of the agent's profile: deny-by-default filesystem rules via Landlock, syscall allowlist via Seccomp-BPF, no `ptrace`, no `mount`, no `bpf`.
 - **Headless observability.** A mandatory `src/logger.zig` writes to `/tmp/ai-harness-debug.log` (mode `0600`). The TUI takes raw mode on the terminal; **no** writes to `stdout` or `stderr`.
-- **Strict TDD.** Every slice ships with tests written **before** implementation. 186 tests pass on Debug + ReleaseSafe + ReleaseFast as of the tui-recovery R-PR 4 merge.
+- **Strict TDD.** Every slice ships with tests written **before** implementation. 500 tests pass on Debug + ReleaseSafe + ReleaseFast as of the terminal-control-lib-from-scratch PR 6 merge (386 main + 114 in-tree terminal).
 
 ## Architecture
 
@@ -51,57 +51,68 @@ Three threads:
 
 In development. Five of seven planned slices are shipped on `main`:
 
-| Slice                                     | Status         | Lines | Tests   |
-| ----------------------------------------- | -------------- | ----- | ------- |
-| Build toolchain (`build.zig` + `zig.zon`) | ✓ shipped      | 78    | 1 smoke |
-| Logger (`/tmp/ai-harness-debug.log`)      | ✓ shipped      | 609   | 15      |
-| Sandbox Linux (Landlock + Seccomp-BPF)    | ✓ shipped      | 1,615 | 25      |
-| API Client (MiniMax HTTP-SSE)             | ✓ shipped      | ~900  | ~12     |
-| TLS handrolled                            | ✓ shipped      | ~700  | ~8      |
-| TUI (mibu + 3-thread orchestrator)        | 🚧 R-PR 1-4 ✓ | ~2,700 | 186    |
-| logger-macos-port                         | 📋 follow-up   | —     | —       |
-| sandbox-macos                             | 📋 follow-up   | —     | —       |
+| Slice                                                       | Status         | Lines  | Tests   |
+| ----------------------------------------------------------- | -------------- | ------ | ------- |
+| Build toolchain (`build.zig` + `zig.zon`)                   | ✓ shipped      | 78     | 1 smoke |
+| Logger (`/tmp/ai-harness-debug.log`)                        | ✓ shipped      | 609    | 15      |
+| Sandbox Linux (Landlock + Seccomp-BPF)                      | ✓ shipped      | 1,615  | 25      |
+| API Client (MiniMax HTTP-SSE)                               | ✓ shipped      | ~900   | ~12     |
+| TLS handrolled                                              | ✓ shipped      | ~700   | ~8      |
+| TUI (in-tree `src/terminal/` + 3-thread orchestrator)       | 🚧 6-PR chain ready, awaiting merge | ~3,500 | 500   |
+| logger-macos-port                                           | 📋 follow-up   | —      | —       |
+| sandbox-macos                                               | 📋 follow-up   | —      | —       |
 
-**Total**: 186 tests pass on `zig build test` (Debug + ReleaseSafe + ReleaseFast) as of the tui-recovery R-PR 4 merge. Slice 5 (TUI) is on the `tui-recovery` chained PR stack; see [Slice status — TUI](#slice-status--tui) below.
+**Total**: 500 tests pass on `zig build test` (Debug + ReleaseSafe + ReleaseFast) as of the terminal-control-lib-from-scratch PR 6 merge. Slice 5 (TUI) is a 6-PR chained stack replacing the `mibu@636a36a` dependency with an in-tree `src/terminal/` module (per ADR 0001 §"Alternatives Considered" #2 + ADR 0003); see [Slice status — TUI](#slice-status--tui) below.
 
 ## Requirements
 
 - **Zig 0.16.0** — exact toolchain pinned (post-0.16 `std.posix.*` wrappers stripped; we use `std.os.linux.*` raw syscalls).
 - **Linux 5.13+** — Landlock ABI v1 is the floor. Tested on Arch Linux (kernel 6.x).
-- **One approved third-party dep: mibu** (see [Dependencies](#dependencies) below). Everything else links statically.
+- **Zero third-party deps.** Everything links statically from Zig stdlib + in-tree modules. The `mibu@636a36a` TUI dependency was replaced by the in-tree `src/terminal/` module (per ADR 0003, closes ADR 0001 §"Alternatives Considered" #2).
 
 ## Dependencies
 
-zargeant has one approved third-party dep, and the rest of the stack is in-tree. The full dep audit is in [CONTRIBUTING.md](CONTRIBUTING.md#tui-dependency-mibu); the short version:
+zargeant has zero third-party deps — the entire stack is in-tree or Zig stdlib. The full dep audit is in [CONTRIBUTING.md](CONTRIBUTING.md); the short version:
 
-| Component             | Source                                        | License | Pin                                      |
-| --------------------- | --------------------------------------------- | ------- | ---------------------------------------- |
-| **TUI render**        | [mibu](https://github.com/xyaman/mibu)        | MIT     | commit `636a36a353614da2a537b060c33f17d608915eab` |
+| Component             | Source                                        | License | Pin  |
+| --------------------- | --------------------------------------------- | ------- | ---- |
+| **TUI render**        | `src/terminal/` (in-tree, clean-room)         | Unlicense (project) | — |
 | **HTTP**              | `src/api_client.zig` + `src/api_sse.zig` (internal) | — | — |
-| **Crypto / TLS**      | `src/tls_conn.zig` (handrolled)               | —       | —                                        |
-| **Sandbox**           | `src/sandbox_linux.zig` (Landlock LSM + Seccomp-BPF) | — | —                                    |
-| **Mock HTTP server**  | `src/mock_server.zig` (internal)              | —       | —                                        |
-| **Logger**            | `src/logger.zig` → `/tmp/ai-harness-debug.log` (mode `0600`) | — | —                |
+| **Crypto / TLS**      | `src/tls_conn.zig` (handrolled)               | —       | —    |
+| **Sandbox**           | `src/sandbox_linux.zig` (Landlock LSM + Seccomp-BPF) | — | — |
+| **Mock HTTP server**  | `src/mock_server.zig` (internal)              | —       | —    |
+| **Logger**            | `src/logger.zig` → `/tmp/ai-harness-debug.log` (mode `0600`) | — | — |
 
-The mibu pin is enforced by `tests/tui/mibu_pin.zig` (REQ-TUI-020). CI fails loud if the hash drifts. The decision to use mibu over libvaxis is recorded in [ADR 0001](docs/decisions/0001-libvaxis-to-mibu.md).
+The previous `mibu@636a36a` TUI dependency (per [ADR 0001](docs/decisions/0001-libvaxis-to-mibu.md)) has been replaced by the in-tree `src/terminal/` module implemented in [ADR 0003](docs/decisions/0003-clean-room-impl.md). No third-party TUI dep remains; the project owns the entire TUI surface.
 
 To add a new third-party dep, write a new ADR under `docs/decisions/` first; see [CONTRIBUTING.md](CONTRIBUTING.md#no-new-third-party-deps-without-an-adr).
 
 ## Slice status — TUI
 
-The TUI slice ships as a 5-PR chained stack on top of the `feat/tui` tracker. Each R-PR is its own PR against the previous one (feature-branch-chain topology); once all 5 land on `feat/tui`, a final PR aggregates `feat/tui` → `main`.
+The TUI slice ships as a 6-PR chained stack on top of the `feat-tclib-tracker` branch (feature-branch-chain topology per `sdd/terminal-control-lib-from-scratch/tasks`). Each PR is its own PR against the previous PR branch; once all 6 land on `feat-tclib-tracker`, a final PR aggregates `feat-tclib-tracker` → `main`.
 
-| R-PR     | Theme                                              | Status          | PR                                                       | LoC    |
-| -------- | -------------------------------------------------- | --------------- | -------------------------------------------------------- | ------ |
-| R-PR 1   | channels + 3-thread runtime + plumbing             | ✓ shipped       | [#3](https://github.com/Kat404/Zargeant/pull/3)           | ~851   |
-| R-PR 2   | `main.zig` CLI + cold-start + `password_input` stub | ✓ shipped       | [#4](https://github.com/Kat404/Zargeant/pull/4)           | ~377   |
-| R-PR 3   | modals + real `password_input` + `WindowMock`      | ✓ shipped       | [#5](https://github.com/Kat404/Zargeant/pull/5)           | ~700   |
-| R-PR 4   | mibu lifecycle + render + integration              | ✓ shipped       | [#6](https://github.com/Kat404/Zargeant/pull/6)           | ~787   |
-| R-PR 5   | docs (ADR 0001 + `CONTRIBUTING.md` + this README)  | 🚧 this PR      | (opening)                                                | ~200   |
+| PR       | Theme                                                                             | Status                       | PR                                                                       | LoC    |
+| -------- | --------------------------------------------------------------------------------- | ---------------------------- | ------------------------------------------------------------------------ | ------ |
+| PR 1     | Foundation + termios (ADR 0002 + `mod.zig` + `term.zig` + MockBackend + 6 tests)  | ✅ OPEN, MERGEABLE           | [#31](https://github.com/Kat404/Zargeant/pull/31)                         | +694   |
+| PR 2     | Emit layer (cursor + style + dpm + kitty)                                        | ✅ OPEN, MERGEABLE           | [#32](https://github.com/Kat404/Zargeant/pull/32)                         | +935   |
+| PR 3     | Event parser part 1 (UTF-8 + base + in-band resize unconditional + EINTR-pending) | ✅ OPEN, MERGEABLE           | [#33](https://github.com/Kat404/Zargeant/pull/33)                         | +1,336 |
+| PR 4     | Event parser part 2 (kitty kb parser: CSI u + press/repeat/release + mods)        | ✅ OPEN, MERGEABLE           | [#34](https://github.com/Kat404/Zargeant/pull/34)                         | +358   |
+| PR 5     | Probe response lexer (DECRPM reply + `Mode.supported()` + 4 failure modes per C14) | ✅ OPEN, MERGEABLE           | [#35](https://github.com/Kat404/Zargeant/pull/35)                         | +608   |
+| PR 6     | Atomic swap + drop mibu (atomic `mibu → terminal` rename + ADR 0003)              | ✅ OPEN, MERGEABLE (FINAL)   | [#36](https://github.com/Kat404/Zargeant/pull/36)                         | +110   |
 
-**What's next:** R-PR 5 (this PR) lands; the user merges the tui-recovery chain into `feat/tui`; the cycle is then ready for `sdd-verify` + `sdd-archive` (final integration PR `feat/tui` → `main`).
+**What's next:** User merges PRs #31 → #32 → #33 → #34 → #35 → #36 in order to `feat-tclib-tracker`, then merges `feat-tclib-tracker` → `main`. The change is `sdd-verify PASS` + `sdd-archive OK` (cycle closed; see engram obs#1521 + obs#1522).
 
-The full task breakdown (32 tasks across 5 R-PRs) lives in `sdd/tui-recovery/tasks` (engram). The TUI design is in `sdd/tui-recovery/design` and the spec in `sdd/tui-recovery/spec`. The libvaxis → mibu decision is in [ADR 0001](docs/decisions/0001-libvaxis-to-mibu.md).
+The full task breakdown (20 WUs across 6 PRs) lives in `sdd/terminal-control-lib-from-scratch/tasks` (obs#1514). The TUI design is in `sdd/terminal-control-lib-from-scratch/design` (obs#1512) and the spec in `sdd/terminal-control-lib-from-scratch/spec` (obs#1510). The libvaxis → mibu → in-tree decision chain: [ADR 0001](docs/decisions/0001-libvaxis-to-mibu.md) → [ADR 0002](docs/decisions/0002-clean-room.md) → [ADR 0003](docs/decisions/0003-clean-room-impl.md).
+
+### Clean-room constraints (CONTRIBUTING.md:41 + ADR 0003 §Negative)
+
+The in-tree `src/terminal/` module was implemented strictly against public specs:
+- POSIX `termios(3)` — raw-mode lifecycle, `tcgetattr`/`tcsetattr`/`TIOCGWINSZ` ioctl
+- ECMA-48 §CSI/§SGR — cursor positioning, SGR attributes
+- xterm ctlseqs — DEC private modes 1049/2026/2048, DECRQM/DECRPM probes, in-band resize
+- kitty keyboard protocol — push/pop + CSI `u` parsing with press/repeat/release + modifier carry
+
+No `mibu` or `libvaxis` source code was consulted at any point during the implementation. The `src/tui.zig` byte stream is preserved byte-for-byte (verified by `tests/tui/cancel_path.zig` CAP-09 + `tests/tui/runtime_thread.zig` integration tests).
 
 ## Build
 
@@ -125,7 +136,7 @@ zig build test --summary all -Doptimize=ReleaseSafe
 zig build test --summary all -Doptimize=ReleaseFast
 ```
 
-Expected output: `41/41 tests passed` on each mode.
+Expected output: `500/500 tests passed` on each mode (386 main + 114 in-tree terminal via `test-terminal` step).
 
 ## Debugging
 
@@ -227,7 +238,7 @@ Long-form documentation lives in `docs/`:
 
 ## Road to v1.0
 
-1. **TUI merge** — merge the tui-recovery chained PR stack into `feat/tui`; open final `feat/tui` → `main` PR to close slice 5.
+1. **TUI merge** — merge the 6-PR terminal-control-lib-from-scratch chain into `feat-tclib-tracker` (PRs #31 → #32 → #33 → #34 → #35 → #36 in order); merge `feat-tclib-tracker` → `main` to close slice 5.
 2. **Cross-platform** — macOS (amd64 + arm64) port for logger + sandbox. Linux arm64.
 3. **Release automation** — GitHub Actions release pipeline; signed binaries.
 
@@ -255,7 +266,7 @@ Each slice is its own SDD cycle, persisted in Engram. Strict TDD is enforced: te
 ## Acknowledgments
 
 - Built on [Zig](https://ziglang.org) — Andrew Kelley and the Zig core team.
-- TUI render surface: [mibu](https://github.com/xyaman/mibu) by xyaman (MIT) — see [ADR 0001](docs/decisions/0001-libvaxis-to-mibu.md) for the libvaxis → mibu decision.
+- TUI render surface: in-tree `src/terminal/` module (clean-room, ~3,500 LoC across 6 chained PRs). The previous `mibu` dependency was replaced per ADR 0003, fulfilling the contingency in ADR 0001 §"Negative".
 - Inspired by [ratatui](https://github.com/ratatui/ratatui) for the Rust TUI ecosystem.
 - Powered by [MiniMax](https://MiniMax.chat) for the inference API.
 

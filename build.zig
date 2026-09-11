@@ -153,78 +153,6 @@ pub fn build(b: *std.Build) void {
     // mibu is kept for WU 6.5 removal.
     lib_mod.addImport("terminal", terminal_mod);
 
-    // terminal-control-lib-from-scratch (PR 1, task obs#1514 §3 WU 1.3).
-    // In-tree src/terminal/ module replacing mibu over 6 chained PRs. PR 1
-    // exposes only the `term` slice; PRs 2-5 extend mod.zig with cursor,
-    // style, dpm, kitty, event. Mirrors the mibu_dep + mibu_mod pattern
-    // above but without an external dependency (the module is in-tree).
-    // The exe_mod import is wired now for symmetry with mibu but unused
-    // until PR 6 atomically re-points src/tui.zig from mibu.* to terminal.*
-    // (per obs#1506 N11-N13 / C17 / obs#1514 §4 chain strategy).
-    //
-    // term_mod is the standalone slice root (src/terminal/term.zig).
-    // terminal_mod (mod.zig) imports it via `addImport("term", term_mod)`.
-    // tests/terminal/root.zig imports both via the test module's imports.
-    const term_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("src/terminal/term.zig"),
-    });
-    // PR 2 (terminal-control-lib-from-scratch) — each new src/terminal/<slice>.zig
-    // is the root of its own module. terminal_mod re-exports each as it lands;
-    // terminal_test_mod imports each so tests/terminal/<slice>.zig can resolve
-    // `@import("slice")` against the corresponding build dep.
-    const cursor_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("src/terminal/cursor.zig"),
-    });
-    const style_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("src/terminal/style.zig"),
-    });
-    const dpm_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("src/terminal/dpm.zig"),
-    });
-    const kitty_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("src/terminal/kitty.zig"),
-    });
-    // PR 3 (terminal-control-lib-from-scratch WU 3.1) — event.zig is its own
-    // module root. Owned by event_mod; terminal_mod re-exports event types in
-    // PR 3 land 3 (WU 3.3); terminal_test_mod imports event so tests/terminal/
-    // event_types.zig can resolve `@import("event")` against the build dep.
-    const event_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("src/terminal/event.zig"),
-    });
-    // term_mod needs `dpm` as a build dep so src/terminal/term.zig can do
-    // `@import("dpm")` to re-export the 6 DPM functions (design C31 fix).
-    // Without this, term_mod's `@import("dpm.zig")` collides with the
-    // sibling-module-root ownership rule (Zig 0.16).
-    term_mod.addImport("dpm", dpm_mod);
-    const terminal_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("src/terminal/mod.zig"),
-    });
-    terminal_mod.addImport("term", term_mod);
-    terminal_mod.addImport("cursor", cursor_mod);
-    terminal_mod.addImport("style", style_mod);
-    terminal_mod.addImport("dpm", dpm_mod);
-    terminal_mod.addImport("kitty", kitty_mod);
-    // PR 3 (terminal-control-lib-from-scratch WU 3.3) — terminal_mod
-    // re-exports event types so src/tui.zig (in PR 6) can do
-    // `terminal.event.nextWithTimeout(...)` and the test file can verify
-    // `terminal.event.pollReadable` exists on the namespace.
-    terminal_mod.addImport("event", event_mod);
-    exe_mod.addImport("terminal", terminal_mod);
-
     // test step
     const test_mod = b.createModule(.{
         .target = target,
@@ -274,33 +202,6 @@ pub fn build(b: *std.Build) void {
     // `test-tui-mibu-pin` step name is intentionally retained as a
     // deliberate broken step (asserted by apply-progress verification:
     // `zig build test-tui-mibu-pin` MUST error as "step does not exist").
-
-    // test step: tests/terminal/root.zig (PR 1, task obs#1514 §3 WU 1.3).
-    // Single-entrypoint test runner for the in-tree src/terminal/ module.
-    // Closes the phantom-test CI trap (obs#1508 C8 / obs#1510 REQ-TCL-012):
-    // `zig build test-terminal --summary all` proves the terminal test
-    // count is non-zero, so PRs 1-5 cannot silently compile-zero tests.
-    // Per-PR test slices append `_ = @import("<slice>.zig");` to root.zig
-    // in the same commit that creates src/terminal/<slice>.zig.
-    const terminal_test_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("tests/terminal/root.zig"),
-        .imports = &.{
-            .{ .name = "terminal", .module = terminal_mod },
-            .{ .name = "term", .module = term_mod },
-            .{ .name = "cursor", .module = cursor_mod },
-            .{ .name = "style", .module = style_mod },
-            .{ .name = "dpm", .module = dpm_mod },
-            .{ .name = "kitty", .module = kitty_mod },
-            .{ .name = "event", .module = event_mod },
-        },
-    });
-    const terminal_test_step = b.addTest(.{ .root_module = terminal_test_mod });
-    const run_terminal_test = b.addRunArtifact(terminal_test_step);
-    const terminal_test_decl = b.step("test-terminal", "Run src/terminal/ + tests/terminal/ in isolation");
-    terminal_test_decl.dependOn(&run_terminal_test.step);
-    test_decl.dependOn(&run_terminal_test.step);
 
     // test step: tests/terminal/root.zig (PR 1, task obs#1514 §3 WU 1.3).
     // Single-entrypoint test runner for the in-tree src/terminal/ module.
