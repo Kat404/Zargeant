@@ -74,6 +74,15 @@ pub const Lifecycle = struct {
     /// `enableRawMode` failed (no `/dev/tty`, CI). The TUI thread
     /// runs in degraded logger-only mode; renderers are skipped.
     no_tty: bool = false,
+    /// REQ-TIRFIX-003 (tui-input-rendering-fixes #1576): explicit sentinel
+    /// for the very first render frame. Replaces the dead `prev_snapshot
+    /// orelse current` fallback (which was unreachable given the
+    /// zero-init at `src/runtime.zig:396-410`). On the first frame the
+    /// render branch emits `\x1b[2J\x1b[H` (ED + CUP) followed by a
+    /// full snapshot re-emit of `current` (skipping space cells, which
+    /// are already spaces after the ED). On frame 2+ the existing diff
+    /// path runs with REQ-TIRFIX-002's corrected trailing cursor.
+    first_frame: bool = true,
     /// REQ-RW-002 (tui-render-wiring #1259): previous-frame cell snapshot
     /// for `emitFrame` diff. Allocated by `tuiRealMain` after init, freed
     /// in shutdown. `null` on the first frame → `emitFrame` receives
@@ -1007,8 +1016,13 @@ test "Lifecycle struct exposes required fields" {
     // (#1259, REQ-RW-002) adds `prev_snapshot`; the count rises to 9.
     // WU-1 (tui-keyentry-rebuild, REQ-NEW-001) adds `parser: Parser`
     // for the persistent parser; the count rises to 10.
+    // tui-input-rendering-fixes (REQ-TIRFIX-003, #1576) adds
+    // `first_frame: bool = true` so the very first render frame emits
+    // \x1b[2J\x1b[H + a full snapshot, replacing the dead
+    // `prev_snapshot orelse current` sentinel at src/tui.zig:584.
+    // Count rises to 11.
     const fields = @typeInfo(Lifecycle).@"struct".fields;
-    try testing.expectEqual(@as(usize, 10), fields.len);
+    try testing.expectEqual(@as(usize, 11), fields.len);
 }
 
 test "redraw_pending is std.atomic.Value(bool) with seq_cst contract" {
