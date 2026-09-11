@@ -14,7 +14,7 @@
 const std = @import("std");
 const testing = std.testing;
 const builtin = @import("builtin");
-const mibu = @import("mibu");
+const terminal = @import("terminal");
 
 // =============================================================================
 // Linux-only comptime guard.
@@ -100,7 +100,7 @@ const Tui = struct {
 /// submit replies are routed via channels.submit_reply). The driver
 /// helper threads the per-test channels ref so each test can verify the
 /// reply path locally.
-fn feedKey(state: *M.State, lc: *Tui.Lifecycle, k: mibu.events.Key, channels: *Ch.Channels) !void {
+fn feedKey(state: *M.State, lc: *Tui.Lifecycle, k: terminal.event.Key, channels: *Ch.Channels) !void {
     var ch: Ch.Channels = Ch.Channels.init();
     defer ch.closeAll(testing.io);
     const consumed = try Tui.handleKeyInput(testing.io, testing.allocator, state, k, null, channels);
@@ -1624,8 +1624,12 @@ test "T-SG-8: WindowMock + 5 draw fns unchanged" {
 }
 
 // T-SG-9 fold-in: REQ-RW-009 (S-RW-012) — no new third-party imports in
-// src/tui.zig or src/runtime.zig. Allowed: std, mibu, builtin,
+// src/tui.zig or src/runtime.zig. Allowed: std, terminal, builtin,
 // @import("channels.zig"), @import("modal.zig").
+//
+// PR 6 (terminal-control-lib-from-scratch, WU 6.3): mibu dropped from
+// the allowed list; @import("terminal") added. The src/tui.zig import
+// is the in-tree terminal module (ADR 0003).
 test "T-SG-9: no new third-party imports in src/tui.zig or src/runtime.zig" {
     const targets = [_][]const u8{
         "src/tui.zig",
@@ -1633,7 +1637,7 @@ test "T-SG-9: no new third-party imports in src/tui.zig or src/runtime.zig" {
     };
     const allowed = [_][]const u8{
         "@import(\"std\")",
-        "@import(\"mibu\")",
+        "@import(\"terminal\")",
         "@import(\"builtin\")",
         "@import(\"channels.zig\")",
         "@import(\"modal.zig\")",
@@ -2200,20 +2204,26 @@ test "T-SG-11: tui-input-wiring slice is present" {
     // Sub-assertion 1: handleKeyInput signature in src/tui.zig.
     try testing.expect(std.mem.indexOf(u8, tui_src, "pub fn handleKeyInput(") != null);
 
-    // Sub-assertion 2: emitFrame body has mibu.cursor.goTo AFTER the
-    // trailing mibu.style.reset. Locate the trailing reset (the second
+    // Sub-assertion 2: emitFrame body has terminal.cursor.goTo AFTER the
+    // trailing terminal.style.reset. Locate the trailing reset (the second
     // occurrence inside emitFrame) and assert a goTo call exists after it.
-    const reset_idx = std.mem.indexOf(u8, tui_src, "mibu.style.reset(writer);") orelse {
+    //
+    // PR 6 (terminal-control-lib-from-scratch, WU 6.3): retargeted the
+    // literal greps from mibu.* to terminal.* to match the namespace swap.
+    // The in-tree `reset` takes 2 args (`(writer, _: bool)` per style.zig
+    // doc — the bool is ignored for API uniformity with bold/underline/reverse);
+    // the grep literal reflects that 2-arg form.
+    const reset_idx = std.mem.indexOf(u8, tui_src, "terminal.style.reset(writer, false);") orelse {
         try testing.expect(false);
         return;
     };
-    // The trailing reset is the LAST `mibu.style.reset(writer);` inside
-    // emitFrame (the one after the for loop). Walk forward from the
+    // The trailing reset is the LAST `terminal.style.reset(writer, false);`
+    // inside emitFrame (the one after the for loop). Walk forward from the
     // first occurrence to find the second one.
-    const second_reset_idx = std.mem.indexOfPos(u8, tui_src, reset_idx + 1, "mibu.style.reset(writer);") orelse reset_idx;
+    const second_reset_idx = std.mem.indexOfPos(u8, tui_src, reset_idx + 1, "terminal.style.reset(writer, false);") orelse reset_idx;
     const trailing_reset_idx = second_reset_idx;
     const after_reset = tui_src[trailing_reset_idx..];
-    try testing.expect(std.mem.indexOf(u8, after_reset, "mibu.cursor.goTo") != null);
+    try testing.expect(std.mem.indexOf(u8, after_reset, "terminal.cursor.goTo") != null);
 
     // Sub-assertion 3: .key arm has handleKeyInput BEFORE channels.tui_to_agent.tryPut.
     const arm_start = std.mem.indexOf(u8, tui_src, ".key =>") orelse {

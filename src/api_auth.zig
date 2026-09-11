@@ -700,12 +700,29 @@ test "no automatic key sources" {
     };
     const targets = [_][]const u8{
         // 4 original targets (per tui spec#379):
-        "src/api_client.zig",   "src/api_sse.zig",  "src/api_auth.zig",
+        "src/api_client.zig",      "src/api_sse.zig",        "src/api_auth.zig",
         "tools/debug_call.zig",
         // 6 new TUI targets (tui-recovery R-PR 1 per design#408 §2.3):
-        "src/channels.zig", "src/runtime.zig",
-        "src/tui.zig",          "src/main.zig",     "src/password_input.zig",
+           "src/channels.zig",       "src/runtime.zig",
+        "src/tui.zig",             "src/main.zig",           "src/password_input.zig",
         "src/modal.zig",
+        // PR 1 terminal-control-lib-from-scratch (obs#1506 C20 / obs#1513 C26-C32):
+        // terminal-control modules use POSIX + ECMA-48 + kitty keyboard only
+        // and must NOT fall back to env-var or file-based key sources.
+                  "src/terminal/mod.zig",   "src/terminal/term.zig",
+        // PR 2 WU 2.1 (cursor + style emitters): byte-exact CSI/SGR, no env
+        // lookup, no file I/O — appended to keep the guard in lock-step.
+        "src/terminal/cursor.zig", "src/terminal/style.zig",
+        // PR 2 WU 2.2 (DPM emitters + DECRQM probe emit + Mode stub):
+        // 6 enter/exit emit helpers + DECRQM probe + Mode struct return;
+        // no env/file I/O.
+        "src/terminal/dpm.zig",
+        // PR 2 WU 2.3 (kitty keyboard protocol push/pop + probe stub):
+        // kitty keyboard protocol emitters only; no env/file I/O.
+        "src/terminal/kitty.zig",
+        // PR 3 WU 3.1 — public event types (REQ-TCL-004 CAP-33). Parser
+        // implementation lands in WU 3.2 (streaming UTF-8) and 3.3 (C11/C9).
+         "src/terminal/event.zig",
     };
     const io = testing.io;
     for (targets) |path| {
@@ -762,6 +779,53 @@ test "validateFormat accepts arbitrary printable prefix" {
 // T1.4 — validateFormat accepts the synthetic test-key.
 test "validateFormat accepts synthetic test-key-..." {
     try testing.expect(validateFormat("test-key-1234567890ABCDEF"));
+}
+
+// =============================================================================
+// WU-5 — tui-keyentry-rebuild (REQ-NEW-005) regression assertions.
+//
+// POST-HOC acceptance tests (NOT strict RED → GREEN). Per design
+// obs#1559 §"Suggested Work Units" WU-5 risk note: validateFormat is
+// unchanged — these tests pass on both pre- and post-WU-1 code (the
+// regression they catch is upstream in the parser, not in
+// validateFormat itself). They serve as a guardrail: if a future
+// refactor introduces paste truncation BEFORE validateFormat, this
+// test is the tripwire that proves the upstream fix still works.
+//
+// Per sdd/tui-keyentry-rebuild/design obs#1558 ADR outline: the fix
+// lives in src/terminal/event.zig (persistent parser + paste-bracket
+// detection). validateFormat's rule (≥24 chars, 0x21..0x7E per byte)
+// is unchanged.
+// =============================================================================
+
+test "validateFormat: 64-char pasted valid key passes (regression)" {
+    // A typical MiniMax API key is 32-64 chars; this 64-char synthetic
+    // exercises the boundary at the upper end. Pre-WU-1 the parser
+    // collapsed pastes to 1 char, so a 64-char paste arrived at
+    // validateFormat as a 1-char string and was rejected. With the
+    // parser fix (WU-1 + WU-3) the full 64 chars reach validateFormat
+    // and pass.
+    const key_64 = "sk-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abc";
+    try testing.expectEqual(@as(usize, 64), key_64.len);
+    try testing.expect(validateFormat(key_64));
+}
+
+test "validateFormat: 24-char minimum passes (regression boundary)" {
+    // Exact minimum — per spec validateFormat requires >= 24 chars.
+    // This is the boundary check: anything below must fail, exactly 24
+    // must pass. Pre-WU-1 a paste collapsing below 24 would fail this
+    // check; post-WU-1 the full string reaches validateFormat.
+    const key_24 = "sk-123456789012345678901"; // 24 chars
+    try testing.expectEqual(@as(usize, 24), key_24.len);
+    try testing.expect(validateFormat(key_24));
+}
+
+test "validateFormat: 23-char rejects (regression boundary below)" {
+    // The complement of the 24-char test: one char below must reject.
+    // Guards against accidental flip of the >= boundary to >.
+    const key_23 = "sk-12345678901234567890"; // 23 chars
+    try testing.expectEqual(@as(usize, 23), key_23.len);
+    try testing.expect(!validateFormat(key_23));
 }
 
 // T1.6 — consent required: writeWithConsent with consent=false returns

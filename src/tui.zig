@@ -1,10 +1,10 @@
-// src/tui.zig -- TUI thread body + mibu lifecycle.
+// src/tui.zig -- TUI thread body + terminal lifecycle.
 //
 // Spec:   sdd/tui-recovery/spec  (id=407) REQ-TUI-002, REQ-TUI-003,
 //         REQ-TUI-019, REQ-TUI-021, REQ-TUI-022
 // Design: sdd/tui-recovery/design (id=408) §2.3 (R-PR 4), §2.4
 //
-// R-PR 4 ships the real mibu render lifecycle:
+// R-PR 4 ships the real terminal render lifecycle:
 //   - tuiThreadInit: enableRawMode + enterAlternateScreen +
 //     enableInBandResize + DEC 2048 probe (REQ-TUI-019) +
 //     queryKittyKeyboard / pushKittyKeyboard (REQ-TUI-022).
@@ -13,7 +13,7 @@
 //   - tuiThreadShutdown: popKittyKeyboard + exitAlternateScreen +
 //     disableRawMode. RawTerm token owns the original termios.
 //
-// mibu primitive calls live in testable helpers (enterAltScreenAndResize,
+// terminal primitive calls live in testable helpers (enterAltScreenAndResize,
 // queryDec2048Supported, queryKittyKbSupported, pushKittyKb, popKittyKb,
 // beginSyncUpdate, endSyncUpdate) so the headless tests can drive each
 // step against a buffered Writer without needing a real TTY. The full
@@ -23,6 +23,14 @@
 // No-thread-spawn invariant: tui.zig does NOT spawn threads.
 // The runtime orchestrator in runtime.zig is the only spawn site —
 // enforced by the static-grep test in runtime.zig.
+//
+// PR 6 (terminal-control-lib-from-scratch, WU 6.3): namespace swap
+// from `mibu.*` to `terminal.*` (in-tree src/terminal/ module).
+// Two non-1:1 call-site adjustments: C22 (4-arg nextWithTimeout with
+// &lifecycle.redraw_pending) + C27 (2-arg enableRawMode with
+// terminal.term.PosixBackend.backend()). Behavior is byte-for-byte
+// preserved; tests/tui/runtime_thread.zig integration tests + CAP-09
+// literal grep prove byte stability.
 //
 // Linux/x86_64 Zig 0.16 only.
 
@@ -37,7 +45,7 @@ comptime {
         @compileError("tui: linux-only v1 -- see sdd/tui/proposal id=373 constraint #5");
 }
 
-const mibu = @import("mibu");
+const terminal = @import("terminal");
 
 // =============================================================================
 // Lifecycle state (REQ-TUI-002 + REQ-TUI-019 + REQ-TUI-022)
@@ -49,7 +57,7 @@ const mibu = @import("mibu");
 pub const Lifecycle = struct {
     /// RawTerm token owns the original termios; calling disableRawMode
     /// on shutdown restores cooked mode.
-    raw_term: ?mibu.term.RawTerm,
+    raw_term: ?terminal.term.RawTerm,
     /// Whether the terminal reported DEC 2048 support. When false, the
     /// SIGWINCH fallback path is the sole resize source.
     dec_2048_supported: bool,
@@ -71,6 +79,14 @@ pub const Lifecycle = struct {
     /// in shutdown. `null` on the first frame → `emitFrame` receives
     /// `current` as both `prev` and `current` arg (full-frame emit).
     prev_snapshot: ?[]@import("modal.zig").Cell = null,
+    /// WU-1 (tui-keyentry-rebuild, REQ-NEW-001): the persistent Parser
+    /// for the TUI thread. Lives on Lifecycle so the ring buffer
+    /// survives across `nextWithTimeout` calls. Wired via
+    /// `terminal.event.setCurrentParser(&lc.parser)` in `tuiThreadInit`
+    /// after `enableRawMode` succeeds; cleared in `tuiThreadShutdown`
+    /// after raw-mode teardown. The 4 KiB ring buffer is part of the
+    /// stack-allocated Lifecycle (not heap-allocated; see design D1).
+    parser: terminal.event.Parser = .{ .ring_buf = undefined, .ring_len = 0, .paste_active = false },
 };
 
 // =============================================================================
@@ -84,15 +100,30 @@ pub const Lifecycle = struct {
 /// Enter alternate screen + enable DEC 2048 in-band resize reports.
 /// Writes CSI ?1049h + CSI ?2048h to `writer` (REQ-TUI-002).
 pub fn enterAltScreenAndResize(writer: *std.Io.Writer) !void {
-    try mibu.term.enterAlternateScreen(writer);
-    try mibu.term.enableInBandResize(writer);
+    try terminal.term.enterAlternateScreen(writer);
+    try terminal.term.enableInBandResize(writer);
 }
 
 /// Exit alternate screen + disable in-band resize reports.
 /// Writes CSI ?1049l + CSI ?2048l to `writer`.
 pub fn exitAltScreenAndResize(writer: *std.Io.Writer) !void {
-    try mibu.term.exitAlternateScreen(writer);
-    try mibu.term.disableInBandResize(writer);
+    try terminal.term.exitAlternateScreen(writer);
+    try terminal.term.disableInBandResize(writer);
+}
+
+/// WU-2 (tui-keyentry-rebuild, REQ-NEW-002): enable DEC 2004 bracketed
+/// paste mode. Writes CSI ?2004h. Pairs with `disableBracketedPaste`.
+/// The terminal emulator then wraps pasted content in ESC[200~...ESC[201~
+/// so the parser can deliver the full payload via per-char .key events
+/// (see WU-3 paste-bracket detection).
+pub fn enableBracketedPaste(writer: *std.Io.Writer) !void {
+    try terminal.term.enableBracketedPaste(writer);
+}
+
+/// WU-2 (tui-keyentry-rebuild, REQ-NEW-002): disable DEC 2004. Writes
+/// CSI ?2004l. Pairs with `enableBracketedPaste` on the shutdown path.
+pub fn disableBracketedPaste(writer: *std.Io.Writer) !void {
+    try terminal.term.disableBracketedPaste(writer);
 }
 
 /// Probe DEC 2048 support via DECRQM. Returns true when the terminal
@@ -105,7 +136,7 @@ pub fn queryDec2048Supported(
     writer: *std.Io.Writer,
 ) bool {
     const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
-    const mode = mibu.events.queryModeWithTimeout(io, file, writer, 2048, 50) catch return false;
+    const mode = terminal.dpm.queryModeWithTimeout(io, file, writer, 2048, 50) catch return false;
 
     return mode.supported();
 }
@@ -118,20 +149,20 @@ pub fn queryKittyKbSupported(
     writer: *std.Io.Writer,
 ) bool {
     const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
-    return mibu.events.supportsKittyKeyboardWithTimeout(io, file, writer, 50) catch false;
+    return terminal.kitty.supportsKittyKeyboardWithTimeout(io, file, writer, 50) catch false;
 }
 
 /// Push kitty keyboard flags. Always uses disambiguate + report_events
-/// (mibu bits = 3 = 1|2 = 0b011; kitty kb protocol flags 1+2).
+/// (terminal kitty kb protocol flags 1+2 = 0b011).
 /// Caller must verify kitty support before calling; pop only on success.
 pub fn pushKittyKb(writer: *std.Io.Writer) !void {
-    const flags: mibu.term.KittyFlags = .{ .disambiguate = true, .report_events = true };
-    try mibu.term.pushKittyKeyboard(writer, flags);
+    const flags: terminal.kitty.KittyFlags = .{ .disambiguate = true, .report_events = true };
+    try terminal.kitty.pushKittyKeyboard(writer, flags);
 }
 
 /// Pop kitty keyboard flag. No-op if push never happened.
 pub fn popKittyKb(writer: *std.Io.Writer) !void {
-    try mibu.term.popKittyKeyboard(writer);
+    try terminal.kitty.popKittyKeyboard(writer);
 }
 
 // =============================================================================
@@ -184,12 +215,12 @@ pub fn resetSigwinch() void {
 /// Begin a synchronized update (DEC 2026). Brackets each render pass
 /// (REQ-TUI-021).
 pub fn beginSyncUpdate(writer: *std.Io.Writer) !void {
-    try mibu.term.beginSynchronizedUpdate(writer);
+    try terminal.term.beginSynchronizedUpdate(writer);
 }
 
 /// End a synchronized update. Flushes the buffered frame to the screen.
 pub fn endSyncUpdate(writer: *std.Io.Writer) !void {
-    try mibu.term.endSynchronizedUpdate(writer);
+    try terminal.term.endSynchronizedUpdate(writer);
 }
 
 /// Emit `frame_count` synchronized update brackets (REQ-TUI-021). Each
@@ -242,11 +273,21 @@ pub fn tuiThreadInit(
     // we fall back to logger-only mode and signal degraded mode on the
     // Lifecycle via `no_tty = true`. The caller is expected to skip
     // render and bracket emission in that case.
-    if (mibu.term.enableRawMode(handle)) |rt| {
+    //
+    // PR 6 (terminal-control-lib-from-scratch, WU 6.3, C27): the in-tree
+    // `terminal.term.enableRawMode` takes 2 args (no Zig overloading);
+    // production callers pass `PosixBackend.backend()` — a fully-populated
+    // `Backend` value with real tcgetattr/tcsetattr/ioctl_gwinsz fn ptrs.
+    if (terminal.term.enableRawMode(handle, terminal.term.PosixBackend.backend())) |rt| {
         lc.raw_term = rt;
     } else |_| {
         lc.no_tty = true;
     }
+
+    // WU-1 (REQ-NEW-001 + REQ-NEW-008): publish the persistent Parser
+    // to the thread-local so `nextWithTimeout` routes through it.
+    // Production-only wire; tests inject via the same setter.
+    terminal.event.setCurrentParser(&lc.parser);
 
     // 2. Install SIGWINCH fallback handler (REQ-TUI-019 scenario 2). The
     // handler sets redraw_pending via the global pointer installed here.
@@ -256,6 +297,15 @@ pub fn tuiThreadInit(
     // (no terminal to switch into).
     if (!lc.no_tty) {
         enterAltScreenAndResize(writer) catch {};
+    }
+
+    // 3.5 WU-2 (tui-keyentry-rebuild, REQ-NEW-002): enable DEC 2004
+    // bracketed paste AFTER alt-screen + in-band-resize and BEFORE
+    // kitty-kb push (per design R-DES-5 wire order). With DEC 2004
+    // active, the terminal wraps pasted content in ESC[200~...ESC[201~
+    // so the WU-3 parser can detect the boundaries.
+    if (!lc.no_tty) {
+        enableBracketedPaste(writer) catch {};
     }
 
     // 3. Probe DEC 2048 (REQ-TUI-019). Failure → false (legacy fallback).
@@ -292,6 +342,11 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
         popKittyKb(writer) catch {};
     }
 
+    // 1.5 WU-2 (tui-keyentry-rebuild, REQ-NEW-002): disable DEC 2004
+    // bracketed paste AFTER kitty-kb pop and BEFORE alt-screen exit
+    // (symmetric wire order with init — design R-DES-5).
+    disableBracketedPaste(writer) catch {};
+
     // 2. Exit alt screen + disable in-band resize.
     exitAltScreenAndResize(writer) catch {};
 
@@ -299,6 +354,12 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
     if (lc.raw_term) |*rt| {
         rt.disableRawMode() catch {};
     }
+
+    // WU-1 (REQ-NEW-008): clear the thread-local parser handle AFTER
+    // raw-mode teardown so no caller of `nextWithTimeout` reaches a
+    // dangling Parser pointer during shutdown. Symmetric with the
+    // setCurrentParser call in tuiThreadInit.
+    terminal.event.setCurrentParser(null);
 }
 
 // =============================================================================
@@ -341,18 +402,26 @@ pub fn emitFrame(
     for (diffs) |entry| {
         last_x = entry.x;
         last_y = entry.y;
-        try mibu.cursor.goTo(writer, entry.x + 1, entry.y + 1);
-        try mibu.style.reset(writer);
-        if (entry.cell.style.bold) try mibu.style.bold(writer, true);
-        if (entry.cell.style.underline) try mibu.style.underline(writer, true);
-        if (entry.cell.style.reverse) try mibu.style.reverse(writer, true);
+        // PR 6 (terminal-control-lib-from-scratch, WU 6.3): in-tree
+        // `terminal.cursor.goTo(x, y)` takes 0-indexed coords and adds
+        // +1 internally (emits `CSI <y+1>;<x+1>H`). mibu took 1-indexed
+        // coords at the call site (caller did +1); dropping the +1 here
+        // preserves the byte output `\x1b[<row+1>;<col+1>H`.
+        try terminal.cursor.goTo(writer, entry.x, entry.y);
+        // ponytail: in-tree reset takes an `_: bool` for API uniformity
+        // with bold/underline/reverse (the bool is ignored — SGR 0 always
+        // resets). Pass `false` since the per-entry reset is unconditional.
+        try terminal.style.reset(writer, false);
+        if (entry.cell.style.bold) try terminal.style.bold(writer, true);
+        if (entry.cell.style.underline) try terminal.style.underline(writer, true);
+        if (entry.cell.style.reverse) try terminal.style.reverse(writer, true);
         // ponytail: u21→u8 cast is v1 ASCII-only; non-ASCII stays for v2.
         try writer.writeByte(@intCast(entry.cell.ch));
     }
-    try mibu.style.reset(writer);
+    try terminal.style.reset(writer, false);
     // REQ-TIW-001 — trailing cursor position. Only fires when at least
     // one diff entry existed (otherwise no position to land on).
-    if (diffs.len > 0) try mibu.cursor.goTo(writer, last_x + 1, last_y + 1);
+    if (diffs.len > 0) try terminal.cursor.goTo(writer, last_x, last_y);
 }
 
 // =============================================================================
@@ -504,10 +573,10 @@ pub fn tuiThreadLoop(
         // 1. Render if pending (REQ-RW-004 sub-bullet 2-3) — runs before
         // Shutdown drain so a pending render always completes.
         if (lifecycle.redraw_pending.swap(false, .seq_cst)) {
-            try mibu.term.beginSynchronizedUpdate(writer);
+            try terminal.term.beginSynchronizedUpdate(writer);
             var win = try modal.WindowMock.init(alloc, lifecycle.width, lifecycle.height);
             defer win.deinit();
-            defer mibu.term.endSynchronizedUpdate(writer) catch {};
+            defer terminal.term.endSynchronizedUpdate(writer) catch {};
             try modal.drawModal(win, state);
             const current = win.snapshot();
             // First frame: lifecycle.prev_snapshot is null → use current
@@ -536,8 +605,16 @@ pub fn tuiThreadLoop(
         if (drainSubmitReply(io, state, channels)) {
             lifecycle.redraw_pending.store(true, .seq_cst);
         }
-        // 3. Poll mibu events. Resize → update dims + set redraw flag.
-        const event = mibu.events.nextWithTimeout(io, file, 16) catch continue;
+        // 3. Poll terminal events. Resize → update dims + set redraw flag.
+        //
+        // PR 6 (terminal-control-lib-from-scratch, WU 6.3, C22): the
+        // in-tree `terminal.event.nextWithTimeout` takes 4 args; the 4th
+        // is the caller's atomic flag (`&lifecycle.redraw_pending`). The
+        // parser reads it after `poll(2)` returns `error.Interrupted`
+        // (EINTR, typically from SIGWINCH) and returns `.resize` (void)
+        // if set, `.none` otherwise. `src/terminal/event.zig` does NOT
+        // declare its own module-level atomic; the caller owns the flag.
+        const event = terminal.event.nextWithTimeout(io, file, 16, &lifecycle.redraw_pending) catch continue;
         switch (event) {
             // REQ-TIW-010 — consume the key locally via handleKeyInput
             // BEFORE forwarding to Agent. Consumed keys drop the forward
@@ -576,7 +653,7 @@ pub fn tuiThreadLoop(
                 }
             },
             .resize => {
-                const sz = mibu.term.getSize(handle) catch continue;
+                const sz = terminal.term.getSize(handle) catch continue;
                 lifecycle.width = sz.width;
                 lifecycle.height = sz.height;
                 lifecycle.redraw_pending.store(true, .seq_cst);
@@ -614,7 +691,7 @@ pub fn handleKeyInput(
     io: std.Io,
     alloc: std.mem.Allocator,
     state: *@import("modal.zig").State,
-    k: mibu.events.Key,
+    k: terminal.event.Key,
     cancel_pipe: ?[2]i32,
     channels: *@import("channels.zig").Channels,
 ) !bool {
@@ -917,8 +994,10 @@ test "Lifecycle struct exposes required fields" {
     // Compile-time assertion via typeinfo. PR 2 adds the `no_tty` field
     // (REQ-TUI-047); the count rises from 7 to 8. tui-render-wiring
     // (#1259, REQ-RW-002) adds `prev_snapshot`; the count rises to 9.
+    // WU-1 (tui-keyentry-rebuild, REQ-NEW-001) adds `parser: Parser`
+    // for the persistent parser; the count rises to 10.
     const fields = @typeInfo(Lifecycle).@"struct".fields;
-    try testing.expectEqual(@as(usize, 9), fields.len);
+    try testing.expectEqual(@as(usize, 10), fields.len);
 }
 
 test "redraw_pending is std.atomic.Value(bool) with seq_cst contract" {
