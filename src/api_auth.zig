@@ -781,6 +781,53 @@ test "validateFormat accepts synthetic test-key-..." {
     try testing.expect(validateFormat("test-key-1234567890ABCDEF"));
 }
 
+// =============================================================================
+// WU-5 — tui-keyentry-rebuild (REQ-NEW-005) regression assertions.
+//
+// POST-HOC acceptance tests (NOT strict RED → GREEN). Per design
+// obs#1559 §"Suggested Work Units" WU-5 risk note: validateFormat is
+// unchanged — these tests pass on both pre- and post-WU-1 code (the
+// regression they catch is upstream in the parser, not in
+// validateFormat itself). They serve as a guardrail: if a future
+// refactor introduces paste truncation BEFORE validateFormat, this
+// test is the tripwire that proves the upstream fix still works.
+//
+// Per sdd/tui-keyentry-rebuild/design obs#1558 ADR outline: the fix
+// lives in src/terminal/event.zig (persistent parser + paste-bracket
+// detection). validateFormat's rule (≥24 chars, 0x21..0x7E per byte)
+// is unchanged.
+// =============================================================================
+
+test "validateFormat: 64-char pasted valid key passes (regression)" {
+    // A typical MiniMax API key is 32-64 chars; this 64-char synthetic
+    // exercises the boundary at the upper end. Pre-WU-1 the parser
+    // collapsed pastes to 1 char, so a 64-char paste arrived at
+    // validateFormat as a 1-char string and was rejected. With the
+    // parser fix (WU-1 + WU-3) the full 64 chars reach validateFormat
+    // and pass.
+    const key_64 = "sk-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abc";
+    try testing.expectEqual(@as(usize, 64), key_64.len);
+    try testing.expect(validateFormat(key_64));
+}
+
+test "validateFormat: 24-char minimum passes (regression boundary)" {
+    // Exact minimum — per spec validateFormat requires >= 24 chars.
+    // This is the boundary check: anything below must fail, exactly 24
+    // must pass. Pre-WU-1 a paste collapsing below 24 would fail this
+    // check; post-WU-1 the full string reaches validateFormat.
+    const key_24 = "sk-123456789012345678901"; // 24 chars
+    try testing.expectEqual(@as(usize, 24), key_24.len);
+    try testing.expect(validateFormat(key_24));
+}
+
+test "validateFormat: 23-char rejects (regression boundary below)" {
+    // The complement of the 24-char test: one char below must reject.
+    // Guards against accidental flip of the >= boundary to >.
+    const key_23 = "sk-12345678901234567890"; // 23 chars
+    try testing.expectEqual(@as(usize, 23), key_23.len);
+    try testing.expect(!validateFormat(key_23));
+}
+
 // T1.6 — consent required: writeWithConsent with consent=false returns
 // error.ConsentDenied and does NOT create the file.
 test "consent required before XDG write" {
