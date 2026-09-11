@@ -119,12 +119,45 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/terminal/term.zig"),
     });
+    // PR 2 (terminal-control-lib-from-scratch) — each new src/terminal/<slice>.zig
+    // is the root of its own module. terminal_mod re-exports each as it lands;
+    // terminal_test_mod imports each so tests/terminal/<slice>.zig can resolve
+    // `@import("slice")` against the corresponding build dep.
+    const cursor_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/cursor.zig"),
+    });
+    const style_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/style.zig"),
+    });
+    const dpm_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/dpm.zig"),
+    });
+    const kitty_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/kitty.zig"),
+    });
+    // term_mod needs `dpm` as a build dep so src/terminal/term.zig can do
+    // `@import("dpm")` to re-export the 6 DPM functions (design C31 fix).
+    // Without this, term_mod's `@import("dpm.zig")` collides with the
+    // sibling-module-root ownership rule (Zig 0.16).
+    term_mod.addImport("dpm", dpm_mod);
     const terminal_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/terminal/mod.zig"),
     });
     terminal_mod.addImport("term", term_mod);
+    terminal_mod.addImport("cursor", cursor_mod);
+    terminal_mod.addImport("style", style_mod);
+    terminal_mod.addImport("dpm", dpm_mod);
+    terminal_mod.addImport("kitty", kitty_mod);
     exe_mod.addImport("terminal", terminal_mod);
 
     // test step
@@ -190,6 +223,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "terminal", .module = terminal_mod },
             .{ .name = "term", .module = term_mod },
+            .{ .name = "cursor", .module = cursor_mod },
+            .{ .name = "style", .module = style_mod },
+            .{ .name = "dpm", .module = dpm_mod },
+            .{ .name = "kitty", .module = kitty_mod },
         },
     });
     const terminal_test_step = b.addTest(.{ .root_module = terminal_test_mod });

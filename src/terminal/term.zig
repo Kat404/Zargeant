@@ -214,42 +214,20 @@ pub fn getSize(handle: std.Io.File.Handle) anyerror!TermSize {
 // =============================================================================
 // Re-exports — design C31 keeps the renamed smoke canary at
 // tests/tui/terminal_smoke.zig:64-91 (formerly tests/tui/mibu_smoke.zig)
-// passing without change. PRs 2-5 land the actual implementations; for PR 1
-// these are placeholder re-exports so the names exist on `terminal.term`.
+// passing without change. PR 1 (terminal-control-lib-from-scratch WU 1.2)
+// shipped `@compileError` stubs so the names existed on `terminal.term`;
+// PR 2 WU 2.2 swaps each stub for a real `@import("dpm.zig")` re-export
+// pointing at the actual implementation. Per C31 the names remain public
+// on `terminal.term` so `terminal.term.enterAlternateScreen(&w)` etc.
+// compiles through the chain.
 // =============================================================================
 
-// ponytail: stubs defer real impl to PRs 2-3. Mark as deliberate simplifications;
-// upgrade by replacing each `= @compileError(...)` with the actual @import chain.
-pub const enterAlternateScreen = struct {
-    pub fn call(_: *std.Io.Writer) anyerror!void {
-        @compileError("terminal.term.enterAlternateScreen lands in PR 2 (dpm.zig)");
-    }
-}.call;
-pub const exitAlternateScreen = struct {
-    pub fn call(_: *std.Io.Writer) anyerror!void {
-        @compileError("terminal.term.exitAlternateScreen lands in PR 2 (dpm.zig)");
-    }
-}.call;
-pub const enableInBandResize = struct {
-    pub fn call(_: *std.Io.Writer) anyerror!void {
-        @compileError("terminal.term.enableInBandResize lands in PR 2 (dpm.zig)");
-    }
-}.call;
-pub const disableInBandResize = struct {
-    pub fn call(_: *std.Io.Writer) anyerror!void {
-        @compileError("terminal.term.disableInBandResize lands in PR 2 (dpm.zig)");
-    }
-}.call;
-pub const beginSynchronizedUpdate = struct {
-    pub fn call(_: *std.Io.Writer) anyerror!void {
-        @compileError("terminal.term.beginSynchronizedUpdate lands in PR 2 (dpm.zig)");
-    }
-}.call;
-pub const endSynchronizedUpdate = struct {
-    pub fn call(_: *std.Io.Writer) anyerror!void {
-        @compileError("terminal.term.endSynchronizedUpdate lands in PR 2 (dpm.zig)");
-    }
-}.call;
+pub const enterAlternateScreen = @import("dpm").enterAlternateScreen;
+pub const exitAlternateScreen = @import("dpm").exitAlternateScreen;
+pub const enableInBandResize = @import("dpm").enableInBandResize;
+pub const disableInBandResize = @import("dpm").disableInBandResize;
+pub const beginSynchronizedUpdate = @import("dpm").beginSynchronizedUpdate;
+pub const endSynchronizedUpdate = @import("dpm").endSynchronizedUpdate;
 
 // =============================================================================
 // Inline tests (REQTCL-013 — every public API has at least one inline test).

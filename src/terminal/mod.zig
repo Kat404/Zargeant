@@ -4,12 +4,16 @@
 //! are the sole reference sources; mibu and libvaxis source code are NOT consulted
 //! (CONTRIBUTING.md:41 + ADR 0001 §Negative + ADR 0002 §"Negative").
 //!
-//! PR 1 (terminal-control-lib-from-scratch) lands only `term`. PRs 2-5 add
-//! cursor, style, dpm, kitty, event. The module hub re-exports them as they
+//! PR 1 (terminal-control-lib-from-scratch) lands `term`. PR 2 adds cursor +
+//! style. PRs 3-5 add dpm, kitty, event. The module hub re-exports them as they
 //! land; PR 6 atomically re-points `src/tui.zig` callers from `mibu.*` to
 //! `terminal.*` per the chain strategy in obs#1514.
 
 pub const term = @import("term");
+pub const cursor = @import("cursor");
+pub const style = @import("style");
+pub const dpm = @import("dpm");
+pub const kitty = @import("kitty");
 
 test {
     std.testing.refAllDecls(@This());
