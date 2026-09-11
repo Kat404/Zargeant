@@ -1,6 +1,6 @@
 # Contributing to zargeant
 
-Thanks for your interest in zargeant. This document covers the contribution workflow, the rules around our single third-party dependency (mibu), and the clean-room policy for TUI primitives.
+Thanks for your interest in zargeant. This document covers the contribution workflow, the rules around our TUI dependency (in-tree `src/terminal/`), and the clean-room policy for TUI primitives.
 
 ## Ground rules
 
@@ -11,44 +11,39 @@ Thanks for your interest in zargeant. This document covers the contribution work
 - **Work-unit commits.** One commit = one deliverable unit. Tests travel with the code they verify. Docs travel with the change they explain. See `~/.config/opencode/skills/work-unit-commits/SKILL.md` (or the in-repo equivalent).
 - **Review budget.** Each PR targets ≤ 400 changed lines. Use chained PRs above 400; the `chained-pr` skill walks the topology.
 
-## TUI dependency (mibu)
+## TUI dependency (in-tree `src/terminal/`)
 
-zargeant's TUI render surface is **mibu**, pinned at the exact commit
+zargeant's TUI render surface is **the in-tree `src/terminal/` module**, replaced from the previous `mibu@636a36a` dependency in PR 6 of the `terminal-control-lib-from-scratch` change. See `docs/decisions/0003-clean-room-impl.md` for the full rationale and `docs/decisions/0002-clean-room.md` for the per-primitive protocol citations.
 
-```
-636a36a353614da2a537b060c33f17d608915eab
-```
+- Source: `src/terminal/` (mod.zig, term.zig, cursor.zig, style.zig, dpm.zig, kitty.zig, event.zig)
+- License: The Unlicense (project license)
+- Zero transitive deps. Zero external dependencies. In-tree only.
 
-- Source: <https://github.com/xyaman/mibu>
-- License: MIT
-- Zero transitive deps. Zero heap allocations in the hot path. ~950 LoC total.
+The smoke canary at `tests/tui/terminal_smoke.zig` (renamed from `tests/tui/mibu_smoke.zig` per Q4) asserts the public surface (`terminal.term.RawTerm`, `terminal.term.TermSize`, `terminal.kitty.KittyFlags`, `terminal.event.Event`, `terminal.event.Key`, `terminal.event.nextWithTimeout`, `terminal.event.pollReadable`, plus the 6 DPM re-exports on `terminal.term` per design C31). CI fails if any symbol drifts.
 
-The pin is enforced by `tests/tui/mibu_pin.zig` (REQ-TUI-020). The test reads `.dependencies.mibu.hash` from `build.zig.zon` and asserts equality. CI fails if the hash drifts.
+**Do not add a third-party TUI dep.** Adding any external TUI library requires:
 
-**Do not upgrade mibu opportunistically.** Any mibu bump requires:
+1. A new ADR entry in `docs/decisions/` documenting why the dep is needed, the alternatives considered (including in-tree + clean-room), the license, and the upgrade policy.
+2. The dep pinned at an exact commit (no caret ranges).
+3. PR review approval.
 
-1. A new ADR entry in `docs/decisions/` (e.g. `0003-mibu-pin-update.md`) documenting the upstream change, the API diff, and the verification done against zargeant's TUI code paths.
-2. An update to `tests/tui/mibu_pin.zig` with the new expected hash.
-3. A review of every mibu call site (`src/tui.zig` + `tests/tui/mibu_smoke.zig`) against the upstream API at the new commit.
-4. All three `zig build test` modes green (Debug + ReleaseSafe + ReleaseFast).
-
-If upstream mibu dies, the fallback plan is documented in `docs/decisions/0001-libvaxis-to-mibu.md` (vendor mibu to `vendor/mibu/`, or fall back to a clean-room reimplementation). Do not chase a new third-party TUI dep without an ADR.
+The previous `mibu` fallback plan (ADR 0001 §"Negative": vendor to `vendor/mibu/`, or fall back to a clean-room reimplementation) is now fulfilled by the in-tree module. ADR 0001's libvaxis → mibu history is preserved for context.
 
 ## Clean-room policy (TUI primitives)
 
-zargeant uses only a small slice of mibu's surface. If you need a TUI primitive mibu does not expose (e.g. a new terminal capability, a custom escape sequence, a kitty keyboard progress report), follow the clean-room protocol:
+If you need a TUI primitive the in-tree `src/terminal/` module does not expose (e.g. a new terminal capability, a custom escape sequence, a kitty keyboard progress report), follow the clean-room protocol:
 
-1. **Do not read libvaxis source.** Ever. The libvaxis → mibu swap in `docs/decisions/0001-libvaxis-to-mibu.md` documents why we left that codebase.
+1. **Do not read libvaxis or mibu source.** Ever. The libvaxis → mibu → in-tree trajectory is documented in `docs/decisions/0001-libvaxis-to-mibu.md` and `docs/decisions/0003-clean-room-impl.md`.
 2. **Consult the relevant public specs:**
    - POSIX `termios(3)` for raw mode, termios save/restore, and signal handling.
    - ECMA-48 for CSI / DCS / OSC escape sequences and parameterized control functions.
    - The kitty keyboard protocol (<https://sw.kovidgoyal.net/kitty/keyboard-protocol/>) for the kitty kb extensions.
    - xterm ctlseqs (<https://invisible-island.net/xterm/ctlseqs/ctlseqs.html>) for the long tail of DEC private modes (e.g. 2048, 1049, 2026) and terminal capability queries.
 3. **Cite each spec in the code comment** above the new code. A one-line citation (`// POSIX termios(3) §canonical mode`) is enough.
-4. **Add a RED test** in `src/tui.zig` (or `tests/tui/` if the test requires a separate file) that exercises the new primitive headlessly (no TTY — use `os.tty = false`).
-5. **Document the new ADR entry** in `docs/decisions/0002-clean-room.md` (create when the first such primitive lands). The ADR records the spec citations, the code path, and the test coverage.
+4. **Add a RED test** in `tests/terminal/` (the test-terminal step at `build.zig`) that exercises the new primitive headlessly (no TTY — use a `MockBackend` or byte-fixture).
+5. **Document the spec citation** in `docs/decisions/0002-clean-room.md` (the ADR records per-primitive references). The ADR is the source of truth for which spec governs which primitive.
 
-Rationale: independent re-implementations of well-specified terminal protocols are settled practice (curl, libssh2, kitty, alacritty, wezterm all have such code). Reading libvaxis would contaminate the implementation with its design choices and re-introduce the maintenance tail we explicitly left behind.
+Rationale: independent re-implementations of well-specified terminal protocols are settled practice (curl, libssh2, kitty, alacritty, wezterm all have such code). Reading libvaxis or mibu would contaminate the implementation with their design choices and re-introduce the maintenance tail we explicitly left behind. The in-tree `src/terminal/` module is the authoritative surface; every primitive derives from the four cited specs.
 
 ## No new third-party deps without an ADR
 
@@ -59,7 +54,7 @@ Adding a new dep to `build.zig.zon` requires:
 3. An update to the project's anti-slop guardrails (no abstract factories over the dep; reuse over reimplementation).
 4. PR review approval.
 
-This applies to any TUI dep, HTTP dep, crypto dep, or sandbox dep. The only currently-approved dep is mibu.
+This applies to any TUI dep, HTTP dep, crypto dep, or sandbox dep. After PR 6 of `terminal-control-lib-from-scratch`, the project has zero third-party TUI deps; the in-tree `src/terminal/` module replaces the previous `mibu@636a36a`.
 
 ## Project modules (reuse over reimplementation)
 
@@ -73,6 +68,7 @@ zargeant ships the following in-tree modules. Reuse them; do not reimplement:
 | `src/api_auth.zig`   | API-key validation + 0o600 consent write.                       |
 | `src/tls_conn.zig`   | Handrolled TLS state machine.                                   |
 | `src/mock_server.zig`| Mock HTTP server for tests.                                     |
+| `src/terminal/`      | TUI control layer (termios + CSI/SGR + DEC private modes + kitty kb + event parser). In-tree; replaces the previous `mibu@636a36a` dep per ADR 0003. |
 
 The TUI code (`src/tui.zig`, `src/runtime.zig`, `src/modal.zig`, `src/password_input.zig`) routes through these — no parallel implementations.
 
@@ -91,7 +87,7 @@ The TUI code (`src/tui.zig`, `src/runtime.zig`, `src/modal.zig`, `src/password_i
 - `src/password_input.zig`
 - `src/modal.zig`
 
-If you add a new TUI source file, append it to the targets list in `src/api_auth.zig` and add the new file to the test assertion.
+If you add a new TUI source file (in `src/terminal/` or elsewhere), append it to the targets list in `src/api_auth.zig` and add the new file to the test assertion. Per ADR 0002 / peer-review C18, no `src/terminal/*.zig` file may contain `getenv`, `readFile`, `libsecret`, or `Secret Service` patterns.
 
 ## Submitting a PR
 
@@ -105,10 +101,9 @@ If you add a new TUI source file, append it to the targets list in `src/api_auth
    ```
 
    All three must exit 0.
-
 3. Push the branch and open a PR. The PR body must include the chain context (position, base, follow-up, review budget) per the `chained-pr` skill.
 4. Address review comments with fixup commits; squash on merge.
 
 ## License
 
-By contributing, you agree to release your contributions under [The Unlicense](https://unlicense.org/) (the project's license). If you are contributing code derived from MIT-licensed works (e.g. mibu), keep the original copyright notice and license header in the affected files.
+By contributing, you agree to release your contributions under [The Unlicense](https://unlicense.org/) (the project's license). The in-tree `src/terminal/` module (replacing the previous `mibu` dependency per ADR 0003) is also released under The Unlicense; the original `mibu` source was MIT-licensed at commit `636a36a353614da2a537b060c33f17d608915eab`, but the in-tree reimplementation is independent clean-room work authored against POSIX `termios(3)`, ECMA-48, the kitty keyboard protocol, and xterm ctlseqs only — no mibu or libvaxis source was consulted per `CONTRIBUTING.md:41` and ADR 0002 §"Negative".

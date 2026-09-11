@@ -8,26 +8,16 @@ pub fn build(b: *std.Build) void {
         "Prioritize performance, safety, or fast compilation (Debug, ReleaseSafe, ReleaseFast)",
     ) orelse .Debug;
 
-    // mibu dep (github.com/xyaman/mibu, MIT, Zig 0.16 tested). Pinned at
-    // 636a36a353614da2a537b060c33f17d608915eab per build.zig.zon. The
-    // module is wired into tui_mod (always), test_mod (always), and
-    // tui-recovery R-PR 2 added lib_mod + exe_mod so main.zig can
-    // transitively pull in src/tui.zig → @import("mibu"). R-PR 4
-    // formalizes this addition per design#408 §2.3.
-    const mibu_dep = b.dependency("mibu", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const mibu_mod = mibu_dep.module("mibu");
+    // mibu dep removed (PR 6, terminal-control-lib-from-scratch, WU 6.5).
+    // The terminal control layer is now an in-tree src/terminal/ module
+    // (ADR 0003); no third-party TUI dep is required. See ADR 0001 §
+    // "Negative" for the contingency this change implements.
 
     // lib: harness (static library)
     const lib_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/root.zig"),
-        .imports = &.{
-            .{ .name = "mibu", .module = mibu_mod },
-        },
     });
     const lib = b.addLibrary(.{
         .name = "harness",
@@ -41,9 +31,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/root.zig"),
-        .imports = &.{
-            .{ .name = "mibu", .module = mibu_mod },
-        },
     });
     exe_mod.single_threaded = false;
     const exe = b.addExecutable(.{
@@ -87,20 +74,84 @@ pub fn build(b: *std.Build) void {
     const debug_call_step = b.step("tools-debug", "Run tools/debug_call.zig with stdin key");
     debug_call_step.dependOn(&debug_call_run.step);
 
-    // tui_mod: exposes mibu (github.com/xyaman/mibu, MIT, Zig 0.16 tested)
-    // under `@import("mibu")` so that src/tui.zig and tests/tui/* can
-    // consume mibu symbols via the build system's `addImport` indirection.
-    // tui (PR 1, sdd id=381 task 1.1) is the first slice to add a dep since
-    // the project bootstrap. mibu replaced libvaxis (was vendored at
-    // vendor/libvaxis/ in the squashed-away 5 libvaxis commits, now wiped
-    // from this branch) because libvaxis v0.5.1 transitive deps don't
-    // compile on Zig 0.16 -- see obs#399 for the full replacement research.
-    const tui_mod = b.createModule(.{
+    // terminal-control-lib-from-scratch (PR 1, task obs#1514 §3 WU 1.3).
+    // In-tree src/terminal/ module replacing mibu over 6 chained PRs. PR 1
+    // exposes only the `term` slice; PRs 2-5 extend mod.zig with cursor,
+    // style, dpm, kitty, event. The module is in-tree; no external
+    // dependency is required (ADR 0003 — the mibu replacement).
+    //
+    // PR 6 (WU 6.5) removed the mibu_dep / mibu_mod / tui_mod blocks.
+    // The legacy tui_mod served only as a wrapper to wire `mibu_mod`
+    // under the `@import("mibu")` name; with mibu gone, tui_mod is no
+    // longer needed (the live tests use lib_mod through
+    // runtime_thread_test_mod + the renamed terminal_smoke test step).
+    //
+    // term_mod is the standalone slice root (src/terminal/term.zig).
+    // terminal_mod (mod.zig) imports it via `addImport("term", term_mod)`.
+    // tests/terminal/root.zig imports both via the test module's imports.
+    const term_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("src/tui.zig"),
+        .root_source_file = b.path("src/terminal/term.zig"),
     });
-    tui_mod.addImport("mibu", mibu_mod);
+    // PR 2 (terminal-control-lib-from-scratch) — each new src/terminal/<slice>.zig
+    // is the root of its own module. terminal_mod re-exports each as it lands;
+    // terminal_test_mod imports each so tests/terminal/<slice>.zig can resolve
+    // `@import("slice")` against the corresponding build dep.
+    const cursor_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/cursor.zig"),
+    });
+    const style_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/style.zig"),
+    });
+    const dpm_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/dpm.zig"),
+    });
+    const kitty_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/kitty.zig"),
+    });
+    // PR 3 (terminal-control-lib-from-scratch WU 3.1) — event.zig is its own
+    // module root. Owned by event_mod; terminal_mod re-exports event types in
+    // PR 3 land 3 (WU 3.3); terminal_test_mod imports event so tests/terminal/
+    // event_types.zig can resolve `@import("event")` against the build dep.
+    const event_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/event.zig"),
+    });
+    // term_mod needs `dpm` as a build dep so src/terminal/term.zig can do
+    // `@import("dpm")` to re-export the 6 DPM functions (design C31 fix).
+    // Without this, term_mod's `@import("dpm.zig")` collides with the
+    // sibling-module-root ownership rule (Zig 0.16).
+    term_mod.addImport("dpm", dpm_mod);
+    const terminal_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/terminal/mod.zig"),
+    });
+    terminal_mod.addImport("term", term_mod);
+    terminal_mod.addImport("cursor", cursor_mod);
+    terminal_mod.addImport("style", style_mod);
+    terminal_mod.addImport("dpm", dpm_mod);
+    terminal_mod.addImport("kitty", kitty_mod);
+    // PR 3 (terminal-control-lib-from-scratch WU 3.3) — terminal_mod
+    // re-exports event types so src/tui.zig (in PR 6) can do
+    // `terminal.event.nextWithTimeout(...)` and the test file can verify
+    // `terminal.event.pollReadable` exists on the namespace.
+    terminal_mod.addImport("event", event_mod);
+    exe_mod.addImport("terminal", terminal_mod);
+    // PR 6 (terminal-control-lib-from-scratch, WU 6.3): lib_mod now needs
+    // `terminal` so src/tui.zig + src/channels.zig can `@import("terminal")`.
+    // mibu is kept for WU 6.5 removal.
+    lib_mod.addImport("terminal", terminal_mod);
 
     // terminal-control-lib-from-scratch (PR 1, task obs#1514 §3 WU 1.3).
     // In-tree src/terminal/ module replacing mibu over 6 chained PRs. PR 1
@@ -180,7 +231,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/root.zig"),
         .imports = &.{
-            .{ .name = "mibu", .module = mibu_mod },
+            .{ .name = "terminal", .module = terminal_mod },
         },
     });
     test_mod.addIncludePath(b.path("test"));
@@ -189,17 +240,25 @@ pub fn build(b: *std.Build) void {
     const test_decl = b.step("test", "Run unit tests");
     test_decl.dependOn(&run_test.step);
 
-    // test step: tests/tui/mibu_smoke.zig (PR 1, task 1.1 RED guard).
-    // Wired as a separate test artifact so its import of `@import("mibu")`
-    // resolves against the zig-fetched mibu source. Mirrors the
+    // test step: tests/tui/terminal_smoke.zig (PR 6, WU 6.4).
+    // Renamed from tests/tui/mibu_smoke.zig (per WU 6.4). Wired as a
+    // separate test artifact so its import of `@import("terminal")`
+    // resolves against the in-tree src/terminal/ module. Mirrors the
     // tools/debug_call test-step pattern (C6 from tls-handrolled
     // remediation, engram id=331).
+    //
+    // PR 6 (terminal-control-lib-from-scratch): the mibu.* → terminal.*
+    // namespace retarget moved the canary from the zig-fetched mibu
+    // source to the in-tree src/terminal/ module. After WU 6.5 the
+    // mibu dep is fully removed; the smoke canary is the single
+    // authoritative check that the in-tree module keeps the public
+    // surface stable.
     const tui_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("tests/tui/mibu_smoke.zig"),
+        .root_source_file = b.path("tests/tui/terminal_smoke.zig"),
         .imports = &.{
-            .{ .name = "mibu", .module = mibu_mod },
+            .{ .name = "terminal", .module = terminal_mod },
         },
     });
     const tui_test_step = b.addTest(.{ .root_module = tui_test_mod });
@@ -208,20 +267,40 @@ pub fn build(b: *std.Build) void {
     tui_test_decl.dependOn(&run_tui_test.step);
     test_decl.dependOn(&run_tui_test.step);
 
-    // test step: tests/tui/mibu_pin.zig (R-PR 4, REQ-TUI-020).
-    // Pin reproducibility assertion — reads build.zig.zon and asserts
-    // both the git SHA fragment + the Zig hash form. Hash drift fails
-    // the build before any code change happens.
-    const mibu_pin_test_mod = b.createModule(.{
+    // test step: tests/tui/mibu_pin.zig (R-PR 4, REQ-TUI-020) — DELETED.
+    // PR 6 (terminal-control-lib-from-scratch, WU 6.4) deletes both the
+    // test file and this build step. REQ-TUI-020 has no object after
+    // the mibu dep removal (WU 6.5); the pin enforcement is moot. The
+    // `test-tui-mibu-pin` step name is intentionally retained as a
+    // deliberate broken step (asserted by apply-progress verification:
+    // `zig build test-tui-mibu-pin` MUST error as "step does not exist").
+
+    // test step: tests/terminal/root.zig (PR 1, task obs#1514 §3 WU 1.3).
+    // Single-entrypoint test runner for the in-tree src/terminal/ module.
+    // Closes the phantom-test CI trap (obs#1508 C8 / obs#1510 REQ-TCL-012):
+    // `zig build test-terminal --summary all` proves the terminal test
+    // count is non-zero, so PRs 1-5 cannot silently compile-zero tests.
+    // Per-PR test slices append `_ = @import("<slice>.zig");` to root.zig
+    // in the same commit that creates src/terminal/<slice>.zig.
+    const terminal_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("tests/tui/mibu_pin.zig"),
+        .root_source_file = b.path("tests/terminal/root.zig"),
+        .imports = &.{
+            .{ .name = "terminal", .module = terminal_mod },
+            .{ .name = "term", .module = term_mod },
+            .{ .name = "cursor", .module = cursor_mod },
+            .{ .name = "style", .module = style_mod },
+            .{ .name = "dpm", .module = dpm_mod },
+            .{ .name = "kitty", .module = kitty_mod },
+            .{ .name = "event", .module = event_mod },
+        },
     });
-    const mibu_pin_test_step = b.addTest(.{ .root_module = mibu_pin_test_mod });
-    const run_mibu_pin_test = b.addRunArtifact(mibu_pin_test_step);
-    const mibu_pin_test_decl = b.step("test-tui-mibu-pin", "Run tests/tui/mibu_pin.zig (REQ-TUI-020)");
-    mibu_pin_test_decl.dependOn(&run_mibu_pin_test.step);
-    test_decl.dependOn(&run_mibu_pin_test.step);
+    const terminal_test_step = b.addTest(.{ .root_module = terminal_test_mod });
+    const run_terminal_test = b.addRunArtifact(terminal_test_step);
+    const terminal_test_decl = b.step("test-terminal", "Run src/terminal/ + tests/terminal/ in isolation");
+    terminal_test_decl.dependOn(&run_terminal_test.step);
+    test_decl.dependOn(&run_terminal_test.step);
 
     // test step: tests/terminal/root.zig (PR 1, task obs#1514 §3 WU 1.3).
     // Single-entrypoint test runner for the in-tree src/terminal/ module.
@@ -265,7 +344,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("tests/tui/runtime_thread.zig"),
         .imports = &.{
-            .{ .name = "mibu", .module = mibu_mod },
+            .{ .name = "terminal", .module = terminal_mod },
             .{ .name = "api_auth", .module = lib_mod },
             .{ .name = "api_client", .module = lib_mod },
             .{ .name = "channels", .module = lib_mod },
@@ -349,24 +428,31 @@ pub fn build(b: *std.Build) void {
     cancel_e2e_test_decl.dependOn(&run_cancel_e2e_test.step);
     test_decl.dependOn(&run_cancel_e2e_test.step);
 
-    // test step: tests/termios_sim.zig (tui-input-flow-bugfixes-2 WU-3,
+    // test step: tests/tui/cancel_path.zig (tui-input-flow-bugfixes-2 WU-3,
     // CAP-09 + CAP-13). Static-grep guard verifying the new pipe-write
     // call in src/tui.zig's Ctrl+C intercept + runtime roundtrip
     // assertion. The full pty mibu/termios e2e (CAP-13) is deferred to
     // WU-5 per design D3 follow-up.
-    const termios_sim_test_mod = b.createModule(.{
+    //
+    // PR 6 (terminal-control-lib-from-scratch, WU 6.4, Q4): renamed from
+    // tests/termios_sim.zig to tests/tui/cancel_path.zig. The contents
+    // were always a cancel-path static-guard artifact (see file header
+    // at tests/tui/cancel_path.zig:1-34), not a termios simulator; the
+    // new name matches the actual contents and lives alongside the
+    // other tui/ tests.
+    const cancel_path_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        .root_source_file = b.path("tests/termios_sim.zig"),
+        .root_source_file = b.path("tests/tui/cancel_path.zig"),
     });
-    const termios_sim_test_step = b.addTest(.{ .root_module = termios_sim_test_mod });
-    const run_termios_sim_test = b.addRunArtifact(termios_sim_test_step);
-    const termios_sim_test_decl = b.step(
-        "test-termios-sim",
-        "Run tests/termios_sim.zig (tui-input-flow-bugfixes-2 WU-3 CAP-09 wiring guard)",
+    const cancel_path_test_step = b.addTest(.{ .root_module = cancel_path_test_mod });
+    const run_cancel_path_test = b.addRunArtifact(cancel_path_test_step);
+    const cancel_path_test_decl = b.step(
+        "test-cancel-path",
+        "Run tests/tui/cancel_path.zig (tui-input-flow-bugfixes-2 WU-3 CAP-09 wiring guard)",
     );
-    termios_sim_test_decl.dependOn(&run_termios_sim_test.step);
-    test_decl.dependOn(&run_termios_sim_test.step);
+    cancel_path_test_decl.dependOn(&run_cancel_path_test.step);
+    test_decl.dependOn(&run_cancel_path_test.step);
 
     // =========================================================================
     // QA 0 — Static checks: `zig build check`

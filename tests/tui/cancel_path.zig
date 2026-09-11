@@ -1,8 +1,20 @@
-// tests/termios_sim.zig — static guards for the cancel-path architecture
+// tests/tui/cancel_path.zig — static guards for the cancel-path architecture
 // of tui-input-flow-bugfixes-2.
 //
 // Spec:    sdd/tui-input-flow-bugfixes-2/spec     CAP-09, CAP-13
 // Design:  sdd/tui-input-flow-bugfixes-2/design  D3
+//
+// PR 6 (terminal-control-lib-from-scratch, WU 6.4, Q4): renamed from
+// tests/termios_sim.zig to tests/tui/cancel_path.zig. The contents were
+// always a cancel-path static-guard artifact, not a termios simulator;
+// the new name matches the actual contents and lives alongside the other
+// tui/ tests. Build path + step name updated in build.zig to match.
+//
+// CAP-09 still depends on the field shape of `terminal.event.Key`:
+// the literal grep at line 69 ("if (k.code == .char and k.mods.ctrl)")
+// matches `src/tui.zig:552` because `Key.code` + `Key.mods.ctrl` field
+// names are preserved across the mibu → terminal namespace swap (PR 6
+// WU 6.3). PR 6 WU 6.3's atomic swap is byte-for-byte compatible.
 //
 // CAP-13 full mibu/termios pty e2e (master→slave 0x03 → mibu key parser →
 // clean TUI exit ≤1s) is DEFERRED indefinitely. Zig 0.16 stdlib does not
