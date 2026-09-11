@@ -74,6 +74,15 @@ pub const Lifecycle = struct {
     /// `enableRawMode` failed (no `/dev/tty`, CI). The TUI thread
     /// runs in degraded logger-only mode; renderers are skipped.
     no_tty: bool = false,
+    /// REQ-TIRFIX-003 (tui-input-rendering-fixes #1576): explicit sentinel
+    /// for the very first render frame. Replaces the dead `prev_snapshot
+    /// orelse current` fallback (which was unreachable given the
+    /// zero-init at `src/runtime.zig:396-410`). On the first frame the
+    /// render branch emits `\x1b[2J\x1b[H` (ED + CUP) followed by a
+    /// full snapshot re-emit of `current` (skipping space cells, which
+    /// are already spaces after the ED). On frame 2+ the existing diff
+    /// path runs with REQ-TIRFIX-002's corrected trailing cursor.
+    first_frame: bool = true,
     /// REQ-RW-002 (tui-render-wiring #1259): previous-frame cell snapshot
     /// for `emitFrame` diff. Allocated by `tuiRealMain` after init, freed
     /// in shutdown. `null` on the first frame → `emitFrame` receives
@@ -419,9 +428,20 @@ pub fn emitFrame(
         try writer.writeByte(@intCast(entry.cell.ch));
     }
     try terminal.style.reset(writer, false);
-    // REQ-TIW-001 — trailing cursor position. Only fires when at least
-    // one diff entry existed (otherwise no position to land on).
-    if (diffs.len > 0) try terminal.cursor.goTo(writer, last_x, last_y);
+    // REQ-TIRFIX-002 (tui-input-rendering-fixes #1576) — trailing cursor
+    // lands ONE COLUMN PAST the last rendered cell, clamped to `cols - 1`
+    // to keep the cursor inside the field (a CUP to (cols, y) places the
+    // cursor in the wrap zone). For input fields this is the correct
+    // position: the next empty cell where the next keystroke will be
+    // typed. The previous on-cell positioning was glued the blink cursor
+    // to the rightmost `*` (Bug 2) and to the cell-being-erased during
+    // backspace (Bug 5 perceptual artifact). ECMA-48 §8.3.21 (CSI CUP)
+    // semantics — `terminal.cursor.goTo` adds +1 internally to convert
+    // 0-indexed caller coords to 1-indexed wire coords.
+    if (diffs.len > 0) {
+        const col: u16 = if (last_x + 1 > cols -| 1) cols -| 1 else last_x + 1;
+        try terminal.cursor.goTo(writer, col, last_y);
+    }
 }
 
 // =============================================================================
@@ -579,10 +599,64 @@ pub fn tuiThreadLoop(
             defer terminal.term.endSynchronizedUpdate(writer) catch {};
             try modal.drawModal(win, state);
             const current = win.snapshot();
-            // First frame: lifecycle.prev_snapshot is null → use current
-            // as both prev (full-frame emit per REQ-RW-003 S-RW-005).
-            const prev = lifecycle.prev_snapshot orelse current;
-            try emitFrame(writer, prev, current, lifecycle.width, lifecycle.height, alloc);
+            // REQ-TIRFIX-003 (tui-input-rendering-fixes #1576): explicit
+            // first_frame sentinel replaces the dead `prev_snapshot orelse
+            // current` fallback (unreachable given the zero-init at
+            // src/runtime.zig:396-410). Frame 1 emits \x1b[2J\x1b[H (ED +
+            // CUP per ECMA-48 §8.3.39 + §8.3.21) followed by a full
+            // snapshot re-emit of `current` (skipping space cells, which
+            // are already blank after the ED). Frame 2+ uses the diff path
+            // via emitFrame with REQ-TIRFIX-002's trailing cursor fix.
+            if (lifecycle.first_frame) {
+                try writer.writeAll("\x1b[2J\x1b[H");
+                var idx: usize = 0;
+                while (idx < current.len) : (idx += 1) {
+                    const cell = current[idx];
+                    // Space cells are already blank after ED; skip them.
+                    // Style-only deltas on spaces are visually no-ops.
+                    if (cell.ch == ' ') continue;
+                    const x: u16 = @intCast(idx % lifecycle.width);
+                    const y: u16 = @intCast(idx / lifecycle.width);
+                    try terminal.cursor.goTo(writer, x, y);
+                    try terminal.style.reset(writer, false);
+                    if (cell.style.bold) try terminal.style.bold(writer, true);
+                    if (cell.style.underline) try terminal.style.underline(writer, true);
+                    if (cell.style.reverse) try terminal.style.reverse(writer, true);
+                    // ponytail: u21→u8 cast is v1 ASCII-only; non-ASCII stays for v2.
+                    try writer.writeByte(@intCast(cell.ch));
+                }
+                try terminal.style.reset(writer, false);
+                // REQ-TIRFIX-002 invariant: trailing cursor on the last
+                // non-space cell. Track the last (x, y) we emitted.
+                if (current.len > 0) {
+                    // After the ED + walk, the last non-space cell's
+                    // trailing CUP lands at last_x + 1, clamped to cols-1.
+                    // Walk back to find the last non-space cell.
+                    var last_idx: usize = current.len;
+                    while (last_idx > 0) {
+                        last_idx -= 1;
+                        if (current[last_idx].ch != ' ') break;
+                    }
+                    if (last_idx < current.len) {
+                        const last_x: u16 = @intCast(last_idx % lifecycle.width);
+                        const last_y: u16 = @intCast(last_idx / lifecycle.width);
+                        const col: u16 = if (last_x + 1 > lifecycle.width -| 1)
+                            lifecycle.width -| 1
+                        else
+                            last_x + 1;
+                        try terminal.cursor.goTo(writer, col, last_y);
+                    }
+                }
+                lifecycle.first_frame = false;
+            } else {
+                // Frame 2+: existing diff path (with REQ-TIRFIX-002's
+                // trailing cursor fix already applied inside emitFrame).
+                // ponytail: prev_snapshot is never null after frame 1
+                // succeeds (we always dupe it on the tail). Defensive
+                // fallback to current mirrors the original behavior.
+                const prev = lifecycle.prev_snapshot orelse current;
+                try emitFrame(writer, prev, current, lifecycle.width, lifecycle.height, alloc);
+            }
             // ponytail: 4 KiB stdout buffer auto-flushes only on overflow,
             // so frames + cursor CSI bytes sit there until the buffer fills
             // (~4 frames of busy typing). Flush per-frame so input and
@@ -706,6 +780,16 @@ pub fn handleKeyInput(
                 return true;
             },
             .backspace => {
+                // REQ-TIW-005 + REQ-TIRFIX-005 (tui-input-rendering-fixes
+                // #1576) — backspace UX contract: cursor visually retreats
+                // one cell to the LEFT; rightmost `*` is blanked on the
+                // next frame; no intermediate `*` appears. Contract holds
+                // because REQ-TIRFIX-002 places the trailing cursor at
+                // `last_x + 1` after each frame; on backspace,
+                // `draft_len -= 1` makes the next frame's `last_x` one
+                // smaller, so the trailing CUP retreats left. The
+                // "append-then-delete flash" was a perceptual artifact of
+                // the old on-cell trailing cursor (Bug 5).
                 if (ke.draft_len == 0) return false; // REQ-TIW-005 empty-draft no-op
                 ke.draft_len -= 1;
                 return true;
@@ -734,6 +818,10 @@ pub fn handleKeyInput(
                 return true;
             },
             .backspace => {
+                // REQ-TIW-005 + REQ-TIRFIX-005 (tui-input-rendering-fixes
+                // #1576) — mirror of key_entry's backspace handler. See
+                // the .key_entry backspace comment above for the full
+                // cursor-retreat UX contract.
                 if (up.draft_len == 0) return false;
                 up.draft_len -= 1;
                 return true;
@@ -996,8 +1084,13 @@ test "Lifecycle struct exposes required fields" {
     // (#1259, REQ-RW-002) adds `prev_snapshot`; the count rises to 9.
     // WU-1 (tui-keyentry-rebuild, REQ-NEW-001) adds `parser: Parser`
     // for the persistent parser; the count rises to 10.
+    // tui-input-rendering-fixes (REQ-TIRFIX-003, #1576) adds
+    // `first_frame: bool = true` so the very first render frame emits
+    // \x1b[2J\x1b[H + a full snapshot, replacing the dead
+    // `prev_snapshot orelse current` sentinel at src/tui.zig:584.
+    // Count rises to 11.
     const fields = @typeInfo(Lifecycle).@"struct".fields;
-    try testing.expectEqual(@as(usize, 10), fields.len);
+    try testing.expectEqual(@as(usize, 11), fields.len);
 }
 
 test "redraw_pending is std.atomic.Value(bool) with seq_cst contract" {

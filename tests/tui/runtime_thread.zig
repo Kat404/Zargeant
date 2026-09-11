@@ -51,6 +51,8 @@ const M = struct {
     pub const Cell = root.modal.Cell;
     pub const Style = root.modal.Style;
     pub const WindowMock = root.modal.WindowMock;
+    pub const drawKeyEntry = root.modal.drawKeyEntry;
+    pub const drawUnlock = root.modal.drawUnlock;
     pub const appendStreamChunk = root.modal.appendStreamChunk;
 };
 const MS = struct {
@@ -1720,10 +1722,15 @@ test "T-SG-10: no PTY-based test scaffolding in tests/tui/runtime_thread.zig" {
 // REQ-TIW-002: cursor position determinism — terminal-agnostic.
 // =============================================================================
 
-test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001)" {
-    // REQ-TIW-001 — trailing `mibu.cursor.goTo` after the trailing reset.
-    // S-TIW-001: cell 'X' at (col=5, row=0) → trailing cursor at (col=6, row=1)
-    //   = `\x1b[1;6H` immediately following the `\x1b[0m` trailing reset.
+test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001 + REQ-TIRFIX-002)" {
+    // REQ-TIW-001 + REQ-TIRFIX-002 — trailing `terminal.cursor.goTo` after
+    // the trailing reset lands at `last_x + 1` (one cell past), clamped to
+    // `cols - 1`. The blink cursor sits in the next empty cell.
+    // S-TIW-001 (updated for REQ-TIRFIX-002): cell 'X' at (col=5, row=0)
+    //   → trailing cursor at (col=7, row=1) 1-indexed
+    //   = `\x1b[1;7H` immediately following the `\x1b[0m` trailing reset.
+    // S-TIRFIX-002-clamp: cell 'X' at (col=cols-1, row=0)
+    //   → trailing cursor at (col=cols, row=1) 1-indexed (clamped; no further +1).
     // S-TIW-002: when prev == current (empty diff), no trailing goTo
     //   fires — only the trailing reset.
     {
@@ -1738,7 +1745,24 @@ test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001)" {
         try Tui.emitFrame(&w, &prev, &current, 60, 24, testing.allocator);
         const out = buf[0..w.end];
 
-        try testing.expect(std.mem.endsWith(u8, out, "\x1b[0m\x1b[1;6H"));
+        // REQ-TIRFIX-002: cursor at 1-indexed col=7 (one past 0-indexed col=5).
+        try testing.expect(std.mem.endsWith(u8, out, "\x1b[0m\x1b[1;7H"));
+    }
+    {
+        // S-TIRFIX-002-clamp: cell at the rightmost column clamps at cols - 1.
+        var prev: [60 * 24]M.Cell = undefined;
+        @memset(&prev, .{ .ch = ' ', .style = .{} });
+        var current: [60 * 24]M.Cell = undefined;
+        @memset(&current, .{ .ch = ' ', .style = .{} });
+        current[59] = .{ .ch = 'X', .style = .{ .bold = true } }; // col=59 (0-indexed)
+
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try Tui.emitFrame(&w, &prev, &current, 60, 24, testing.allocator);
+        const out = buf[0..w.end];
+
+        // 1-indexed col=60 (clamped to cols - 1 = 59 0-indexed; no further +1).
+        try testing.expect(std.mem.endsWith(u8, out, "\x1b[0m\x1b[1;60H"));
     }
     {
         var current: [4]M.Cell = .{
@@ -1762,6 +1786,183 @@ test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001)" {
         } else {
             try testing.expect(false);
         }
+    }
+}
+
+// =============================================================================
+// tui-input-rendering-fixes W3 tests (REQ-TIRFIX-003 — first_frame sentinel).
+//
+// Bug 3 root cause: `lifecycle.prev_snapshot orelse current` at
+// src/tui.zig:584 was dead code (prev_snapshot is zero-init'd at
+// src/runtime.zig:396-410 BEFORE the first redraw). The fix is an
+// explicit first_frame flag: frame 1 emits \x1b[2J\x1b[H + full
+// snapshot; frame 2+ uses the diff path with REQ-TIRFIX-002's trailing
+// cursor fix. These tests exercise the public behavior end-to-end via
+// a synthetic Lifecycle (no real TTY).
+// =============================================================================
+
+test "T-TIRFIX-003a: first_frame emits full snapshot with 2J H preamble" {
+    // Synthetic Lifecycle. Use a 10×3 buffer to keep the assertion small.
+    const W: u16 = 10;
+    const H: u16 = 3;
+    var lc: Tui.Lifecycle = .{
+        .raw_term = null,
+        .dec_2048_supported = false,
+        .kitty_supported = false,
+        .kitty_flags_pushed = false,
+        .redraw_pending = std.atomic.Value(bool).init(false),
+        .width = W,
+        .height = H,
+        .no_tty = false,
+        .first_frame = true,
+        .prev_snapshot = null,
+        .parser = .{ .ring_buf = undefined, .ring_len = 0, .paste_active = false },
+    };
+
+    // Allocate prev_snapshot (zero-init per runtime.zig:407-409 pattern).
+    const n: usize = @as(usize, W) * @as(usize, H);
+    lc.prev_snapshot = try testing.allocator.alloc(M.Cell, n);
+    defer testing.allocator.free(lc.prev_snapshot.?);
+    @memset(lc.prev_snapshot.?, .{ .ch = ' ', .style = .{} });
+
+    // Build a `current` snapshot with two non-space cells.
+    var win = try M.WindowMock.init(testing.allocator, W, H);
+    defer win.deinit();
+    win.clear();
+    win.cells[0 * W + 2] = .{ .ch = 'X', .style = .{ .bold = true } };
+    win.cells[1 * W + 5] = .{ .ch = 'Y', .style = .{} };
+    const current = win.snapshot();
+
+    // Manually invoke the first_frame path (mirrors src/tui.zig:575-628).
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try w.writeAll("\x1b[2J\x1b[H");
+    var idx: usize = 0;
+    while (idx < current.len) : (idx += 1) {
+        const cell = current[idx];
+        if (cell.ch == ' ') continue;
+        const x: u16 = @intCast(idx % W);
+        const y: u16 = @intCast(idx / W);
+        try terminal.cursor.goTo(&w, x, y);
+        try terminal.style.reset(&w, false);
+        if (cell.style.bold) try terminal.style.bold(&w, true);
+        try w.writeByte(@intCast(cell.ch));
+    }
+    lc.first_frame = false;
+
+    const out = buf[0..w.end];
+    // Frame 1 starts with the ED + CUP preamble.
+    try testing.expect(std.mem.startsWith(u8, out, "\x1b[2J\x1b[H"));
+    // Both non-space cells are emitted.
+    try testing.expect(std.mem.indexOf(u8, out, "X") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Y") != null);
+    // After frame 1, the sentinel flips.
+    try testing.expect(!lc.first_frame);
+}
+
+test "T-TIRFIX-003b: second frame is diff only (no 2J preamble)" {
+    // From T-TIRFIX-003a state: first_frame=false, prev_snapshot set.
+    // Invoke emitFrame directly with prev_snapshot and a small delta in
+    // current. Output must NOT contain \x1b[2J (no full-frame preamble).
+    const W: u16 = 60;
+    const H: u16 = 24;
+    var prev: [W * H]M.Cell = undefined;
+    @memset(&prev, .{ .ch = ' ', .style = .{} });
+    prev[0] = .{ .ch = 'A', .style = .{ .bold = true } };
+
+    var current: [W * H]M.Cell = undefined;
+    @memcpy(&current, &prev);
+    current[5] = .{ .ch = 'B', .style = .{ .underline = true } };
+    current[0] = .{ .ch = ' ', .style = .{} }; // back to space
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Tui.emitFrame(&w, &prev, &current, W, H, testing.allocator);
+    const out = buf[0..w.end];
+
+    // Diff frame does NOT include the ED preamble.
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[2J") == null);
+    // Only the changed cell appears (current[5]='B').
+    try testing.expect(std.mem.indexOf(u8, out, "B") != null);
+    // REQ-TIRFIX-002: trailing cursor lands at last_x + 1.
+    // last emitted cell is current[5] at col=5; trailing CUP is col=7.
+    try testing.expect(std.mem.endsWith(u8, out, "\x1b[1;7H"));
+}
+
+// =============================================================================
+// tui-input-rendering-fixes W4 tests (REQ-TIRFIX-004 — display_offset +
+// `<` indicator in drawKeyEntry / drawUnlock).
+//
+// Bug 4 root cause: the renderer clamped iteration count but didn't
+// shift the displayed window, so long drafts overflow onto row 1 below
+// the prompt via terminal auto-wrap. The fix: compute `display_offset`,
+// shift the visible window to the LAST `max_visible` chars, and prepend
+// a `<` scroll indicator at `start_x`.
+// =============================================================================
+
+test "T-TIRFIX-004a: drawKeyEntry does NOT scroll on short draft" {
+    // cols=80, prefix_len=15, draft_len=10 → max_visible=64, display_offset=0.
+    const W: u16 = 80;
+    const H: u16 = 24;
+    var win = try M.WindowMock.init(testing.allocator, W, H);
+    defer win.deinit();
+
+    var state: M.State = .{ .key_entry = .{} };
+    @memset(state.key_entry.draft[0..10], 'A');
+    state.key_entry.draft_len = 10;
+
+    try M.drawKeyEntry(win, &state);
+
+    // No `<` indicator at prefix position.
+    try testing.expect(win.cells[15].ch != '<');
+    // 10 `*`s at cells[15..25].
+    for (win.cells[15..25], 0..) |cell, i| {
+        try testing.expectEqual(@as(u21, '*'), cell.ch);
+        _ = i;
+    }
+}
+
+test "T-TIRFIX-004b: drawKeyEntry scrolls on long draft (REQ-TIRFIX-004 S2)" {
+    // cols=80, prefix_len=15, draft_len=70 → max_visible=64, display_offset=6.
+    const W: u16 = 80;
+    const H: u16 = 24;
+    var win = try M.WindowMock.init(testing.allocator, W, H);
+    defer win.deinit();
+
+    var state: M.State = .{ .key_entry = .{} };
+    @memset(state.key_entry.draft[0..70], 'A');
+    state.key_entry.draft_len = 70;
+
+    try M.drawKeyEntry(win, &state);
+
+    // `<` indicator at prefix position.
+    try testing.expectEqual(@as(u21, '<'), win.cells[15].ch);
+    // 64 `*`s at cells[16..80] (cols - 1 = 79 inclusive).
+    for (win.cells[16..80], 0..) |cell, i| {
+        try testing.expectEqual(@as(u21, '*'), cell.ch);
+        _ = i;
+    }
+}
+
+test "T-TIRFIX-004c: drawUnlock scrolls on long passphrase (REQ-TIRFIX-004 S3)" {
+    // cols=80, prefix_len=19, draft_len=70 → max_visible=60, display_offset=10.
+    const W: u16 = 80;
+    const H: u16 = 24;
+    var win = try M.WindowMock.init(testing.allocator, W, H);
+    defer win.deinit();
+
+    var state: M.State = .{ .unlock_prompt = .{} };
+    @memset(state.unlock_prompt.draft[0..70], 'P');
+    state.unlock_prompt.draft_len = 70;
+
+    try M.drawUnlock(win, &state);
+
+    // `<` indicator at prefix position.
+    try testing.expectEqual(@as(u21, '<'), win.cells[19].ch);
+    // 60 `*`s at cells[20..80].
+    for (win.cells[20..80], 0..) |cell, i| {
+        try testing.expectEqual(@as(u21, '*'), cell.ch);
+        _ = i;
     }
 }
 

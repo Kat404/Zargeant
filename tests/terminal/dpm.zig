@@ -29,11 +29,25 @@ test "enterAlternateScreen emits CSI ? 1049 h" {
     try testing.expectEqualStrings("\x1b[?1049h", buf[0..w.end]);
 }
 
-test "exitAlternateScreen emits CSI ? 1049 l" {
+test "exitAlternateScreen emits 2J H before 1049l (REQ-TIRFIX-001)" {
     var buf: [16]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try dpm.exitAlternateScreen(&w);
-    try testing.expectEqualStrings("\x1b[?1049l", buf[0..w.end]);
+    // Byte-exact sequence: 2J (4) + H (3) + 1049l (8) = 15 bytes.
+    try testing.expectEqualStrings("\x1b[2J\x1b[H\x1b[?1049l", buf[0..w.end]);
+    try testing.expectEqual(@as(usize, 15), w.end);
+}
+
+test "exitAlternateScreen is idempotent (REQ-TIRFIX-001 S2)" {
+    var buf1: [16]u8 = undefined;
+    var w1 = std.Io.Writer.fixed(&buf1);
+    try dpm.exitAlternateScreen(&w1);
+
+    var buf2: [16]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&buf2);
+    try dpm.exitAlternateScreen(&w2);
+
+    try testing.expectEqualSlices(u8, buf1[0..w1.end], buf2[0..w2.end]);
 }
 
 // =============================================================================
