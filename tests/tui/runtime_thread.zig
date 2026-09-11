@@ -1720,10 +1720,15 @@ test "T-SG-10: no PTY-based test scaffolding in tests/tui/runtime_thread.zig" {
 // REQ-TIW-002: cursor position determinism — terminal-agnostic.
 // =============================================================================
 
-test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001)" {
-    // REQ-TIW-001 — trailing `mibu.cursor.goTo` after the trailing reset.
-    // S-TIW-001: cell 'X' at (col=5, row=0) → trailing cursor at (col=6, row=1)
-    //   = `\x1b[1;6H` immediately following the `\x1b[0m` trailing reset.
+test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001 + REQ-TIRFIX-002)" {
+    // REQ-TIW-001 + REQ-TIRFIX-002 — trailing `terminal.cursor.goTo` after
+    // the trailing reset lands at `last_x + 1` (one cell past), clamped to
+    // `cols - 1`. The blink cursor sits in the next empty cell.
+    // S-TIW-001 (updated for REQ-TIRFIX-002): cell 'X' at (col=5, row=0)
+    //   → trailing cursor at (col=7, row=1) 1-indexed
+    //   = `\x1b[1;7H` immediately following the `\x1b[0m` trailing reset.
+    // S-TIRFIX-002-clamp: cell 'X' at (col=cols-1, row=0)
+    //   → trailing cursor at (col=cols, row=1) 1-indexed (clamped; no further +1).
     // S-TIW-002: when prev == current (empty diff), no trailing goTo
     //   fires — only the trailing reset.
     {
@@ -1738,7 +1743,24 @@ test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001)" {
         try Tui.emitFrame(&w, &prev, &current, 60, 24, testing.allocator);
         const out = buf[0..w.end];
 
-        try testing.expect(std.mem.endsWith(u8, out, "\x1b[0m\x1b[1;6H"));
+        // REQ-TIRFIX-002: cursor at 1-indexed col=7 (one past 0-indexed col=5).
+        try testing.expect(std.mem.endsWith(u8, out, "\x1b[0m\x1b[1;7H"));
+    }
+    {
+        // S-TIRFIX-002-clamp: cell at the rightmost column clamps at cols - 1.
+        var prev: [60 * 24]M.Cell = undefined;
+        @memset(&prev, .{ .ch = ' ', .style = .{} });
+        var current: [60 * 24]M.Cell = undefined;
+        @memset(&current, .{ .ch = ' ', .style = .{} });
+        current[59] = .{ .ch = 'X', .style = .{ .bold = true } }; // col=59 (0-indexed)
+
+        var buf: [4096]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try Tui.emitFrame(&w, &prev, &current, 60, 24, testing.allocator);
+        const out = buf[0..w.end];
+
+        // 1-indexed col=60 (clamped to cols - 1 = 59 0-indexed; no further +1).
+        try testing.expect(std.mem.endsWith(u8, out, "\x1b[0m\x1b[1;60H"));
     }
     {
         var current: [4]M.Cell = .{
