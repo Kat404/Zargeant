@@ -244,6 +244,27 @@ pub const Parser = struct {
             return .timeout;
         }
 
+        // Tiger Style §4 — defensive precondition on the ring buffer state.
+        // ring_len must never exceed the ring_buf capacity (only feedBytes
+        // + readMore advance ring_len; both honour the capacity bound).
+        std.debug.assert(self.ring_len <= self.ring_buf.len);
+
+        // Tiger Style (tui-ship-fast-phase0 WU 0.2, Bugs 1+3): drain the
+        // ring buffer BEFORE polling so a multi-event payload (paste
+        // brackets, multi-key burst) surfaces across sequential next()
+        // calls without forcing the caller to spin the poll/read loop.
+        // Pre-fix: bytes that arrived via readMore (or were injected by
+        // tests via feedBytes) sat in ring_buf until poll(2) said the
+        // fd was ready again — by which time the first event had already
+        // been returned and the next ones starved. POSIX termios(3)
+        // ISIG is preserved: signal-generating input keys (Ctrl+C, Ctrl+Z)
+        // still produce signals per ISIG=true; the parser just routes the
+        // decoded character through the same .key event surface.
+        if (self.ring_len > 0) {
+            const ev = self.decode();
+            if (ev != .none) return ev;
+        }
+
         // 1) Poll for readability. On EINTR (C9), check `pending` and
         // return early — the parser does not retry the poll (the SIGWINCH
         // handler has already stored into the atomic).
