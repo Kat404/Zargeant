@@ -93,6 +93,9 @@ const Tui = struct {
     pub const tuiThreadLoop = root.tui.tuiThreadLoop;
     pub const handleKeyInput = root.tui.handleKeyInput;
     pub const drainSubmitReply = root.tui.drainSubmitReply;
+    // WU 0.6 (tui-ship-fast-phase0, Bug 4): CURSOR_SKIP sentinel
+    // suppresses the trailing CUP emission in emitFrame.
+    pub const CURSOR_SKIP = root.tui.CURSOR_SKIP;
 };
 
 /// Key-event driver helper (REQ-TIW-013). Mirrors the wiring in
@@ -1360,9 +1363,11 @@ test "W3-1: emitFrame writes CSI cursor position + cell byte for a 2-cell diff" 
     };
     var buf: [128]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try Tui.emitFrame(&w, &prev, &current, 2, 2, testing.allocator);
+    // WU 0.6 (Bug 4): pass cursor_col/cursor_row matching the diff
+    // cell (x=1, y=0) so the trailing CUP fires at \x1b[1;2H.
+    try Tui.emitFrame(&w, &prev, &current, 2, 2, testing.allocator, 1, 0);
     const out = buf[0..w.end];
-    // Cursor position: mibu.cursor.goTo(writer, x=2, y=1) → \x1b[1;2H
+    // Cursor position: terminal.cursor.goTo(writer, x=1, y=0) → \x1b[1;2H
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;2H") != null);
     // Bold SGR
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[1m") != null);
@@ -1388,7 +1393,8 @@ test "W3-2: emitFrame writes SGR codes for bold/underline/reverse/reset" {
     };
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try Tui.emitFrame(&w, &prev, &current, 3, 1, testing.allocator);
+    // WU 0.6: cursor_col=CURSOR_SKIP (these tests don't model cursor).
+    try Tui.emitFrame(&w, &prev, &current, 3, 1, testing.allocator, Tui.CURSOR_SKIP, 0);
     const out = buf[0..w.end];
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[1m") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[4m") != null);
@@ -1398,7 +1404,9 @@ test "W3-2: emitFrame writes SGR codes for bold/underline/reverse/reset" {
 test "W3-3: emitFrame writes no cursor escapes when prev == current" {
     // REQ-RW-003 scenario S-RW-005 — when prev == current, the diff is
     // empty so only the trailing reset SGR is emitted (no cursor
-    // positions).
+    // positions). WU 0.6 (Bug 4): CURSOR_SKIP suppresses the trailing
+    // CUP — back-compat behavior for states that don't carry cursor
+    // layout state.
     var cells: [4]M.Cell = .{
         .{ .ch = 'A', .style = .{ .bold = true } },
         .{ .ch = 'B', .style = .{ .underline = true } },
@@ -1407,7 +1415,7 @@ test "W3-3: emitFrame writes no cursor escapes when prev == current" {
     };
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try Tui.emitFrame(&w, &cells, &cells, 2, 2, testing.allocator);
+    try Tui.emitFrame(&w, &cells, &cells, 2, 2, testing.allocator, Tui.CURSOR_SKIP, 0);
     const out = buf[0..w.end];
     // No cursor-position escapes (those look like \x1b[<num>;<num>H).
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[2;1H") == null);
@@ -1434,7 +1442,7 @@ test "W3-4: emitFrame frees the diff slice under std.testing.allocator" {
     };
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try Tui.emitFrame(&w, &prev, &current, 3, 1, testing.allocator);
+    try Tui.emitFrame(&w, &prev, &current, 3, 1, testing.allocator, Tui.CURSOR_SKIP, 0);
     // If emitFrame leaks the diff slice, the testing.allocator would
     // assert on scope exit; we got here so the leak is zero.
     try testing.expect(w.end > 0);
@@ -1454,10 +1462,10 @@ test "W3-5: emitFrame ignores WindowMock.in_alt_screen + cursor_hidden" {
     };
     var buf_a: [256]u8 = undefined;
     var w_a = std.Io.Writer.fixed(&buf_a);
-    try Tui.emitFrame(&w_a, &prev, &current, 2, 1, testing.allocator);
+    try Tui.emitFrame(&w_a, &prev, &current, 2, 1, testing.allocator, Tui.CURSOR_SKIP, 0);
     var buf_b: [256]u8 = undefined;
     var w_b = std.Io.Writer.fixed(&buf_b);
-    try Tui.emitFrame(&w_b, &prev, &current, 2, 1, testing.allocator);
+    try Tui.emitFrame(&w_b, &prev, &current, 2, 1, testing.allocator, Tui.CURSOR_SKIP, 0);
     try testing.expectEqual(w_a.end, w_b.end);
     try testing.expectEqualSlices(u8, buf_a[0..w_a.end], buf_b[0..w_b.end]);
 }
@@ -1562,13 +1570,14 @@ test "W5-1: Lifecycle.prev_snapshot updates per frame (no double-emit)" {
     var w = std.Io.Writer.fixed(&buf);
     // Frame 1: prev -> frame1. emitFrame swaps lifecycle.prev_snapshot
     // to a dupe of frame1 (we fake this here by tracking manually).
-    try Tui.emitFrame(&w, &prev, &frame1, 3, 1, testing.allocator);
+    // WU 0.6: cursor_col=CURSOR_SKIP (no cursor modeling here).
+    try Tui.emitFrame(&w, &prev, &frame1, 3, 1, testing.allocator, Tui.CURSOR_SKIP, 0);
     const frame1_out = w.end;
     try testing.expect(frame1_out > 0);
 
     // Frame 2: frame1 -> frame2 (only cell B→D differs).
     var w2 = std.Io.Writer.fixed(&buf);
-    try Tui.emitFrame(&w2, &frame1, &frame2, 3, 1, testing.allocator);
+    try Tui.emitFrame(&w2, &frame1, &frame2, 3, 1, testing.allocator, Tui.CURSOR_SKIP, 0);
     const frame2_out = w2.end;
     try testing.expect(frame2_out > 0);
     // Frame 2 emits fewer bytes than frame 1 (only 1 diff entry vs 3).
@@ -1739,7 +1748,9 @@ test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001)" {
 
         var buf: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        try Tui.emitFrame(&w, &prev, &current, 60, 24, testing.allocator);
+        // WU 0.6: pass cursor_col=6 (the explicit cursor position),
+        // 1-indexed col=6 means 0-indexed col=5.
+        try Tui.emitFrame(&w, &prev, &current, 60, 24, testing.allocator, 5, 0);
         const out = buf[0..w.end];
 
         try testing.expect(std.mem.endsWith(u8, out, "\x1b[0m\x1b[1;6H"));
@@ -1754,7 +1765,8 @@ test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001)" {
 
         var buf: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        try Tui.emitFrame(&w, &current, &current, 2, 2, testing.allocator);
+        // WU 0.6: CURSOR_SKIP suppresses the trailing CUP.
+        try Tui.emitFrame(&w, &current, &current, 2, 2, testing.allocator, Tui.CURSOR_SKIP, 0);
         const out = buf[0..w.end];
 
         // Trailing reset present.
@@ -2301,7 +2313,9 @@ test "WU 0.5: drawKeyEntry exposes cursor at prefix_len+0 when draft_len=0 (empt
     var prev_buf: [60 * 24]M.Cell = undefined;
     const prev: []M.Cell = &prev_buf;
     for (prev) |*c| c.* = .{ .ch = ' ', .style = .{} };
-    try Tui.emitFrame(&w, prev, cells, cols, rows, testing.allocator);
+    // WU 0.6: pull the explicit cursor from state.key_entry and pass
+    // it through to emitFrame (cursor_col=15 = 0-indexed, col 16 1-indexed).
+    try Tui.emitFrame(&w, prev, cells, cols, rows, testing.allocator, state.key_entry.cursor_col, state.key_entry.cursor_row);
     const out = buf[0..w.end];
     // Tiger Style: the cursor must land at the explicit position
     // (col=16, row=1, 1-indexed) regardless of whether any `*` exists.
@@ -2336,7 +2350,9 @@ test "WU 0.5: drawKeyEntry exposes cursor at prefix_len+3 when draft_len=3 ('abc
     for (prev) |*c| c.* = .{ .ch = ' ', .style = .{} };
     var buf: [512]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try Tui.emitFrame(&w, prev, cells, cols, rows, testing.allocator);
+    // WU 0.6: cursor from state.key_entry.cursor_col = 18 (0-indexed,
+    // 1-indexed col 19).
+    try Tui.emitFrame(&w, prev, cells, cols, rows, testing.allocator, state.key_entry.cursor_col, state.key_entry.cursor_row);
     const out = buf[0..w.end];
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;19H") != null);
 }
@@ -2374,7 +2390,9 @@ test "WU 0.5: drawKeyEntry caps cursor at the visible-window right edge on long 
     for (prev) |*c| c.* = .{ .ch = ' ', .style = .{} };
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try Tui.emitFrame(&w, prev, cells, cols, rows, testing.allocator);
+    // WU 0.6: cursor from state.key_entry.cursor_col = 80 (0-indexed,
+    // 1-indexed col 81) — visible-window right edge.
+    try Tui.emitFrame(&w, prev, cells, cols, rows, testing.allocator, state.key_entry.cursor_col, state.key_entry.cursor_row);
     const out = buf[0..w.end];
     // prefix=15, max_visible=65, cursor_col=80 (0-indexed) → col=81 (1-indexed).
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;81H") != null);
