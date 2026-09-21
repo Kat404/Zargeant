@@ -81,6 +81,12 @@ pub const MockBackend = struct {
     tcgetattr_count: u32 = 0,
     tcsetattr_count: u32 = 0,
     ioctl_gwinsz_count: u32 = 0,
+    // WU 0.7 (tui-ship-fast-phase0, Bug 6): capture the termios struct
+    // passed to the most recent tcsetattr call so tests can assert the
+    // post-cfmakeraw transformation (was null-only before this slice —
+    // existing tests only checked call counts). `null` until the first
+    // tcsetattr fires; after that it carries the applied termios.
+    last_applied_termios: ?std.posix.termios = null,
 
     const Options = struct {
         original_termios: std.posix.termios = std.mem.zeroes(std.posix.termios),
@@ -122,9 +128,13 @@ pub const MockBackend = struct {
         return m.original_termios;
     }
 
-    fn tcsetattrMock(_: std.Io.File.Handle, _: std.posix.TCSA, _: std.posix.termios) anyerror!void {
+    fn tcsetattrMock(_: std.Io.File.Handle, _: std.posix.TCSA, term: std.posix.termios) anyerror!void {
         const m = active_mock orelse return error.NoActiveMock;
         m.tcsetattr_count += 1;
+        // WU 0.7: record the applied termios for the test to inspect.
+        // The `last_applied_termios` field documents the contract — the
+        // most recent applied transformation is what the test asserts on.
+        m.last_applied_termios = term;
         if (m.fail_tcsetattr) |e| return e;
     }
 
