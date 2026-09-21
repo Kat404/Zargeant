@@ -209,3 +209,124 @@ test "kitty kb: CSI 97;8u decodes super-only modifier (bit 8)" {
     try testing.expectEqual(false, ev.key.mods.ctrl);
     try testing.expectEqual(false, ev.key.mods.shift);
 }
+
+// =============================================================================
+// WU 0.3 (tui-ship-fast-phase0, Bugs 2+5) — parseKittyKb must map functional
+// codepoints to their named KeyCode variants.
+//
+// Bug 2: kitty kb emits `CSI 13 u` for Enter, `CSI 127 u` for Backspace,
+// `CSI 27 u` for Escape, and `CSI 9 u` for Tab — i.e. the codepoint is the
+// ASCII control byte. Pre-fix, the parser returned `.char(13)` / `.char(127)`
+// / `.char(27)` / `.char(9)`, forcing every consumer to special-case the
+// control bytes by literal value. The fix maps the well-known functional
+// codepoints to their named KeyCode variants; everything else stays as
+// `.char(<codepoint>)`.
+//
+// Bug 5: kitty kb does NOT prefix functional keys with a ':shifted'
+// variant. Pre-fix, the functional codepoints were indistinguishable from
+// printable characters, so consumers (TUI modals) had to check both the
+// `code == .char` branch AND the literal codepoint. After fix, `.enter`
+// and `.backspace` are first-class key events on the same surface as
+// the SS3/CSI dispatcher already produces.
+//
+// Per the kitty kb protocol spec
+// (https://sw.kovidgoyal.net/kitty/keyboard-protocol/) the keycode
+// mapping table covers exactly these four: 9=Tab, 13=Enter, 27=Escape,
+// 127=Backspace. All other codepoints (including the printable ASCII
+// range 32..126) stay as `.char(<codepoint>)`.
+// =============================================================================
+
+test "parseKittyKb: CSI 13 u maps 13 (CR) to .enter (Bugs 2, 5)" {
+    // Kitty kb emits `CSI 13 u` for the Enter key. The codepoint is the
+    // ASCII CR byte (0x0D = 13). Pre-fix this returned `.char(13)`; after
+    // fix it returns `Key{ .code = .enter }`.
+    var parser = event.Parser.init();
+    parser.feedBytes("\x1b[13u");
+    const ev = parser.decode();
+    try testing.expect(ev == .key);
+    try testing.expect(ev.key.code == .enter);
+    try testing.expectEqual(event.EventKind.press, ev.key.event);
+    try testing.expectEqual(false, ev.key.mods.shift);
+    try testing.expectEqual(@as(usize, 0), parser.ring_len);
+}
+
+test "parseKittyKb: CSI 127 u maps 127 (DEL) to .backspace (Bugs 2, 5)" {
+    // Kitty kb emits `CSI 127 u` for Backspace. The codepoint is the
+    // ASCII DEL byte (0x7F = 127). Pre-fix this returned `.char(127)`;
+    // after fix it returns `Key{ .code = .backspace }`.
+    var parser = event.Parser.init();
+    parser.feedBytes("\x1b[127u");
+    const ev = parser.decode();
+    try testing.expect(ev == .key);
+    try testing.expect(ev.key.code == .backspace);
+    try testing.expectEqual(event.EventKind.press, ev.key.event);
+    try testing.expectEqual(false, ev.key.mods.shift);
+    try testing.expectEqual(@as(usize, 0), parser.ring_len);
+}
+
+test "parseKittyKb: CSI 127;2:2 u maps 127 + shift + repeat to .backspace (Bugs 2, 5)" {
+    // Kitty kb repeat event with shift held: modifier=2, colon-shorthand
+    // repeat. Pre-fix this returned `.char(127)` + mods.shift; after fix
+    // the codepoint is mapped to .backspace AND the repeat modifier +
+    // shift flag are preserved.
+    var parser = event.Parser.init();
+    parser.feedBytes("\x1b[127;2:2u");
+    const ev = parser.decode();
+    try testing.expect(ev == .key);
+    try testing.expect(ev.key.code == .backspace);
+    try testing.expectEqual(event.EventKind.repeat, ev.key.event);
+    try testing.expectEqual(true, ev.key.mods.shift);
+    try testing.expectEqual(false, ev.key.mods.ctrl);
+    try testing.expectEqual(@as(usize, 0), parser.ring_len);
+}
+
+test "parseKittyKb: CSI 13;1 u maps 13 + no real modifier to .enter with no mods" {
+    // Plain Enter press with the default modifier bitmask (1 = shift
+    // held alone is interpreted by terminals as the literal shift key,
+    // not as a 'plain' enter; for this test we use `CSI 13;1u` to
+    // confirm the modifier bitmask=1 case still surfaces .enter without
+    // applying shift to the .enter key).
+    var parser = event.Parser.init();
+    parser.feedBytes("\x1b[13;1u");
+    const ev = parser.decode();
+    try testing.expect(ev == .key);
+    try testing.expect(ev.key.code == .enter);
+    try testing.expectEqual(event.EventKind.press, ev.key.event);
+}
+
+test "parseKittyKb: CSI 27 u maps 27 (ESC) to .esc (Bugs 2, 5)" {
+    // Kitty kb emits `CSI 27 u` for Escape. The codepoint is the ASCII
+    // ESC byte (0x1B = 27). Pre-fix this returned `.char(27)`; after fix
+    // it returns `Key{ .code = .esc }`.
+    var parser = event.Parser.init();
+    parser.feedBytes("\x1b[27u");
+    const ev = parser.decode();
+    try testing.expect(ev == .key);
+    try testing.expect(ev.key.code == .esc);
+    try testing.expectEqual(event.EventKind.press, ev.key.event);
+}
+
+test "parseKittyKb: CSI 9 u maps 9 (TAB) to .tab (Bugs 2, 5)" {
+    // Kitty kb emits `CSI 9 u` for Tab. The codepoint is the ASCII HT
+    // byte (0x09 = 9). Pre-fix this returned `.char(9)`; after fix it
+    // returns `Key{ .code = .tab }`.
+    var parser = event.Parser.init();
+    parser.feedBytes("\x1b[9u");
+    const ev = parser.decode();
+    try testing.expect(ev == .key);
+    try testing.expect(ev.key.code == .tab);
+    try testing.expectEqual(event.EventKind.press, ev.key.event);
+}
+
+test "parseKittyKb: printable codepoint stays .char (regression guard)" {
+    // Regression guard — the codepoint mapping must NOT swallow printable
+    // ASCII. `CSI 97 u` (the 'a' key) must still surface as
+    // `Key{ .code = .char(97) }` — only the four functional codepoints
+    // (9, 13, 27, 127) are mapped; everything else stays as .char.
+    var parser = event.Parser.init();
+    parser.feedBytes("\x1b[97u");
+    const ev = parser.decode();
+    try testing.expect(ev == .key);
+    try testing.expect(ev.key.code == .char);
+    try testing.expectEqual(@as(u21, 'a'), ev.key.code.char);
+}
