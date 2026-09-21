@@ -264,13 +264,17 @@ test "parseKittyKb: CSI 127 u maps 127 (DEL) to .backspace (Bugs 2, 5)" {
     try testing.expectEqual(@as(usize, 0), parser.ring_len);
 }
 
-test "parseKittyKb: CSI 127;2:2 u maps 127 + shift + repeat to .backspace (Bugs 2, 5)" {
-    // Kitty kb repeat event with shift held: modifier=2, colon-shorthand
-    // repeat. Pre-fix this returned `.char(127)` + mods.shift; after fix
-    // the codepoint is mapped to .backspace AND the repeat modifier +
-    // shift flag are preserved.
+test "parseKittyKb: CSI 127;1: u maps 127 + shift + repeat to .backspace (Bugs 2, 5)" {
+    // Kitty kb colon-shorthand repeat event with shift held: modifier=1
+    // (= shift bit per the kitty kb spec) and the trailing colon
+    // signals repeat (shorthand). Pre-fix this returned `.char(127)` +
+    // mods.shift; after fix the codepoint is mapped to .backspace AND
+    // the repeat modifier + shift flag are preserved. Per the kitty kb
+    // protocol spec, the colon-shorthand for repeat is just `:` after
+    // the modifier segment (not `:2` — that's the explicit form, out
+    // of scope for PR 4).
     var parser = event.Parser.init();
-    parser.feedBytes("\x1b[127;2:2u");
+    parser.feedBytes("\x1b[127;1:u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
     try testing.expect(ev.key.code == .backspace);
