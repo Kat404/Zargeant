@@ -52,6 +52,10 @@ const M = struct {
     pub const Style = root.modal.Style;
     pub const WindowMock = root.modal.WindowMock;
     pub const appendStreamChunk = root.modal.appendStreamChunk;
+    // WU 0.5 (tui-ship-fast-phase0): drawKeyEntry is exposed on the
+    // modal namespace so tests can drive the renderer directly and
+    // assert the cursor position surface (Bug 4).
+    pub const drawKeyEntry = root.modal.drawKeyEntry;
 };
 const MS = struct {
     const root = @import("mock_server");
@@ -2235,4 +2239,143 @@ test "T-SG-11: tui-input-wiring slice is present" {
     const handle_idx = std.mem.indexOf(u8, arm_body, "handleKeyInput").?;
     const forward_idx = std.mem.indexOf(u8, arm_body, "channels.tui_to_agent.tryPut").?;
     try testing.expect(handle_idx < forward_idx);
+}
+
+// =============================================================================
+// WU 0.5 (tui-ship-fast-phase0, Bug 4) — drawKeyEntry must expose the cursor
+// position as explicit layout state, NOT derived from walking back through
+// the cell diff. The current implementation puts the blink cursor at the
+// LAST diff cell (last_x, last_y in emitFrame), which produces the wrong
+// column when:
+//   - draft_len == 0 (no `*` cells, but cursor should still be at prefix+1)
+//   - draft_len > 0 (cursor should be one past the LAST `*`, not ON it)
+//   - long draft hitting the visible-window cap (cursor should be at the
+//     right edge of the visible window, not at the last drawn cell)
+//
+// Bug 4 symptom: in key_entry with no draft yet typed, the blink cursor
+// lands on the SPACE between "key:" and the typed area (col=15, 0-indexed),
+// so the first typed character overwrites the prompt trailing space
+// instead of appearing one column to the right. After typing N characters,
+// the cursor lands on the LAST `*` (col=prefix+N-1, 0-indexed) instead of
+// one past it.
+//
+// Fix scope (WU 0.6):
+//   - src/modal.zig drawKeyEntry returns or writes a cursor_col/cursor_row
+//     pair: cursor_col = prefix_len + min(draft_len, max_visible), cursor_row = 0.
+//   - src/tui.zig emitFrame emits CUP at the explicit position UNCONDITIONALLY
+//     when state is key_entry (no longer derived from diffs).
+//   - POSIX termios(3) ISIG is preserved (ISIG=true, SIGINT still works).
+//
+// These tests pin the post-fix behavior. They currently FAIL because the
+// current code derives cursor from the last diff cell (last_x, last_y).
+// =============================================================================
+
+test "WU 0.5: drawKeyEntry exposes cursor at prefix_len+0 when draft_len=0 (empty key_entry)" {
+    // GIVEN: a fresh key_entry state with draft_len = 0 (no chars typed)
+    // WHEN: drawKeyEntry renders + emitFrame produces output bytes
+    // THEN: the trailing CUP places the cursor at column 16 (1-indexed)
+    //       — one past the 15-char "Enter API key: " prefix.
+    //
+    // Pre-fix (RED): emitFrame walks back through the diff; the LAST
+    // diff cell is the prompt's trailing space at (col=14, row=0). The
+    // trailing goTo emits `\x1b[1;15H`, NOT `\x1b[1;16H` as this test
+    // asserts.
+    const draft_buf: [256]u8 = .{0} ** 256;
+    var state: M.State = .{
+        .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 0,
+        },
+    };
+    const cols: u16 = 60;
+    const rows: u16 = 24;
+    var win = try M.WindowMock.init(testing.allocator, cols, rows);
+    defer win.deinit();
+    try M.drawKeyEntry(win, &state);
+    const cells = win.snapshot();
+    // First frame: prev is empty (all spaces); emitFrame sees a diff
+    // for the 15 prompt chars + trailing CUP at the explicit position.
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    // Construct prev = all spaces (matches first-frame condition).
+    var prev_buf: [60 * 24]M.Cell = undefined;
+    const prev: []M.Cell = &prev_buf;
+    for (prev) |*c| c.* = .{ .ch = ' ', .style = .{} };
+    try Tui.emitFrame(&w, prev, cells, cols, rows, testing.allocator);
+    const out = buf[0..w.end];
+    // Tiger Style: the cursor must land at the explicit position
+    // (col=16, row=1, 1-indexed) regardless of whether any `*` exists.
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;16H") != null);
+}
+
+test "WU 0.5: drawKeyEntry exposes cursor at prefix_len+3 when draft_len=3 ('abc' typed)" {
+    // GIVEN: key_entry with draft_len = 3, draft = "abc"
+    // WHEN: drawKeyEntry renders + emitFrame produces output bytes
+    // THEN: the trailing CUP places the cursor at column 19 (1-indexed)
+    //       — one past the 3 `*` chars (col 18, 1-indexed).
+    //
+    // Pre-fix (RED): last_x = 17 (the 3rd `*`), trailing goTo emits
+    // `\x1b[1;18H`, NOT `\x1b[1;19H` as this test asserts.
+    var draft_buf: [256]u8 = .{0} ** 256;
+    const draft = "abc";
+    @memcpy(draft_buf[0..draft.len], draft);
+    var state: M.State = .{
+        .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = draft.len,
+        },
+    };
+    const cols: u16 = 60;
+    const rows: u16 = 24;
+    var win = try M.WindowMock.init(testing.allocator, cols, rows);
+    defer win.deinit();
+    try M.drawKeyEntry(win, &state);
+    const cells = win.snapshot();
+    var prev_buf: [60 * 24]M.Cell = undefined;
+    const prev: []M.Cell = &prev_buf;
+    for (prev) |*c| c.* = .{ .ch = ' ', .style = .{} };
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Tui.emitFrame(&w, prev, cells, cols, rows, testing.allocator);
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;19H") != null);
+}
+
+test "WU 0.5: drawKeyEntry caps cursor at the visible-window right edge on long draft" {
+    // GIVEN: key_entry with draft_len = 100 (longer than the visible
+    //        window), terminal cols = 80
+    // WHEN: drawKeyEntry renders + emitFrame produces output bytes
+    // THEN: the cursor lands at the visible-window right edge — i.e.
+    //       prefix_len + max_visible = 15 + (80 - 15) = 80 (0-indexed)
+    //       = col 81 (1-indexed) = `\x1b[1;81H`. The draft is truncated
+    //       to 65 visible `*` chars; characters past col 79 are not
+    //       displayed.
+    //
+    // Pre-fix (RED): last_x = 79 (the LAST visible `*` at the right
+    // edge of the visible window). Trailing goTo emits `\x1b[1;80H`,
+    // NOT `\x1b[1;81H` as this test asserts.
+    var draft_buf: [256]u8 = .{0} ** 256;
+    var i: usize = 0;
+    while (i < draft_buf.len) : (i += 1) draft_buf[i] = 'x';
+    var state: M.State = .{
+        .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 100, // longer than cols - prefix
+        },
+    };
+    const cols: u16 = 80;
+    const rows: u16 = 24;
+    var win = try M.WindowMock.init(testing.allocator, cols, rows);
+    defer win.deinit();
+    try M.drawKeyEntry(win, &state);
+    const cells = win.snapshot();
+    var prev_buf: [80 * 24]M.Cell = undefined;
+    const prev: []M.Cell = &prev_buf;
+    for (prev) |*c| c.* = .{ .ch = ' ', .style = .{} };
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Tui.emitFrame(&w, prev, cells, cols, rows, testing.allocator);
+    const out = buf[0..w.end];
+    // prefix=15, max_visible=65, cursor_col=80 (0-indexed) → col=81 (1-indexed).
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;81H") != null);
 }
