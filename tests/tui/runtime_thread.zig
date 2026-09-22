@@ -91,6 +91,7 @@ const Tui = struct {
     pub const Lifecycle = root.tui.Lifecycle;
     pub const emitFrame = root.tui.emitFrame;
     pub const tuiThreadLoop = root.tui.tuiThreadLoop;
+    pub const tuiThreadShutdown = root.tui.tuiThreadShutdown;
     pub const handleKeyInput = root.tui.handleKeyInput;
     pub const drainSubmitReply = root.tui.drainSubmitReply;
     // WU 0.6 (tui-ship-fast-phase0, Bug 4): CURSOR_SKIP sentinel
@@ -2657,6 +2658,105 @@ test "WU 0.5: drawKeyEntry caps cursor at the visible-window right edge on long 
 // These tests assert the post-fix contract. They currently FAIL (RED):
 // pre-fix code writes the `|` at cells[cols] when the prompt overflows.
 // =============================================================================
+
+// =============================================================================
+// WU 1.5.4 (tui-ship-fast-phase0.5, R7) — tuiThreadShutdown restores
+// terminal cursor visibility + SGR attributes.
+//
+// Root cause (Opus 4.6): tuiThreadShutdown misses two CSI sequences:
+//   1. CSI ?25h (DECTCEM show cursor) — without this the cursor stays
+//      invisible after exit; the user's shell prompt blinks nowhere.
+//      Reference: xterm ctlseqs §"CSI Ps h" DEC private mode set, Ps=25.
+//      Reference: ECMA-48 §8.3.201.
+//   2. CSI 0m (SGR reset all attributes) — without this any bold /
+//      color attribute set during the TUI session leaks into the
+//      user's next shell prompt (Starship, fish, etc. visibly affected).
+//      Reference: ECMA-48 §8.3.117 (SGR with Ps=0).
+//
+// Both sequences must be emitted BEFORE disableRawMode. Cursor visibility
+// (DECTCEM) is a per-screen state; once termios is restored to cooked
+// mode, the shell does not re-show the cursor because DECTCEM is the
+// terminal's persistent state — the kernel does not touch it on raw-mode
+// disable. SGR attributes are likewise terminal state, not termios state.
+//
+// Fix scope: in tuiThreadShutdown, after exitAltScreenAndResize and
+// before disableRawMode, write "\x1b[?25h" then "\x1b[0m" to the writer.
+// Add a final writer.flush() after raw-mode teardown so the ~20 bytes
+// of restore sequences actually reach the TTY before process exit
+// (the existing flush at the top of shutdown runs BEFORE the restore).
+//
+// These tests assert the post-fix contract via direct invocation of
+// tuiThreadShutdown against a std.Io.Writer.fixed buffer. They currently
+// FAIL (RED) because pre-fix the show-cursor + SGR-reset bytes are
+// missing from the emitted sequence.
+// =============================================================================
+
+test "WU 1.5.4: tuiThreadShutdown emits DECTCEM show-cursor + SGR reset (R7)" {
+    // S-WU154-01: tuiThreadShutdown writes "\x1b[?25h" (DECTCEM show
+    //              cursor) somewhere in the output stream. Pre-fix:
+    //              the byte sequence is absent → expecting any-must-
+    //              match fails.
+    // S-WU154-02: tuiThreadShutdown writes "\x1b[0m" (SGR reset) somewhere
+    //              in the output stream. Pre-fix: missing → fails.
+    // S-WU154-03: ordering — DECTCEM show-cursor appears BEFORE the raw
+    //              mode disable path. We can't directly assert ordering
+    //              without enabling raw_term (which would require a real
+    //              tty), so we approximate by asserting the show-cursor
+    //              sequence appears AFTER exitAltScreenAndResize bytes
+    //              ("\x1b[?1049l") in the buffer — exit-alt-screen must
+    //              precede show-cursor per the shutdown order contract.
+    // S-WU154-04: ordering — SGR reset appears AFTER show-cursor. The
+    //              shutdown contract writes show-cursor first, then SGR.
+    //
+    // We construct a minimal Lifecycle with raw_term=null (so
+    // disableRawMode's branch is skipped — the test stays headless) and
+    // kitty_flags_pushed=false (so popKittyKb is skipped). The disable-
+    // BracketedPaste + exitAltScreenAndResize paths still fire so the
+    // buffer is non-empty + the test exercises real code paths.
+
+    var lc: Tui.Lifecycle = .{
+        .raw_term = null,
+        .dec_2048_supported = false,
+        .kitty_supported = false,
+        .kitty_flags_pushed = false,
+        .redraw_pending = std.atomic.Value(bool).init(false),
+        .width = 80,
+        .height = 24,
+    };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    Tui.tuiThreadShutdown(&lc, &w);
+    const out = buf[0..w.end];
+
+    // S-WU154-01: DECTCEM show-cursor present.
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?25h") != null);
+
+    // S-WU154-02: SGR reset present.
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[0m") != null);
+
+    // S-WU154-03: show-cursor AFTER exit-alt-screen (which writes
+    // "\x1b[?1049l"). Per xterm ctlseqs the alt-screen tear-down must
+    // precede cursor restoration; otherwise the cursor reappears inside
+    // the now-exited alt-screen buffer (no-op visually but smears the
+    // main-screen's cursor state).
+    const exit_alt_idx = std.mem.indexOf(u8, out, "\x1b[?1049l") orelse {
+        try testing.expect(false); // exit-alt-screen missing → broken
+        return;
+    };
+    const show_cursor_idx = std.mem.indexOf(u8, out, "\x1b[?25h") orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expect(show_cursor_idx > exit_alt_idx);
+
+    // S-WU154-04: SGR reset AFTER show-cursor. The shutdown contract
+    // emits DECTCEM first, then SGR reset.
+    const sgr_idx = std.mem.indexOf(u8, out, "\x1b[0m") orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expect(sgr_idx > show_cursor_idx);
+}
 
 test "WU 1.5.2: drawKeyEntry spinner does NOT render at row 1 when draft saturates visible window (R3)" {
     // S-WU152-01: cols=27 (narrow), draft_len=12 (max visible for that
