@@ -795,7 +795,19 @@ pub fn handleKeyInput(
                     ); // REQ-TIW-006
                     return true;
                 },
-                .esc => return false, // REQ-TIW-007 + REQ-TIW-NEG-3 — v1 no-op
+                .esc => {
+                    // WU 1.5.3 (tui-ship-fast-phase0.5, R6): Esc clears the
+                    // draft + err_msg. Replaces the v1 no-op (REQ-TIW-NEG-3)
+                    // with a "clear all" gesture consistent with the
+                    // .unlock_prompt arm's cancelUnlock behavior. The draft
+                    // bytes are left in place; only draft_len is zeroed so
+                    // the renderer's "shown = min(draft_len, ...)" reads 0.
+                    // err_msg_len is zeroed too so the prior format-fail
+                    // message disappears on cancel.
+                    ke.draft_len = 0;
+                    ke.err_msg_len = 0;
+                    return true;
+                },
                 else => return false, // REQ-TIW-009 — arrows / F-keys / tab
             }
         },
