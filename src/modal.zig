@@ -399,7 +399,11 @@ pub fn drawKeyEntry(win: *WindowMock, state: *State) !void {
     // future work (ponytail).
     if (payload.validating) {
         const spinner_x: usize = "Enter API key: ".len + shown;
-        if (spinner_x < win.cells.len) {
+        // WU 1.5.2 (tui-ship-fast-phase0.5, R3): cap at cols, NOT
+        // cells.len (cols*rows). Pre-fix the '|' spinner wrote into row 1
+        // when draft_len == max_visible (spinner_x == cols), causing the
+        // visual '|' artifact after the masked draft at the right edge.
+        if (spinner_x < win.size().cols) {
             win.cells[spinner_x] = .{ .ch = '|', .style = .{ .bold = true } };
         }
     }
