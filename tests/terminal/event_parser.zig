@@ -458,3 +458,146 @@ test "bracketed paste: split-CSI start sequence across calls" {
     try testing.expect(e_end == .paste_end);
     try testing.expect(!parser.paste_active);
 }
+
+// =============================================================================
+// WU 0.1 (tui-ship-fast-phase0, Bugs 1+3) — Parser.next must drain ring_buf
+// before polling, so that multi-event payloads (pastes + multi-key bursts)
+// are delivered via sequential decode() calls without needing extra
+// poll/read cycles.
+//
+// Bug 1: a paste payload (paste_start + per-char keys + paste_end) fed in
+//   ONE feedBytes call surfaces only the FIRST event per next() call. The
+//   subsequent keys + paste_end must be drained from ring_buf BEFORE
+//   poll(2) is called again.
+//
+// Bug 3: a multi-key burst ("ASD") requires three read(2)/poll(2) cycles
+//   to surface three .key events. After feedBytes, decode() must return
+//   three sequential .key events without any read/poll intervention.
+//
+// The fix lives in src/terminal/event.zig:Parser.next (drain ring_buf
+// before poll_fn). These tests document the desired behavior and serve
+// as RED tests for WU 0.2.
+// =============================================================================
+
+test "Parser drains ring_buf before returning: paste payload completes via decode() chain" {
+    // Bug 1 — feedBytes of a full bracketed paste (start + payload + end)
+    // then repeatedly calling decode() must walk the full sequence:
+    //   .paste_start → 5 × .key(char) → .paste_end
+    // Crucially, the FIRST decode() must NOT collapse to .paste_end (the
+    // pre-fix bug); the ring_buf must keep enough state across calls.
+    var parser = event.Parser.init();
+    parser.feedBytes("\x1b[200~ABCDE\x1b[201~");
+
+    const e1 = parser.decode();
+    try testing.expect(e1 == .paste_start);
+    try testing.expect(parser.paste_active);
+
+    const expected = "ABCDE";
+    var i: usize = 0;
+    while (i < expected.len) : (i += 1) {
+        const ev = parser.decode();
+        try testing.expect(ev == .key);
+        try testing.expect(ev.key.code == .char);
+        try testing.expectEqual(@as(u21, expected[i]), ev.key.code.char);
+    }
+
+    // The paste_end MUST come on the decode() AFTER all five chars are
+    // drained — pre-fix bug collapsed to .paste_end on the first call
+    // because ring_buf was ignored. After fix, decode() surfaces
+    // .paste_end here.
+    const e_end = parser.decode();
+    try testing.expect(e_end == .paste_end);
+    try testing.expect(!parser.paste_active);
+    try testing.expectEqual(@as(usize, 0), parser.ring_len);
+}
+
+test "Parser drains ring_buf before returning: multi-key burst emits 3 keys via decode() chain" {
+    // Bug 3 — feedBytes("ASD") then decode() three times must yield
+    // three distinct .key events. Pre-fix, only one event was returned
+    // per next() call because ring_buf was created fresh each call.
+    var parser = event.Parser.init();
+    parser.feedBytes("ASD");
+
+    const e1 = parser.decode();
+    try testing.expect(e1 == .key);
+    try testing.expectEqual(@as(u21, 'A'), e1.key.code.char);
+
+    const e2 = parser.decode();
+    try testing.expect(e2 == .key);
+    try testing.expectEqual(@as(u21, 'S'), e2.key.code.char);
+
+    const e3 = parser.decode();
+    try testing.expect(e3 == .key);
+    try testing.expectEqual(@as(u21, 'D'), e3.key.code.char);
+
+    try testing.expectEqual(@as(usize, 0), parser.ring_len);
+}
+
+test "Parser drains ring_buf before returning: decode() returns .none after ring_buf drained" {
+    // After the last key in a multi-key burst is consumed, the next
+    // decode() must return .none (not block, not error). This is the
+    // "drain completed" terminal state — proof the ring_buf is empty.
+    var parser = event.Parser.init();
+    parser.feedBytes("XY");
+    _ = parser.decode();
+    _ = parser.decode();
+    try testing.expectEqual(@as(usize, 0), parser.ring_len);
+    const ev = parser.decode();
+    try testing.expect(ev == .none);
+}
+
+test "Parser drains ring_buf before returning: paste_start is sticky across decode() calls" {
+    // Bug 1 follow-up — after paste_start surfaces, subsequent decode()
+    // calls must continue to emit per-char .key events for the remaining
+    // paste payload even if paste_active was just set. This proves the
+    // ring_buf drain logic doesn't accidentally reset paste_active.
+    var parser = event.Parser.init();
+    parser.feedBytes("\x1b[200~XY\x1b[201~");
+
+    // First decode: paste_start.
+    const e_start = parser.decode();
+    try testing.expect(e_start == .paste_start);
+    try testing.expect(parser.paste_active);
+
+    // Decode X.
+    const e_x = parser.decode();
+    try testing.expect(e_x == .key);
+    try testing.expectEqual(@as(u21, 'X'), e_x.key.code.char);
+    try testing.expect(parser.paste_active);
+
+    // Decode Y.
+    const e_y = parser.decode();
+    try testing.expect(e_y == .key);
+    try testing.expectEqual(@as(u21, 'Y'), e_y.key.code.char);
+    try testing.expect(parser.paste_active);
+
+    // Final decode: paste_end (close bracket consumed).
+    const e_end = parser.decode();
+    try testing.expect(e_end == .paste_end);
+    try testing.expect(!parser.paste_active);
+}
+
+test "Parser drains ring_buf before returning: full buffer survives many sequential decodes" {
+    // Stress test — feed 64 bytes (32 'x' chars + 32 'y' chars) and
+    // verify decode() emits 64 distinct .key events without any extra
+    // read/poll. The pre-fix bug would surface only ONE event per call,
+    // so the test would assert ring_len > 0 after the first decode and
+    // fail. After fix, decode() walks the buffer deterministically.
+    var parser = event.Parser.init();
+    var payload: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) payload[i] = 'x';
+    while (i < 64) : (i += 1) payload[i] = 'y';
+    parser.feedBytes(&payload);
+    try testing.expectEqual(@as(usize, 64), parser.ring_len);
+
+    var j: usize = 0;
+    while (j < 64) : (j += 1) {
+        const ev = parser.decode();
+        try testing.expect(ev == .key);
+        try testing.expectEqual(@as(u21, payload[j]), ev.key.code.char);
+    }
+    try testing.expectEqual(@as(usize, 0), parser.ring_len);
+    const e_done = parser.decode();
+    try testing.expect(e_done == .none);
+}

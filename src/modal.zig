@@ -224,6 +224,13 @@ pub const KeyEntryState = struct {
     err_msg_len: usize = 0,
     validating: bool = false,
     worker_thread: ?std.Thread = null,
+    // WU 0.6 (tui-ship-fast-phase0, Bug 4): explicit cursor position for
+    // the key_entry modal. drawKeyEntry writes these fields; emitFrame
+    // reads them and emits CUP at this position UNCONDITIONALLY (no
+    // longer derived from walking back through the diff). cursor_col is
+    // 0-indexed (col=15 means the 16th column, 1-indexed col=16).
+    cursor_col: u16 = 0,
+    cursor_row: u16 = 0,
 };
 
 /// Payload for `.unlock_prompt` (REQ-TUI-007). Same shape as KeyEntry but
@@ -353,6 +360,10 @@ pub fn drawModal(win: *WindowMock, state: *State) !void {
 /// state. Callers drive the `key_entry → consent_prompt` transition via
 /// `submitKeyEntryAsync` (REQ-TUI-006).
 pub fn drawKeyEntry(win: *WindowMock, state: *State) !void {
+    // Tiger Style §4 — defensive precondition on the draft length.
+    // draft_len is bounded by the fixed-size draft buffer.
+    std.debug.assert(state.key_entry.draft_len <= state.key_entry.draft.len);
+
     win.clear();
     const payload = &state.key_entry;
     try win.print("Enter API key: ", .{});
@@ -388,10 +399,33 @@ pub fn drawKeyEntry(win: *WindowMock, state: *State) !void {
     // future work (ponytail).
     if (payload.validating) {
         const spinner_x: usize = "Enter API key: ".len + shown;
-        if (spinner_x < win.cells.len) {
+        // WU 1.5.2 (tui-ship-fast-phase0.5, R3): cap at cols, NOT
+        // cells.len (cols*rows). Pre-fix the '|' spinner wrote into row 1
+        // when draft_len == max_visible (spinner_x == cols), causing the
+        // visual '|' artifact after the masked draft at the right edge.
+        if (spinner_x < win.size().cols) {
             win.cells[spinner_x] = .{ .ch = '|', .style = .{ .bold = true } };
         }
     }
+    // WU 0.6 (tui-ship-fast-phase0, Bug 4): write the explicit cursor
+    // position to state.key_entry so emitFrame can place CUP here
+    // UNCONDITIONALLY (independent of diffs.len or any `*` cells). The
+    // formula is `prefix_len + min(draft_len, max_visible)` — i.e. one
+    // past the last visible character. For draft_len=0 the cursor lands
+    // at col=15 (1-indexed col=16, after the trailing space of the
+    // prompt). For long drafts the cursor caps at the right edge of
+    // the visible window.
+    //
+    // Tiger Style: cap at `cols` so the assertion `cursor_col < cols`
+    // in emitFrame holds. The cursor at col=cols means "one past the
+    // last visible column" — the terminal will wrap to row 1 if a
+    // character is typed; emitFrame won't crash on the assertion.
+    const max_col: u16 = win.size().cols;
+    const raw_cursor: usize = "Enter API key: ".len + shown;
+    const cursor_x: u16 = @intCast(@min(raw_cursor, @as(usize, max_col)));
+    std.debug.assert(cursor_x <= win.size().cols);
+    payload.cursor_col = cursor_x;
+    payload.cursor_row = 0;
 }
 
 /// Format-pre-flight + API-validation submit handler for KeyEntry (WU-2:

@@ -350,6 +350,18 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
     // 2. Exit alt screen + disable in-band resize.
     exitAltScreenAndResize(writer) catch {};
 
+    // 2.5 WU 1.5.4 (tui-ship-fast-phase0.5, R7): ECMA-48 terminal state
+    // restore — show cursor (DECTCEM) + SGR reset. Without these the
+    // cursor stays invisible and bold/color attributes leak into the
+    // next shell prompt (Starship, fish, etc.). Both must precede
+    // disableRawMode because DECTCEM is terminal-screen state (the
+    // kernel does not touch it on raw-mode restore) and SGR attributes
+    // are likewise terminal state, not termios state. Reference: xterm
+    // ctlseqs §"CSI Ps h" / §"SGR"; ECMA-48 §8.3.201 (DECTCEM) +
+    // §8.3.117 (SGR 0 = default rendition).
+    writer.writeAll("\x1b[?25h") catch {}; // DECTCEM show cursor
+    writer.writeAll("\x1b[0m") catch {}; // SGR reset
+
     // 3. Disable raw mode (restores original termios).
     if (lc.raw_term) |*rt| {
         rt.disableRawMode() catch {};
@@ -360,6 +372,13 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
     // dangling Parser pointer during shutdown. Symmetric with the
     // setCurrentParser call in tuiThreadInit.
     terminal.event.setCurrentParser(null);
+
+    // WU 1.5.4 (R7): final flush AFTER all teardown bytes. The L338
+    // flush at the top of shutdown runs BEFORE the DEC reset sequences;
+    // without this second flush the ~40 bytes of teardown CSI sit in
+    // the 4 KiB stdout buffer and may never reach the terminal before
+    // process exit.
+    writer.flush() catch {};
 }
 
 // =============================================================================
@@ -371,11 +390,39 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
 // ponytail: no StyleTracker — add when profiling shows >1% frame
 // budget in SGR emits. ponytail: u21→u8 cast is v1 ASCII-only; non-ASCII
 // stays for v2.
+//
+// WU 0.6 (tui-ship-fast-phase0, Bug 4): emitFrame takes explicit
+// `cursor_col` and `cursor_row` parameters. When `cursor_col ==
+// CURSOR_SKIP`, no trailing CUP is emitted (the diff loop is unchanged
+// for non-key_entry states). When `cursor_col != CURSOR_SKIP`, the
+// trailing CUP fires UNCONDITIONALLY at (cursor_col, cursor_row),
+// regardless of whether any diff entries existed. This makes the
+// blink-cursor position a first-class piece of layout state owned by
+// the modal draw function, NOT a side-effect of walking the diff.
+//
+// POSIX termios(3) §Canonical mode ISIG is preserved: signal-generating
+// input keys (Ctrl+C, Ctrl+Z) still produce signals per ISIG=true; the
+// parser surfaces the decoded character through the same .key event
+// surface as before. The CUP placement is read-only with respect to
+// the tty discipline.
 // =============================================================================
+
+/// Sentinel value for `cursor_col` that suppresses the trailing CUP
+/// emission. Used for non-key_entry states where the cursor position
+/// is not part of the modal's layout contract.
+pub const CURSOR_SKIP: u16 = std.math.maxInt(u16);
 
 /// Emit a frame's worth of CSI cursor-position + SGR + cell bytes to
 /// `writer`. Reuses `WindowMock.diff(prev)` to compute the entry list.
 /// Lazily emits SGR per cell. Caller owns the WindowMock + prev buffer.
+///
+/// `cursor_col` / `cursor_row` are the explicit blink-cursor position
+/// (0-indexed). When `cursor_col == CURSOR_SKIP`, no trailing CUP is
+/// emitted (back-compat with states that don't track cursor). When
+/// `cursor_col != CURSOR_SKIP`, the trailing CUP fires unconditionally
+/// at (cursor_col, cursor_row) — this is the WU 0.6 contract that
+/// resolves Bug 4 (cursor previously derived from last diff cell,
+/// producing off-by-one when draft_len == 0 or when no `*` chars exist).
 pub fn emitFrame(
     writer: *std.Io.Writer,
     prev: []const @import("modal.zig").Cell,
@@ -383,7 +430,21 @@ pub fn emitFrame(
     cols: u16,
     rows: u16,
     alloc: std.mem.Allocator,
+    cursor_col: u16,
+    cursor_row: u16,
 ) !void {
+    // Tiger Style §4 — defensive precondition on the explicit cursor.
+    // The CURSOR_SKIP sentinel is allowed; any other value must be
+    // within the visible grid (0-indexed col <= cols, row < rows).
+    // cursor_col == cols is allowed because it represents "one past
+    // the last visible column" — the terminal will clamp/wrap on the
+    // next write. This matches the WU 0.5 contract that the cursor
+    // cap at long-draft edge is `prefix_len + max_visible == cols`.
+    if (cursor_col != CURSOR_SKIP) {
+        std.debug.assert(cursor_col <= cols);
+        std.debug.assert(cursor_row < rows);
+    }
+
     const modal = @import("modal.zig");
     var win: modal.WindowMock = .{
         .allocator = alloc,
@@ -393,15 +454,13 @@ pub fn emitFrame(
     };
     const diffs = try win.diff(prev);
     defer alloc.free(diffs);
-    // REQ-TIW-001 — track the last diff cell so we can place the
-    // blink cursor adjacent to it after the trailing reset. Terminal-
-    // agnostic: avoids terminal-specific DEC 2026 frozen-cursor on
-    // first frame (Kitty/VTE behavior varies per #1277 W-3).
-    var last_x: u16 = 0;
-    var last_y: u16 = 0;
+    // WU 0.6 (Bug 4): trailing CUP at the explicit cursor position
+    // (no longer derived from walking the diff back). For key_entry
+    // this is `prefix_len + min(draft_len, max_visible)` per the
+    // drawKeyEntry contract; for other states it is CURSOR_SKIP and no
+    // CUP is emitted. The diff loop below is unchanged — per-cell
+    // CUP+SGR+byte emission is still driven by the diff entries.
     for (diffs) |entry| {
-        last_x = entry.x;
-        last_y = entry.y;
         // PR 6 (terminal-control-lib-from-scratch, WU 6.3): in-tree
         // `terminal.cursor.goTo(x, y)` takes 0-indexed coords and adds
         // +1 internally (emits `CSI <y+1>;<x+1>H`). mibu took 1-indexed
@@ -419,9 +478,14 @@ pub fn emitFrame(
         try writer.writeByte(@intCast(entry.cell.ch));
     }
     try terminal.style.reset(writer, false);
-    // REQ-TIW-001 — trailing cursor position. Only fires when at least
-    // one diff entry existed (otherwise no position to land on).
-    if (diffs.len > 0) try terminal.cursor.goTo(writer, last_x, last_y);
+    // WU 0.6 (Bug 4) — trailing CUP at the explicit cursor position.
+    // Fires UNCONDITIONALLY when cursor_col != CURSOR_SKIP, regardless
+    // of whether any diff entries existed. The sentinel CURSOR_SKIP
+    // suppresses emission (preserves the back-compat behavior for the
+    // W3 diff-loop tests that don't model cursor state).
+    if (cursor_col != CURSOR_SKIP) {
+        try terminal.cursor.goTo(writer, cursor_col, cursor_row);
+    }
 }
 
 // =============================================================================
@@ -582,7 +646,25 @@ pub fn tuiThreadLoop(
             // First frame: lifecycle.prev_snapshot is null → use current
             // as both prev (full-frame emit per REQ-RW-003 S-RW-005).
             const prev = lifecycle.prev_snapshot orelse current;
-            try emitFrame(writer, prev, current, lifecycle.width, lifecycle.height, alloc);
+            // WU 0.6 (tui-ship-fast-phase0, Bug 4): pull the explicit
+            // cursor position from modal state for key_entry. drawKeyEntry
+            // writes cursor_col = prefix_len + min(draft_len, max_visible);
+            // other states leave cursor_col at 0, which emitFrame treats
+            // as the CURSOR_SKIP sentinel (no trailing CUP) only when
+            // the caller wraps the lookup. Here we route through a
+            // small helper that returns the sentinel for non-key_entry
+            // states.
+            const cursor_pos = modalCursorFromState(state);
+            try emitFrame(
+                writer,
+                prev,
+                current,
+                lifecycle.width,
+                lifecycle.height,
+                alloc,
+                cursor_pos.col,
+                cursor_pos.row,
+            );
             // ponytail: 4 KiB stdout buffer auto-flushes only on overflow,
             // so frames + cursor CSI bytes sit there until the buffer fills
             // (~4 frames of busy typing). Flush per-frame so input and
@@ -697,33 +779,56 @@ pub fn handleKeyInput(
 ) !bool {
     if (k.event == .release) return false; // REQ-TIW-008 — kitty-kb release no-op
     switch (state.*) {
-        .key_entry => |*ke| switch (k.code) {
-            .char => |c| {
-                if (ke.draft_len >= ke.draft.len) return false; // REQ-TIW-004 ceiling
-                if (c > 0x7F) return false; // REQ-TIW-004 non-ASCII
-                ke.draft[ke.draft_len] = @intCast(c);
-                ke.draft_len += 1;
-                return true;
-            },
-            .backspace => {
-                if (ke.draft_len == 0) return false; // REQ-TIW-005 empty-draft no-op
-                ke.draft_len -= 1;
-                return true;
-            },
-            .enter => {
-                // WU-2 (CAP-03): spawn worker, return ≤1ms. State
-                // transitions on submit_reply consumption, not here.
-                try @import("modal.zig").submitKeyEntryAsync(
-                    io,
-                    alloc,
-                    state,
-                    cancel_pipe,
-                    &channels.submit_reply,
-                ); // REQ-TIW-006
-                return true;
-            },
-            .esc => return false, // REQ-TIW-007 + REQ-TIW-NEG-3 — v1 no-op
-            else => return false, // REQ-TIW-009 — arrows / F-keys / tab
+        .key_entry => |*ke| {
+            // WU 1.5.1 (tui-ship-fast-phase0.5, R1+R4 fix): reject ALL
+            // input while the async validation worker is in flight.
+            // Pre-fix, keystrokes during validation appended to the
+            // draft (R1: "Enter adds extra *") and the validation
+            // spinner appeared to lag on the last char delete (R4:
+            // "1s lag on last *"). POSIX termios(3) ISIG is preserved
+            // (ISIG=true means signal-generating Ctrl+C/Z still emit
+            // signals independently of this modal handler).
+            if (ke.validating) return false;
+            switch (k.code) {
+                .char => |c| {
+                    if (ke.draft_len >= ke.draft.len) return false; // REQ-TIW-004 ceiling
+                    if (c > 0x7F) return false; // REQ-TIW-004 non-ASCII
+                    ke.draft[ke.draft_len] = @intCast(c);
+                    ke.draft_len += 1;
+                    return true;
+                },
+                .backspace => {
+                    if (ke.draft_len == 0) return false; // REQ-TIW-005 empty-draft no-op
+                    ke.draft_len -= 1;
+                    return true;
+                },
+                .enter => {
+                    // WU-2 (CAP-03): spawn worker, return ≤1ms. State
+                    // transitions on submit_reply consumption, not here.
+                    try @import("modal.zig").submitKeyEntryAsync(
+                        io,
+                        alloc,
+                        state,
+                        cancel_pipe,
+                        &channels.submit_reply,
+                    ); // REQ-TIW-006
+                    return true;
+                },
+                .esc => {
+                    // WU 1.5.3 (tui-ship-fast-phase0.5, R6): Esc clears the
+                    // draft + err_msg. Replaces the v1 no-op (REQ-TIW-NEG-3)
+                    // with a "clear all" gesture consistent with the
+                    // .unlock_prompt arm's cancelUnlock behavior. The draft
+                    // bytes are left in place; only draft_len is zeroed so
+                    // the renderer's "shown = min(draft_len, ...)" reads 0.
+                    // err_msg_len is zeroed too so the prior format-fail
+                    // message disappears on cancel.
+                    ke.draft_len = 0;
+                    ke.err_msg_len = 0;
+                    return true;
+                },
+                else => return false, // REQ-TIW-009 — arrows / F-keys / tab
+            }
         },
         .unlock_prompt => |*up| switch (k.code) {
             .char => |c| {
@@ -879,6 +984,18 @@ fn io_allocator_tui(io: std.Io) std.mem.Allocator {
     _ = io;
     if (builtin.is_test) return std.testing.allocator;
     return std.heap.page_allocator;
+}
+
+/// WU 0.6 (tui-ship-fast-phase0, Bug 4): extract the explicit cursor
+/// position from the modal state for use by emitFrame. Only key_entry
+/// carries an explicit cursor contract; other states return the
+/// CURSOR_SKIP sentinel so emitFrame skips the trailing CUP. The
+/// caller threads these through emitFrame as cursor_col / cursor_row.
+fn modalCursorFromState(state: *const @import("modal.zig").State) struct { col: u16, row: u16 } {
+    switch (state.*) {
+        .key_entry => |*ke| return .{ .col = ke.cursor_col, .row = ke.cursor_row },
+        else => return .{ .col = CURSOR_SKIP, .row = 0 },
+    }
 }
 
 // =============================================================================

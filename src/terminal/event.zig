@@ -244,6 +244,27 @@ pub const Parser = struct {
             return .timeout;
         }
 
+        // Tiger Style §4 — defensive precondition on the ring buffer state.
+        // ring_len must never exceed the ring_buf capacity (only feedBytes
+        // + readMore advance ring_len; both honour the capacity bound).
+        std.debug.assert(self.ring_len <= self.ring_buf.len);
+
+        // Tiger Style (tui-ship-fast-phase0 WU 0.2, Bugs 1+3): drain the
+        // ring buffer BEFORE polling so a multi-event payload (paste
+        // brackets, multi-key burst) surfaces across sequential next()
+        // calls without forcing the caller to spin the poll/read loop.
+        // Pre-fix: bytes that arrived via readMore (or were injected by
+        // tests via feedBytes) sat in ring_buf until poll(2) said the
+        // fd was ready again — by which time the first event had already
+        // been returned and the next ones starved. POSIX termios(3)
+        // ISIG is preserved: signal-generating input keys (Ctrl+C, Ctrl+Z)
+        // still produce signals per ISIG=true; the parser just routes the
+        // decoded character through the same .key event surface.
+        if (self.ring_len > 0) {
+            const ev = self.decode();
+            if (ev != .none) return ev;
+        }
+
         // 1) Poll for readability. On EINTR (C9), check `pending` and
         // return early — the parser does not retry the poll (the SIGWINCH
         // handler has already stored into the atomic).
@@ -484,7 +505,14 @@ pub const Parser = struct {
         // in the full kitty kb spec; out of scope for PR 4).
         var iter = std.mem.splitScalar(u8, params, ';');
         const key_str = iter.next() orelse return null;
-        const mods_str_raw = iter.next() orelse return null;
+        // WU 0.4 (tui-ship-fast-phase0): a single-segment params buffer
+        // (e.g. `CSI 13 u` with no modifier segment) is valid per the
+        // kitty kb spec — the modifier bitmask defaults to 0. Pre-fix
+        // this returned null, causing the functional-key codepoint
+        // mapping tests to fail. Empty-string fallback here means the
+        // downstream parseInt + endsWith checks produce modifier=0 and
+        // event_kind=press, which is exactly the spec behavior.
+        const mods_str_raw = iter.next() orelse "";
 
         // Parse base codepoint from "codepoint[:shifted]". Take the slice
         // BEFORE the first `:` if present — that's the base layout key.
@@ -522,8 +550,32 @@ pub const Parser = struct {
         else
             .press;
 
+        // WU 0.4 (tui-ship-fast-phase0, Bugs 2+5): map the four kitty kb
+        // functional keycodepoints to their named KeyCode variants. Per the
+        // kitty keyboard protocol spec
+        // (https://sw.kovidgoyal.net/kitty/keyboard-protocol/) the
+        // functional keycodes are exactly:
+        //     9   → Tab     (ASCII HT)
+        //     13  → Enter   (ASCII CR)
+        //     27  → Escape  (ASCII ESC)
+        //     127 → Backspace (ASCII DEL)
+        // Pre-fix every codepoint — functional or printable — was wrapped
+        // as `.char(<n>)`, forcing every TUI modal to special-case the
+        // control bytes by literal value. After fix, the four functional
+        // keys are first-class key events on the same surface as the SS3/
+        // CSI dispatcher (which already produces .enter / .tab / .esc /
+        // .backspace for the legacy sequences). Everything else stays as
+        // `.char(<n>)` — printable ASCII (32..126), CJK, emoji, etc.
+        const code: KeyCode = switch (key_code) {
+            13 => .enter,
+            127 => .backspace,
+            27 => .esc,
+            9 => .tab,
+            else => .{ .char = key_code },
+        };
+
         return Key{
-            .code = .{ .char = key_code },
+            .code = code,
             .mods = .{
                 .shift = (mods_val & 1) != 0,
                 .alt = (mods_val & 2) != 0,
