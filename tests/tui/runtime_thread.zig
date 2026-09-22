@@ -2010,6 +2010,12 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
         try testing.expect(state.key_entry.err_msg_len == 0);
     }
     // S-TIW-013: key_entry + .esc → no mutation, returns false.
+    // WU 1.5.3 (tui-ship-fast-phase0.5, R6): Esc on key_entry now clears
+    // the draft + err_msg (was REQ-TIW-NEG-3 no-op). Replace the old
+    // "returns false + draft unchanged" assertion with the new contract:
+    //   - consumed == true
+    //   - draft_len == 0 (cleared)
+    //   - err_msg_len == 0 (cleared)
     {
         var draft_buf: [256]u8 = .{0} ** 256;
         @memcpy(draft_buf[0..5], "hello");
@@ -2027,8 +2033,131 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
             null, // cancel_pipe — null for tests
             &ch,
         );
+        try testing.expect(consumed);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.err_msg_len);
+    }
+}
+
+// =============================================================================
+// WU 1.5.1 (tui-ship-fast-phase0.5, R1+R4) — validating guard in handleKeyInput.
+//
+// Root cause (Opus 4.6): handleKeyInput does NOT guard against new key
+// input while state.key_entry.validating == true. After submit, the
+// async worker thread runs a TLS handshake (~1-3s); during that window
+// any further keystrokes (chars, Enter, Backspace) silently append to
+// the draft — Enter's \r = 0x0D was rendered as `*`, and Backspace
+// deletions appeared to lag because the draw thread kept writing the
+// new draft to the screen while the validation result was about to
+// arrive.
+//
+// Fix scope: in the .key_entry arm of handleKeyInput, return false
+// UNCONDITIONALLY when ke.validating is true. This blocks char /
+// backspace / Enter / Esc uniformly. POSIX termios(3) ISIG is preserved
+// (ISIG=true means signal-generating Ctrl+C / Ctrl+Z still emit
+// signals — those keys are surfaced as .key events by the parser
+// regardless of the .validating state, but the modal handler discards
+// them per REQ-TIW-NEG-x).
+//
+// These tests assert the post-fix contract. They currently FAIL
+// (RED): pre-fix code happily appends a char / fires submit on Enter /
+// decrements draft_len on Backspace even with validating=true.
+// =============================================================================
+
+test "WU 1.5.1: handleKeyInput ignores all input while key_entry.validating=true (R1+R4)" {
+    // S-WU151-01: typing 'x' while validating → no-op, draft_len unchanged,
+    //              returns false (the draft is owned by the in-flight worker).
+    // S-WU151-02: Enter while validating → no-op, draft_len unchanged,
+    //              returns false (prevents double-submit; the original submit
+    //              already set validating=true and is still in flight).
+    // S-WU151-03: Backspace while validating → no-op, draft_len unchanged,
+    //              returns false (the in-flight worker holds the snapshot
+    //              of the draft it was validating; mutating it locally would
+    //              desync the worker from the user's intent).
+    // S-WU151-04: pre-existing contract still holds: validating=false
+    //              (the typical default) lets char / Enter / Backspace
+    //              through as before.
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..3], "abc");
+        var state: M.State = .{
+            .key_entry = .{
+                .draft = draft_buf,
+                .draft_len = 3,
+                .validating = true, // <-- the fix's predicate
+            },
+        };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .{ .char = 'x' }, .event = .press },
+            null,
+            &ch,
+        );
         try testing.expect(!consumed);
-        try testing.expectEqual(@as(usize, 5), state.key_entry.draft_len);
+        try testing.expectEqual(@as(usize, 3), state.key_entry.draft_len);
+    }
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..3], "abc");
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 3,
+            .validating = true,
+        } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .enter, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(!consumed);
+        try testing.expectEqual(@as(usize, 3), state.key_entry.draft_len);
+        try testing.expect(state.key_entry.validating);
+    }
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..3], "abc");
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 3,
+            .validating = true,
+        } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .backspace, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(!consumed);
+        try testing.expectEqual(@as(usize, 3), state.key_entry.draft_len);
+    }
+    {
+        var state: M.State = .{ .key_entry = .{} }; // validating=false (default)
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .{ .char = 'y' }, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(consumed);
+        try testing.expectEqual(@as(usize, 1), state.key_entry.draft_len);
+        try testing.expectEqual(@as(u8, 'y'), state.key_entry.draft[0]);
     }
 }
 
