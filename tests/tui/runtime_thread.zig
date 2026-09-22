@@ -2161,6 +2161,116 @@ test "WU 1.5.1: handleKeyInput ignores all input while key_entry.validating=true
     }
 }
 
+// =============================================================================
+// WU 1.5.3 (tui-ship-fast-phase0.5, R6) — Esc clears draft on key_entry.
+//
+// Root cause (Opus 4.6): REQ-TIW-NEG-3 was "Esc on key_entry is a no-op".
+// In the smoke test the user pressed Esc expecting it to clear the typed
+// draft (the universal modal-cancel UX) and saw nothing happen. The
+// design contract was a per-key no-op for v1 because clearing could be
+// done with Backspace; but the UX expectation after a typo + a rejected
+// submission is "press Esc to start over" — not "press Backspace N times".
+//
+// Fix scope: in handleKeyInput's .key_entry arm, the .esc branch zeros
+// draft_len (and err_msg_len if populated by a prior format-fail) and
+// returns true. The draft bytes themselves are left in place — the
+// rendering layer only consults draft_len, so residual bytes are
+// inert until the next char appends. Mirrors the .unlock_prompt arm's
+// cancelUnlock UX for symmetry.
+//
+// The companion assertion in T-TIW-3 / S-TIW-013 was updated in WU 1.5.1
+// to match. These dedicated tests re-assert the contract with stronger
+// coverage so a future regression to the v1 no-op behavior fails loudly.
+// =============================================================================
+
+test "WU 1.5.3: Esc on key_entry clears draft + err_msg (R6)" {
+    // S-WU153-01: draft_len=5 + err_msg populated + .esc → draft_len=0,
+    //              err_msg_len=0, returns true.
+    // S-WU153-02: draft_len=0 (empty draft) + .esc → no-op, returns true
+    //              (mirrors Backspace's "no work to undo" path; consuming
+    //              the key keeps the keypress sink consistent).
+    // S-WU153-03: draft_len=256 (full) + .esc → draft_len=0, returns
+    //              true (regression guard for the cap-not-touched path).
+    // S-WU153-04: .unlock_prompt + .esc still calls cancelUnlock (NOT
+    //              regressed by the key_entry fix — guards the v2 invariant
+    //              "two modal arms, two distinct Esc semantics").
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..5], "hello");
+        var err_buf: [128]u8 = .{0} ** 128;
+        @memcpy(err_buf[0..10], "bad format");
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 5,
+            .err_msg_buf = err_buf,
+            .err_msg_len = 10,
+        } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .esc, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(consumed);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.err_msg_len);
+    }
+    {
+        var state: M.State = .{ .key_entry = .{} };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .esc, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(consumed);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
+    }
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..256], "x" ** 256);
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 256,
+        } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .esc, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(consumed);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
+    }
+    {
+        var state: M.State = .{ .unlock_prompt = .{ .attempts = 1 } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .esc, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(consumed);
+        try testing.expect(std.meta.activeTag(state) == .key_entry);
+    }
+}
+
 test "T-TIW-4: handleKeyInput ignores .release; treats .repeat as .press (REQ-TIW-008)" {
     // REQ-TIW-008 — release early-return; repeat behaves like press.
     // S-TIW-014: .char('a') .release → no mutation, returns false.
