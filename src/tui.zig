@@ -760,33 +760,44 @@ pub fn handleKeyInput(
 ) !bool {
     if (k.event == .release) return false; // REQ-TIW-008 — kitty-kb release no-op
     switch (state.*) {
-        .key_entry => |*ke| switch (k.code) {
-            .char => |c| {
-                if (ke.draft_len >= ke.draft.len) return false; // REQ-TIW-004 ceiling
-                if (c > 0x7F) return false; // REQ-TIW-004 non-ASCII
-                ke.draft[ke.draft_len] = @intCast(c);
-                ke.draft_len += 1;
-                return true;
-            },
-            .backspace => {
-                if (ke.draft_len == 0) return false; // REQ-TIW-005 empty-draft no-op
-                ke.draft_len -= 1;
-                return true;
-            },
-            .enter => {
-                // WU-2 (CAP-03): spawn worker, return ≤1ms. State
-                // transitions on submit_reply consumption, not here.
-                try @import("modal.zig").submitKeyEntryAsync(
-                    io,
-                    alloc,
-                    state,
-                    cancel_pipe,
-                    &channels.submit_reply,
-                ); // REQ-TIW-006
-                return true;
-            },
-            .esc => return false, // REQ-TIW-007 + REQ-TIW-NEG-3 — v1 no-op
-            else => return false, // REQ-TIW-009 — arrows / F-keys / tab
+        .key_entry => |*ke| {
+            // WU 1.5.1 (tui-ship-fast-phase0.5, R1+R4 fix): reject ALL
+            // input while the async validation worker is in flight.
+            // Pre-fix, keystrokes during validation appended to the
+            // draft (R1: "Enter adds extra *") and the validation
+            // spinner appeared to lag on the last char delete (R4:
+            // "1s lag on last *"). POSIX termios(3) ISIG is preserved
+            // (ISIG=true means signal-generating Ctrl+C/Z still emit
+            // signals independently of this modal handler).
+            if (ke.validating) return false;
+            switch (k.code) {
+                .char => |c| {
+                    if (ke.draft_len >= ke.draft.len) return false; // REQ-TIW-004 ceiling
+                    if (c > 0x7F) return false; // REQ-TIW-004 non-ASCII
+                    ke.draft[ke.draft_len] = @intCast(c);
+                    ke.draft_len += 1;
+                    return true;
+                },
+                .backspace => {
+                    if (ke.draft_len == 0) return false; // REQ-TIW-005 empty-draft no-op
+                    ke.draft_len -= 1;
+                    return true;
+                },
+                .enter => {
+                    // WU-2 (CAP-03): spawn worker, return ≤1ms. State
+                    // transitions on submit_reply consumption, not here.
+                    try @import("modal.zig").submitKeyEntryAsync(
+                        io,
+                        alloc,
+                        state,
+                        cancel_pipe,
+                        &channels.submit_reply,
+                    ); // REQ-TIW-006
+                    return true;
+                },
+                .esc => return false, // REQ-TIW-007 + REQ-TIW-NEG-3 — v1 no-op
+                else => return false, // REQ-TIW-009 — arrows / F-keys / tab
+            }
         },
         .unlock_prompt => |*up| switch (k.code) {
             .char => |c| {
