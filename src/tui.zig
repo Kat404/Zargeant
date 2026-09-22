@@ -350,6 +350,18 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
     // 2. Exit alt screen + disable in-band resize.
     exitAltScreenAndResize(writer) catch {};
 
+    // 2.5 WU 1.5.4 (tui-ship-fast-phase0.5, R7): ECMA-48 terminal state
+    // restore — show cursor (DECTCEM) + SGR reset. Without these the
+    // cursor stays invisible and bold/color attributes leak into the
+    // next shell prompt (Starship, fish, etc.). Both must precede
+    // disableRawMode because DECTCEM is terminal-screen state (the
+    // kernel does not touch it on raw-mode restore) and SGR attributes
+    // are likewise terminal state, not termios state. Reference: xterm
+    // ctlseqs §"CSI Ps h" / §"SGR"; ECMA-48 §8.3.201 (DECTCEM) +
+    // §8.3.117 (SGR 0 = default rendition).
+    writer.writeAll("\x1b[?25h") catch {}; // DECTCEM show cursor
+    writer.writeAll("\x1b[0m") catch {}; // SGR reset
+
     // 3. Disable raw mode (restores original termios).
     if (lc.raw_term) |*rt| {
         rt.disableRawMode() catch {};
@@ -360,6 +372,13 @@ pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
     // dangling Parser pointer during shutdown. Symmetric with the
     // setCurrentParser call in tuiThreadInit.
     terminal.event.setCurrentParser(null);
+
+    // WU 1.5.4 (R7): final flush AFTER all teardown bytes. The L338
+    // flush at the top of shutdown runs BEFORE the DEC reset sequences;
+    // without this second flush the ~40 bytes of teardown CSI sit in
+    // the 4 KiB stdout buffer and may never reach the terminal before
+    // process exit.
+    writer.flush() catch {};
 }
 
 // =============================================================================
