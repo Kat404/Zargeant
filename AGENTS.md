@@ -161,3 +161,85 @@ Before delivering any Zig code changes, verify that:
 - [ ] All `switch` statements on enums are exhaustive (no lazy `else =>`).
 - [ ] All loops are bounded and recursion is completely avoided.
 - [ ] System clock or PRNGs are passed in as parameters rather than called directly inside logic.
+
+---
+
+## 9. Task Runner (`justfile`)
+
+The project uses [`just`](https://github.com/casey/just) as a thin wrapper over the most common Zargeant workflows (see [`justfile`](./justfile)). **Always prefer `just <recipe>` over memorized raw `zig build ...` invocations** — recipes are the discoverable surface for the whole team.
+
+### 9.1 Quick reference
+
+| Category | Recipe                    | What it does                                                                   |
+| -------- | ------------------------- | ------------------------------------------------------------------------------ |
+| Meta     | `just`                    | Default. Lists all recipes.                                                    |
+| Meta     | `just help`               | Show `just`'s CLI help.                                                        |
+| Build    | `just build`              | `zig build` — debug binary, fastest iteration.                                 |
+| Build    | `just build-safe`         | `zig build -Doptimize=ReleaseSafe` — production parity without LTO.            |
+| Build    | `just build-fast`         | `zig build -Doptimize=ReleaseFast` — fully optimized.                         |
+| Build    | `just clean`              | Wipe `.zig-cache` + `zig-out`.                                                 |
+| Run      | `just run -- <args>`      | Run production binary with forwarded args.                                     |
+| Run      | `just run-mock`           | Run with `--mock` (offline, no real HTTP).                                     |
+| Test     | `just test`               | Umbrella: all 7 individual `test-*` targets.                                   |
+| Test     | `just test-terminal`      | `src/terminal/` + `tests/terminal/` in isolation.                              |
+| Test     | `just test-tui`           | `tests/tui/terminal_smoke.zig` (public-surface compile guard).                 |
+| Test     | `just test-runtime-thread` | `tests/tui/runtime_thread.zig` (PR1+PR1.5 TUI fix coverage).                  |
+| Test     | `just test-api-client`    | `tests/api_client.zig` (REQ-NEW-003 socket guard).                             |
+| Test     | `just test-tools`         | `tools/` in-file tests.                                                        |
+| Test     | `just test-cancel-path`   | `tests/tui/cancel_path.zig` (CAP-09 wiring guard).                             |
+| Test     | `just test-cancel-e2e`    | `tests/cancel_e2e.zig` (env-gated end-to-end cancel pipe).                     |
+| Test     | `just test-embedded`      | `src/*.zig` embedded tests via standalone binary (see §9.2).                   |
+| Test     | `just test-all`           | `just test` + `just test-embedded`.                                           |
+| QA       | `just verify`             | `zig build verify` (QA 0..6, compile-first in 3 optimization modes).          |
+| QA       | `just fmt-check`          | `zig build check` (QA 0 — fmt + AST check).                                   |
+| QA       | `just fmt`                | `zig fmt src/ tests/ tools/` (auto-format in place).                          |
+| QA       | `just check-syscalls`     | QA 0.5 — REQ-NEW-003 forbidden syscall guard.                                 |
+| QA       | `just check-tdd`          | Every `src/*.zig` must have ≥ 1 `test` block.                                 |
+| QA       | `just check-coauthor`     | No `Co-Authored-By: ...AI...` lines in commits ahead of main.                  |
+| QA       | `just check`              | Umbrella: `fmt-check + check-syscalls + check-tdd + check-coauthor`.           |
+| CI       | `just ci`                 | Full local CI via Podman (Alpine + Zig 0.16.0, `--rm`, no garbage).            |
+| CI       | `just ci-fast`            | Local CI skipping the heavy build steps (static guards only).                  |
+| CI       | `just ci-rebuild`         | Local CI wiping `~/.cache/zargeant-podman-ci/` first.                          |
+| CI       | `just ci-rebuild-image`   | Local CI rebuilding the Alpine container image from scratch.                   |
+| CI       | `just ci-shell`           | Drop into the CI container shell for debugging.                               |
+| CI       | `just ci-clean`           | Wipe CI image + cache (full reset).                                            |
+| Git      | `just git-status`         | Working tree short status + ahead/behind main.                                 |
+| Git      | `just git-log`            | `git log --oneline` of commits ahead of `origin/main`.                         |
+| Helpers  | `just odd`                | List ODD feature docs in `odd/tasks/`.                                         |
+
+```bash
+just                # list all recipes (default)
+just --help         # just's own CLI help
+just -u <recipe>    # show inline docs for one recipe
+```
+
+### 9.2 Test recipe conventions — avoid `zig build test`
+
+The test recipes **deliberately do not** invoke the umbrella `zig build test` target. Zig 0.16.0 has a reproducible hang in `std.zig.Server`'s `--listen=-` IPC protocol on non-CI environments (agent shell without TTY, Podman containers): the child test binary exits cleanly after `cancel_e2e` CAP-09 passes, but the parent `zig` process never receives the completion message and waits indefinitely.
+
+Workarounds attempted (all reproduced the hang):
+
+- Disabling `cancel_e2e` via `ZARGEANT_RUN_TUI_CANCEL_E2E=0` — still hangs.
+- Forcing a TTY allocation (`podman run -t`) — still hangs.
+- Running the cached test binary directly in standalone mode — separate hang location.
+
+**Decision**: each `test-*` recipe invokes a single `zig build test-<name>` target (compiled into one binary that runs independently). The ~197 `src/*.zig` embedded tests not covered by any individual target are deferred to GitHub Actions CI when minutes are available; `just test-embedded` includes a best-effort workaround for local coverage.
+
+### 9.3 Local CI container (Podman, Alpine)
+
+The `ci*` recipes wrap [`tools/local-ci.sh`](./tools/local-ci.sh), which orchestrates a one-shot Podman container built from [`tools/zargeant-ci.Containerfile`](./tools/zargeant-ci.Containerfile).
+
+| Property        | Value                                                                  |
+| --------------- | ---------------------------------------------------------------------- |
+| Base image      | `docker.io/library/alpine:3.20` (musl libc, ~8 MB)                    |
+| Runtime stack   | Zig 0.16.0 (glibc-linked) + `git` + `curl` + `bash` + `gcompat`        |
+| `gcompat`       | Glibc compat layer required because Zig's x86_64-linux tarball is glibc-linked; bridges it onto musl. |
+| Container flags | `--rm` on every invocation → zero leftover containers                  |
+| Cache           | `~/.cache/zargeant-podman-ci/` (persistent `.zig-cache` between runs) |
+| Image tag       | `localhost/zargeant-ci:latest` (398 MB, baked once, reused across runs) |
+| Build context   | Project root (so `zig build` can find `src/`, `build.zig`, etc.)       |
+
+### 9.4 When adding new workflows
+
+Prefer a new recipe in [`justfile`](./justfile) over memorizing a long raw command. Keep the recipe name + one-line description as the discoverable surface; if a recipe has non-obvious behavior (timeouts, env vars, workarounds), add a short comment block immediately above it.
+
