@@ -2526,3 +2526,118 @@ test "WU 0.5: drawKeyEntry caps cursor at the visible-window right edge on long 
     // prefix=15, max_visible=65, cursor_col=80 (0-indexed) → col=81 (1-indexed).
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;81H") != null);
 }
+
+// =============================================================================
+// WU 1.5.2 (tui-ship-fast-phase0.5, R3) — spinner bounds check in drawKeyEntry.
+//
+// Root cause (Opus 4.6): the validation spinner (a single `|` glyph with
+// bold style) is rendered at `spinner_x = "Enter API key: ".len + shown`.
+// The bounds check uses `win.cells.len` (which is `cols * rows`). When
+// `spinner_x == cols` — i.e. the spinner would land ONE COLUMN PAST the
+// last visible column of row 0 — the check `spinner_x < cells.len` is
+// STILL TRUE (cells.len is far larger), so the `|` glyph is written into
+// the first cell of row 1. The user perceives this as a stray `|`
+// appearing at column 0 of row 1, which looks like a misplaced scroll
+// indicator (it is not — it's the validation spinner).
+//
+// Fix scope: cap the bounds check at `win.size().cols` (NOT cells.len).
+// When `spinner_x == cols`, the `|` is suppressed entirely (the spinner
+// only renders on row 0; row 1 has no other key_entry content).
+//
+// These tests assert the post-fix contract. They currently FAIL (RED):
+// pre-fix code writes the `|` at cells[cols] when the prompt overflows.
+// =============================================================================
+
+test "WU 1.5.2: drawKeyEntry spinner does NOT render at row 1 when draft saturates visible window (R3)" {
+    // S-WU152-01: cols=27 (narrow), draft_len=12 (max visible for that
+    //              width: cols - "Enter API key: ".len = 27 - 15 = 12),
+    //              validating=true. spinner_x = 15 + 12 = 27 = cols.
+    //              Pre-fix: cells[27] (row 1, col 0) is `|` with bold.
+    //              Post-fix: cells[27] is the default space (no write).
+    // S-WU152-02: cols=27, draft_len=12, validating=FALSE → no spinner
+    //              at all (baseline). cells[27] stays space.
+    // S-WU152-03: cols=80 (typical), draft_len=65 (max visible), validating=true.
+    //              spinner_x = 15 + 65 = 80 = cols. Pre-fix writes `|` at
+    //              cells[80] (row 1, col 0). Post-fix suppresses.
+    // S-WU152-04: cols=80, draft_len=10 (NOT at edge), validating=true →
+    //              spinner_x = 25 < cols. The spinner DOES render at
+    //              cells[25] (still row 0). Regression guard for the fix
+    //              not over-suppressing the normal case.
+    {
+        const cols: u16 = 27;
+        const rows: u16 = 10;
+        var win = try M.WindowMock.init(testing.allocator, cols, rows);
+        defer win.deinit();
+
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..12], "abcdefghijkl");
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 12,
+            .validating = true,
+        } };
+        try M.drawKeyEntry(win, &state);
+
+        // Tiger Style: cells[cols] is the FIRST cell of row 1. The bug
+        // writes `|` there; the fix suppresses it.
+        try testing.expect(win.cells[cols].ch != '|');
+        try testing.expect(win.cells[cols].style.bold == false);
+    }
+    {
+        const cols: u16 = 27;
+        const rows: u16 = 10;
+        var win = try M.WindowMock.init(testing.allocator, cols, rows);
+        defer win.deinit();
+
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..12], "abcdefghijkl");
+        var state: M.State = .{
+            .key_entry = .{
+                .draft = draft_buf,
+                .draft_len = 12,
+                // validating=false (default)
+            },
+        };
+        try M.drawKeyEntry(win, &state);
+
+        try testing.expect(win.cells[cols].ch != '|');
+    }
+    {
+        const cols: u16 = 80;
+        const rows: u16 = 24;
+        var win = try M.WindowMock.init(testing.allocator, cols, rows);
+        defer win.deinit();
+
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..65], "x" ** 65);
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 65,
+            .validating = true,
+        } };
+        try M.drawKeyEntry(win, &state);
+
+        try testing.expect(win.cells[cols].ch != '|');
+    }
+    {
+        const cols: u16 = 80;
+        const rows: u16 = 24;
+        var win = try M.WindowMock.init(testing.allocator, cols, rows);
+        defer win.deinit();
+
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..10], "abcdefghij");
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 10,
+            .validating = true,
+        } };
+        try M.drawKeyEntry(win, &state);
+
+        // Regression guard: spinner DOES render at the expected position
+        // when there is room (spinner_x = 15 + 10 = 25 < cols).
+        const spinner_x: usize = "Enter API key: ".len + 10;
+        try testing.expect(win.cells[spinner_x].ch == '|');
+        try testing.expect(win.cells[spinner_x].style.bold);
+    }
+}
