@@ -45,6 +45,13 @@ const ModalState = modal_ns.State;
 // active State variant to the corresponding render*ToGrid fn. Same
 // import pattern as the per-fn imports above.
 const renderToGrid = modal_ns.renderToGrid;
+// tui-ship-fast-phase2 (T-2.4.1) — WindowMock adapter wrapping *ScreenGrid.
+// Required by T-SG-8 (tests/tui/runtime_thread.zig:1618 preserves the
+// WindowMock + 5 draw fns literals). The adapter's 10-method surface
+// forwards calls to a ScreenGrid; the existing modal.zig in-file tests
+// at lines 1197-1614 must pass unchanged.
+const WindowMock = modal_ns.WindowMock;
+const ModalCell = modal_ns.Cell;
 
 // REQ-TUI-001: ScreenGrid struct shape + invariants
 // TDD RED: these tests fail because src/screen_grid.zig doesn't exist.
@@ -1319,6 +1326,171 @@ test "renderToGrid dispatches by State variant (T-2.3.3)" {
     //         Compile-time symbol existence — passes even in RED
     //         because the stub fn is declared (just panics at runtime).
     try testing.expect(@hasDecl(modal_ns, "renderToGrid"));
+}
+
+// tui-ship-fast-phase2 (T-2.4.1) — WindowMock adapter forwards 10 methods.
+// Each sub-case exercises one adapter method against a freshly-init'd
+// WindowMock + ScreenGrid. The adapter's contract (per design §3.4 +
+// spec REQ-TUI-007/008) is: 10 methods, signature unchanged from the
+// legacy heap-owned impl, body delegates to ScreenGrid. Sub-case 11
+// is a compile-time @hasDecl guard.
+test "WindowMock adapter forwards 10 methods (T-2.4.1)" {
+    // Case 1: init returns a valid adapter. Fields set per spec.
+    {
+        const win = try WindowMock.init(testing.allocator, 20, 10);
+        defer win.deinit();
+        try testing.expectEqual(@as(u16, 20), win.cols);
+        try testing.expectEqual(@as(u16, 10), win.rows);
+        try testing.expect(!win.cursor_hidden);
+        try testing.expect(!win.in_alt_screen);
+    }
+
+    // Case 2: clear() delegates to ScreenGrid.clear (all spaces).
+    {
+        const win = try WindowMock.init(testing.allocator, 20, 10);
+        defer win.deinit();
+        // Stain the grid with 'X' chars, then clear.
+        for (0..200) |i| {
+            const c: u16 = @intCast(i % 20);
+            const r: u16 = @intCast(i / 20);
+            _ = win.grid.writeCell(c, r, 'X', .{});
+        }
+        win.clear();
+        const active = win.grid.active();
+        for (active) |cell| {
+            try testing.expectEqual(@as(u21, ' '), cell.ch);
+        }
+    }
+
+    // Case 3: print writes ASCII chars at positions 0..len. Legacy
+    // fragment-overwrite behavior preserved (each call starts at col=0).
+    {
+        const win = try WindowMock.init(testing.allocator, 20, 10);
+        defer win.deinit();
+        try win.print("hello", .{});
+        const active = win.grid.active();
+        try testing.expectEqual(@as(u21, 'h'), active[0].ch);
+        try testing.expectEqual(@as(u21, 'e'), active[1].ch);
+        try testing.expectEqual(@as(u21, 'l'), active[2].ch);
+        try testing.expectEqual(@as(u21, 'l'), active[3].ch);
+        try testing.expectEqual(@as(u21, 'o'), active[4].ch);
+        try testing.expectEqual(@as(u21, ' '), active[5].ch);
+
+        // Second call overwrites positions 0..2 with "ABC" (legacy
+        // fragment-overwrite). Positions 3..4 stay 'l','o'.
+        try win.print("ABC", .{});
+        try testing.expectEqual(@as(u21, 'A'), active[0].ch);
+        try testing.expectEqual(@as(u21, 'B'), active[1].ch);
+        try testing.expectEqual(@as(u21, 'C'), active[2].ch);
+        try testing.expectEqual(@as(u21, 'l'), active[3].ch);
+        try testing.expectEqual(@as(u21, 'o'), active[4].ch);
+    }
+
+    // Case 4: print handles multi-byte UTF-8 atomically. € (U+20AC,
+    // 3-byte UTF-8) must land in ONE cell with ch=0x20AC, NOT three
+    // single-byte cells with ch=0xE2/0x82/0xAC. The legacy byte-
+    // iter impl fragmented multi-byte UTF-8; the new Utf8View-based
+    // impl fixes it.
+    {
+        const win = try WindowMock.init(testing.allocator, 20, 10);
+        defer win.deinit();
+        try win.print("€", .{});
+        const active = win.grid.active();
+        // Find the cell with ch=0x20AC (€).
+        var found_euro: usize = 0;
+        for (active) |cell| {
+            if (cell.ch == 0x20AC) found_euro += 1;
+        }
+        try testing.expectEqual(@as(usize, 1), found_euro);
+        // Negative: NO cell with the low byte 0xAC alone (fragmented
+        // multi-byte would produce three such cells).
+        var found_frag: usize = 0;
+        for (active) |cell| {
+            if (cell.ch == 0xAC) found_frag += 1;
+        }
+        try testing.expectEqual(@as(usize, 0), found_frag);
+    }
+
+    // Case 5: print with style.bold true preserves the style flag.
+    {
+        const win = try WindowMock.init(testing.allocator, 20, 10);
+        defer win.deinit();
+        try win.print("X", .{ .bold = true });
+        const active = win.grid.active();
+        try testing.expect(active[0].style.bold);
+    }
+
+    // Case 6: hideCursor / showCursor toggles the local cursor_hidden flag.
+    {
+        const win = try WindowMock.init(testing.allocator, 20, 10);
+        defer win.deinit();
+        try testing.expect(!win.cursor_hidden);
+        win.hideCursor();
+        try testing.expect(win.cursor_hidden);
+        win.showCursor();
+        try testing.expect(!win.cursor_hidden);
+    }
+
+    // Case 7: enterAlternateScreen / exitAlternateScreen toggles
+    // the local in_alt_screen flag.
+    {
+        const win = try WindowMock.init(testing.allocator, 20, 10);
+        defer win.deinit();
+        try testing.expect(!win.in_alt_screen);
+        win.enterAlternateScreen();
+        try testing.expect(win.in_alt_screen);
+        win.exitAlternateScreen();
+        try testing.expect(!win.in_alt_screen);
+    }
+
+    // Case 8: snapshot returns the active grid (len == cols*rows).
+    {
+        const win = try WindowMock.init(testing.allocator, 20, 10);
+        defer win.deinit();
+        try testing.expectEqual(@as(usize, 200), win.snapshot().len);
+        // Every cell is a space (freshly init'd).
+        for (win.snapshot()) |cell| {
+            try testing.expectEqual(@as(u21, ' '), cell.ch);
+        }
+    }
+
+    // Case 9: diff returns entries for changed cells. Write a cell via
+    // grid.writeCell (bypassing print) then diff against an all-space
+    // prev. Expect 1 entry at the changed position.
+    {
+        const win = try WindowMock.init(testing.allocator, 20, 10);
+        defer win.deinit();
+
+        _ = win.grid.writeCell(5, 3, 'X', .{ .bold = true });
+
+        // Allocate an all-space prev slice using modal.Cell (matches
+        // diff's parameter type). screen_grid.Cell and modal.Cell are
+        // byte-identical structs, but Zig treats them as distinct
+        // types — allocate with the modal type to avoid a cast.
+        const prev = try testing.allocator.alloc(ModalCell, 200);
+        defer testing.allocator.free(prev);
+        for (prev) |*c| c.* = .{ .ch = ' ', .style = .{} };
+
+        const entries = try win.diff(prev);
+        defer testing.allocator.free(entries);
+
+        try testing.expectEqual(@as(usize, 1), entries.len);
+        try testing.expectEqual(@as(u16, 5), entries[0].x);
+        try testing.expectEqual(@as(u16, 3), entries[0].y);
+        try testing.expectEqual(@as(u21, 'X'), entries[0].cell.ch);
+        try testing.expect(entries[0].cell.style.bold);
+    }
+
+    // Case 10: deinit is safe to call (testing.allocator catches leaks).
+    {
+        const win = try WindowMock.init(testing.allocator, 20, 10);
+        win.deinit();
+        // No panic, no leak (testing.allocator assertion on shutdown).
+    }
+
+    // Case 11: @hasDecl compile-time symbol guards.
+    try testing.expect(@hasDecl(modal_ns, "WindowMock"));
+    try testing.expect(@hasDecl(WindowMock, "init"));
 }
 
 // Local helper: copy a literal into the inline message/err buffer.

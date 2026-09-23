@@ -79,34 +79,77 @@ pub const TermSize = struct {
 // draw fns write into. Tests assert via snapshot() + diff(prev, current).
 // =============================================================================
 
+/// WindowMock adapter wrapping ScreenGrid (T-2.4.1 RED skeleton).
+///
+/// T-2.4.1 (tui-ship-fast-phase2, design §3.4 / spec REQ-TUI-007/008):
+/// refactor `WindowMock` from a heap-allocated cell-owner into a thin
+/// adapter that wraps `*ScreenGrid`. The 10-method public surface
+/// stays byte-for-byte unchanged per T-SG-8 (the static-grep guard
+/// at tests/tui/runtime_thread.zig:1618 preserves these literals in
+/// src/modal.zig). The implementation in this RED commit is a
+/// skeleton: the 6 commonly-used methods (init/deinit/clear/size/
+/// print/snapshot/diff) are wired through to ScreenGrid; the 4
+/// alt-screen + cursor toggles are `@panic` stubs that the GREEN
+/// commit will replace with their real impls.
+///
+/// NOTE on `cells`: design §3.4 specifies a 6-field shape, but the
+/// existing 5 draw fns (drawKeyEntry, drawUnlock, drawConsentPrompt,
+/// drawErrorModal, drawAgentLoopView) reference `win.cells[i]` as a
+/// mutable slice. To preserve those fns verbatim (T-SG-8 forbids
+/// modification), `cells` is added as a 7th field — a view into
+/// `grid.cells[active_idx][0..cols*rows]`. Writes through `win.cells`
+/// propagate to the active grid buffer.
 pub const WindowMock = struct {
+    grid: *ScreenGrid,
     allocator: std.mem.Allocator,
     cols: u16,
     rows: u16,
-    cells: []Cell,
     cursor_hidden: bool = false,
     in_alt_screen: bool = false,
+    // View into grid.cells[active_idx][0..cols*rows]. NOT separately
+    // heap-allocated; never freed by deinit. Stable for the lifetime
+    // of the WindowMock (the grid is owned by this struct and outlives
+    // every draw fn call — submitFrame's `grid.swap()` happens after
+    // drawModal returns).
+    cells: []Cell,
 
-    /// Allocate a WindowMock with the given dimensions. The cell grid is
-    /// zero-initialised (every cell is a space with empty style).
+    /// Allocate a WindowMock with the given dimensions. The cell grid
+    /// is owned by the adapter (heap-allocated `*ScreenGrid`, zero-
+    /// initialised by `ScreenGrid.init`). The `cells` slice aliases
+    /// the active grid buffer for backward-compat with the 5 draw fns.
     pub fn init(allocator: std.mem.Allocator, cols: u16, rows: u16) !*WindowMock {
         const self = try allocator.create(WindowMock);
         errdefer allocator.destroy(self);
+
+        const grid_ptr = try allocator.create(ScreenGrid);
+        errdefer allocator.destroy(grid_ptr);
+        grid_ptr.* = try ScreenGrid.init(cols, rows);
+
         const n: usize = @as(usize, cols) * @as(usize, rows);
-        const cells = try allocator.alloc(Cell, n);
-        @memset(cells, .{ .ch = ' ', .style = .{} });
+        // @ptrCast: grid_ptr.cells[active_idx][0..n] is []screen_grid.Cell;
+        // the struct fields are byte-identical to modal.Cell (same size
+        // and alignment), but Zig treats them as distinct types so the
+        // cells field assignment needs an explicit cast.
+        const cells_view: []Cell = @ptrCast(grid_ptr.cells[grid_ptr.active_idx][0..n]);
         self.* = .{
+            .grid = grid_ptr,
             .allocator = allocator,
             .cols = cols,
             .rows = rows,
-            .cells = cells,
+            .cursor_hidden = false,
+            .in_alt_screen = false,
+            .cells = cells_view,
         };
         return self;
     }
 
-    /// Free the cell grid + the WindowMock itself. Idempotent.
+    /// Free the WindowMock + its owned `*ScreenGrid`. Idempotent
+    /// (matches the legacy contract). The ScreenGrid `deinit` is a
+    /// no-op (the inline `[2][MAX_CELL_BUF]Cell` storage needs no
+    /// explicit release), but we call it for API symmetry.
     pub fn deinit(self: *WindowMock) void {
-        self.allocator.free(self.cells);
+        self.grid.deinit(self.allocator);
+        self.allocator.destroy(self.grid);
         self.allocator.destroy(self);
     }
 
@@ -115,63 +158,125 @@ pub const WindowMock = struct {
         return .{ .cols = self.cols, .rows = self.rows };
     }
 
-    /// Reset every cell to a space.
+    /// Reset every cell in the active grid to a space.
     pub fn clear(self: *WindowMock) void {
-        @memset(self.cells, .{ .ch = ' ', .style = .{} });
+        self.grid.clear();
     }
 
-    /// Print `text` with `style` starting at (0,0), advancing linearly.
-    /// Text longer than `cols` is truncated; empty text is a no-op.
-    /// The cursor stays at (text.len, 0) on the same line for callers
-    /// that want to chain prints.
+    /// Print `text` with `style` starting at (col=0, row=0), advancing
+    /// linearly with wrapping at `cols`. Each codepoint is written via
+    /// `grid.writeCell(col, row, cp, style)`. The legacy fragment-
+    /// overwriting behavior is preserved (each call starts at col=0,
+    /// so multi-call layered rendering — as in drawConsentPrompt — sees
+    /// each fragment's chars overwrite the previous at the same offset).
+    ///
+    /// Multi-byte UTF-8 is parsed via `Utf8View` so each codepoint
+    /// lands in ONE cell (fixing the legacy byte-fragmentation bug
+    /// that drawErrorModal's em-dash hint hit).
     pub fn print(self: *WindowMock, text: []const u8, style: Style) !void {
         if (self.cols == 0 or self.rows == 0) return;
-        const max: usize = @min(text.len, self.cols);
-        for (text[0..max], 0..) |c, i| {
-            self.cells[i] = .{ .ch = c, .style = style };
+        if (text.len == 0) return;
+
+        var col: u16 = 0;
+        var row: u16 = 0;
+
+        var view = std.unicode.Utf8View.init(text) catch {
+            // Invalid UTF-8 — byte-iterate as a defensive fallback.
+            for (text) |c| {
+                _ = self.grid.writeCell(col, row, c, .{
+                    .bold = style.bold,
+                    .underline = style.underline,
+                    .reverse = style.reverse,
+                });
+                col += 1;
+                if (col >= self.cols) {
+                    col = 0;
+                    row += 1;
+                    if (row >= self.rows) return;
+                }
+            }
+            return;
+        };
+        var iter = view.iterator();
+        while (iter.nextCodepoint()) |cp| {
+            _ = self.grid.writeCell(col, row, cp, .{
+                .bold = style.bold,
+                .underline = style.underline,
+                .reverse = style.reverse,
+            });
+            col += 1;
+            if (col >= self.cols) {
+                col = 0;
+                row += 1;
+                if (row >= self.rows) return;
+            }
         }
     }
 
     /// Hide the cursor. The mock flips the flag so tests can assert.
+    /// T-2.4.1 RED skeleton: implementation deferred to the GREEN commit.
     pub fn hideCursor(self: *WindowMock) void {
-        self.cursor_hidden = true;
+        _ = self;
+        @panic("SkeletonNotImplemented: WindowMock adapter");
     }
 
-    /// Show the cursor.
+    /// Show the cursor. T-2.4.1 RED skeleton: deferred to GREEN.
     pub fn showCursor(self: *WindowMock) void {
-        self.cursor_hidden = false;
+        _ = self;
+        @panic("SkeletonNotImplemented: WindowMock adapter");
     }
 
-    /// Switch to the alternate screen buffer.
+    /// Switch to the alternate screen buffer. T-2.4.1 RED skeleton: deferred to GREEN.
     pub fn enterAlternateScreen(self: *WindowMock) void {
-        self.in_alt_screen = true;
+        _ = self;
+        @panic("SkeletonNotImplemented: WindowMock adapter");
     }
 
-    /// Return to the primary screen buffer.
+    /// Return to the primary screen buffer. T-2.4.1 RED skeleton: deferred to GREEN.
     pub fn exitAlternateScreen(self: *WindowMock) void {
-        self.in_alt_screen = false;
+        _ = self;
+        @panic("SkeletonNotImplemented: WindowMock adapter");
     }
 
-    /// Return the current cell grid. The slice is owned by the WindowMock
-    /// (caller must NOT free). Cheap — no copy.
-    pub fn snapshot(self: *WindowMock) []Cell {
-        return self.cells;
+    /// Return the active grid as a const slice (cheap, no copy).
+    /// Aliases `ScreenGrid.active()` — the underlying memory is the
+    /// same as `self.cells`. The return type is the screen_grid.Cell
+    /// element type (byte-identical to modal.Cell — callers can read
+    /// `.ch` / `.style` identically).
+    pub fn snapshot(self: *WindowMock) []const screen_grid_mod.Cell {
+        return self.grid.active();
     }
 
     /// Return a fresh slice of `DiffEntry` covering cells that differ
-    /// between `prev` and the current grid. Allocates; caller frees.
-    /// Two cells with the same char and style flags compare equal.
+    /// between `prev` and the current active grid. Allocates via the
+    /// adapter's allocator; caller frees. Two cells with the same
+    /// char and style flags compare equal. Cell types are byte-
+    /// identical between `modal.Cell` and `screen_grid.Cell`; we
+    /// copy fields out of `grid.active()` into `modal.Cell` (since
+    /// Zig treats the two structs as distinct types).
     pub fn diff(self: *WindowMock, prev: []const Cell) ![]DiffEntry {
+        const active = self.grid.active();
         var entries: std.ArrayList(DiffEntry) = .empty;
         defer entries.deinit(self.allocator);
-        const limit: usize = @min(prev.len, self.cells.len);
-        for (self.cells[0..limit], 0..) |cell, i| {
+        const limit: usize = @min(prev.len, active.len);
+        for (active[0..limit], 0..) |cell, i| {
             const prev_cell = if (i < prev.len) prev[i] else Cell{ .ch = 0, .style = .{} };
-            if (cell.ch != prev_cell.ch or !std.meta.eql(cell.style, prev_cell.style)) {
+            if (cell.ch != prev_cell.ch or
+                cell.style.bold != prev_cell.style.bold or
+                cell.style.underline != prev_cell.style.underline or
+                cell.style.reverse != prev_cell.style.reverse)
+            {
                 try entries.append(self.allocator, .{
                     .x = @intCast(i % @as(usize, self.cols)),
                     .y = @intCast(i / @as(usize, self.cols)),
-                    .cell = cell,
+                    .cell = .{
+                        .ch = cell.ch,
+                        .style = .{
+                            .bold = cell.style.bold,
+                            .underline = cell.style.underline,
+                            .reverse = cell.style.reverse,
+                        },
+                    },
                 });
             }
         }
