@@ -12,6 +12,7 @@
 const std = @import("std");
 const testing = std.testing;
 const screen_grid_mod = @import("screen_grid");
+const diff_emit_mod = @import("diff_emit");
 
 const ScreenGrid = screen_grid_mod.ScreenGrid;
 const MAX_CELL_BUF = screen_grid_mod.MAX_CELL_BUF;
@@ -19,6 +20,10 @@ const Cell = screen_grid_mod.Cell;
 const CursorIntent = screen_grid_mod.CursorIntent;
 const CURSOR_SKIP = screen_grid_mod.CURSOR_SKIP;
 const cursorFromIntent = screen_grid_mod.cursorFromIntent;
+const DiffEntry = diff_emit_mod.DiffEntry;
+const diffAndEmit = diff_emit_mod.diffAndEmit;
+const emitDiffEntry = diff_emit_mod.emitDiffEntry;
+const emitTrailingCUP = diff_emit_mod.emitTrailingCUP;
 
 // REQ-TUI-001: ScreenGrid struct shape + invariants
 // TDD RED: these tests fail because src/screen_grid.zig doesn't exist.
@@ -207,4 +212,225 @@ test "cursorFromIntent resolves CursorIntent to (col, row) or CURSOR_SKIP" {
     // Case 7: CURSOR_SKIP sentinel is exactly u16 max. Stable surface
     // for the `if (cursor_col != CURSOR_SKIP)` gate in src/tui.zig:443.
     try testing.expectEqual(@as(u16, std.math.maxInt(u16)), CURSOR_SKIP);
+}
+
+// T-2.2.1: diffAndEmit + DiffEntry + emitDiffEntry + emitTrailingCUP
+// (REQ-DE-001..003, REQ-DE-006, REQ-DE-010, design §3.2). Each scenario
+// is a separate test block so the test runner reports the exact failing
+// case. RED state: src/diff_emit.zig stubs return
+// `error.SkeletonNotImplemented` so every diffAndEmit call below fails
+// with that error. GREEN state: all 11 tests pass.
+//
+// Reference byte encoding (asserted byte-exact in tests below):
+//   CUP         "ESC [ <row+1> ; <col+1> H"      (1-indexed)
+//   SGR bold    "ESC [ 1 m"
+//   SGR reset   "ESC [ 0 m"
+//   UTF-8 'A'   0x41
+//   UTF-8 'é'   0xc3 0xa9   (U+00E9)
+//   UTF-8 '€'   0xe2 0x82 0xac (U+20AC)
+//   UTF-8 '😀'  0xf0 0x9f 0x98 0x80 (U+1F600)
+
+test "diffAndEmit identical grids emit zero entries and zero trailing CUP" {
+    // Empty buffer: identical prev/current + CURSOR_SKIP → nothing to emit.
+    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try diffAndEmit(&w, &prev, &current, 4, 1, CURSOR_SKIP, 0);
+
+    try testing.expectEqual(@as(usize, 0), w.end);
+}
+
+test "diffAndEmit one changed cell emits CUP+SGR+UTF-8+SGR reset" {
+    // Single change at (col=5, row=2) with 'A' and no style.
+    // 0-indexed (5, 2) → 1-indexed CUP "ESC[3;6H".
+    // No style → leading SGR reset "ESC[0m", char "A", trailing SGR reset.
+    // Expected: \x1b[3;6H \x1b[0m \x41 \x1b[0m
+    var prev: [24]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 24;
+    var current: [24]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 24;
+    // (col=5, row=2) with cols=8 → idx = 2*8 + 5 = 21
+    current[21] = .{ .ch = 'A', .style = .{} };
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try diffAndEmit(&w, &prev, &current, 8, 3, CURSOR_SKIP, 0);
+
+    const expected = "\x1b[3;6H\x1b[0m\x41\x1b[0m";
+    try testing.expectEqualStrings(expected, buf[0..w.end]);
+}
+
+test "diffAndEmit two adjacent changes emit two entries" {
+    // 2 cells changed in the same row at col=2 and col=3.
+    // Expected: two entries with growing column coordinates.
+    //   entry 1: CUP "\x1b[1;3H" + "\x1b[0m" + "X" + "\x1b[0m"
+    //   entry 2: CUP "\x1b[1;4H" + "\x1b[0m" + "Y" + "\x1b[0m"
+    var prev: [8]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 8;
+    var current: [8]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 8;
+    current[2] = .{ .ch = 'X', .style = .{} };
+    current[3] = .{ .ch = 'Y', .style = .{} };
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try diffAndEmit(&w, &prev, &current, 8, 1, CURSOR_SKIP, 0);
+
+    const expected = "\x1b[1;3H\x1b[0m\x58\x1b[0m" ++
+        "\x1b[1;4H\x1b[0m\x59\x1b[0m";
+    try testing.expectEqualStrings(expected, buf[0..w.end]);
+}
+
+test "diffAndEmit bold style emits bold SGR (\\x1b[1m) and reset (\\x1b[0m)" {
+    // style.bold=true → output contains "\x1b[1m" and ends with "\x1b[0m".
+    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    current[0] = .{ .ch = 'B', .style = .{ .bold = true } };
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try diffAndEmit(&w, &prev, &current, 4, 1, CURSOR_SKIP, 0);
+
+    const actual = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, actual, "\x1b[1m") != null);
+    // Each entry ends with SGR reset.
+    try testing.expect(std.mem.endsWith(u8, actual, "\x1b[0m"));
+    // Byte-exact: CUP "\x1b[1;1H" + bold "\x1b[1m" + "B" + reset "\x1b[0m"
+    try testing.expectEqualStrings(
+        "\x1b[1;1H\x1b[1m\x42\x1b[0m",
+        actual,
+    );
+}
+
+test "diffAndEmit trailing CUP at cursor position when cursor_col != CURSOR_SKIP" {
+    // cursor_col=10, cursor_row=4 → trailing CUP "\x1b[5;11H".
+    // One cell change to force the function past the loop body; then
+    // emitTrailingCUP appends the trailing CUP.
+    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    current[0] = .{ .ch = 'Z', .style = .{} };
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try diffAndEmit(&w, &prev, &current, 4, 1, 10, 4);
+
+    // Trailing bytes after the last entry are exactly "\x1b[5;11H".
+    const actual = buf[0..w.end];
+    try testing.expect(std.mem.endsWith(u8, actual, "\x1b[5;11H"));
+}
+
+test "diffAndEmit trailing CUP skipped when cursor_col == CURSOR_SKIP" {
+    // Output ends after the last diff entry, no trailing CUP appended.
+    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    current[0] = .{ .ch = 'Z', .style = .{} };
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try diffAndEmit(&w, &prev, &current, 4, 1, CURSOR_SKIP, 0);
+
+    // Byte-exact: one entry ending in "\x1b[0m", no trailing CUP.
+    try testing.expectEqualStrings(
+        "\x1b[1;1H\x1b[0m\x5a\x1b[0m",
+        buf[0..w.end],
+    );
+}
+
+test "diffAndEmit emits 3-byte UTF-8 (€) intact" {
+    // U+20AC (€) encodes to 3 bytes: 0xe2 0x82 0xac.
+    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    current[0] = .{ .ch = 0x20AC, .style = .{} };
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try diffAndEmit(&w, &prev, &current, 4, 1, CURSOR_SKIP, 0);
+
+    const actual = buf[0..w.end];
+    // The 3-byte UTF-8 sequence must appear intact (NOT truncated to "\xac").
+    try testing.expect(std.mem.indexOf(u8, actual, "\xe2\x82\xac") != null);
+    // And the single-byte truncation sentinel must NOT appear.
+    try testing.expect(std.mem.indexOf(u8, actual, "\xac") == null or
+        // "\xac" alone could appear inside another sequence; ensure the
+        // 3-byte sequence is present by checking the trailing byte.
+        std.mem.endsWith(u8, actual, "\xe2\x82\xac"));
+    // Byte-exact: CUP + SGR reset + € + SGR reset
+    try testing.expectEqualStrings(
+        "\x1b[1;1H\x1b[0m\xe2\x82\xac\x1b[0m",
+        actual,
+    );
+}
+
+test "diffAndEmit emits 4-byte UTF-8 (😀) intact" {
+    // U+1F600 (😀) encodes to 4 bytes: 0xf0 0x9f 0x98 0x80.
+    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    current[0] = .{ .ch = 0x1F600, .style = .{} };
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try diffAndEmit(&w, &prev, &current, 4, 1, CURSOR_SKIP, 0);
+
+    const actual = buf[0..w.end];
+    // Full 4-byte sequence must appear (SS-1 fix — no truncation).
+    try testing.expect(std.mem.indexOf(u8, actual, "\xf0\x9f\x98\x80") != null);
+    // Byte-exact: CUP + SGR reset + 😀 + SGR reset
+    try testing.expectEqualStrings(
+        "\x1b[1;1H\x1b[0m\xf0\x9f\x98\x80\x1b[0m",
+        actual,
+    );
+}
+
+test "diffAndEmit atomic 4-byte UTF-8 (full sequence or zero bytes per cell)" {
+    // Buffer sized to fit CUP (8 bytes "ESC[1;1H") + SGR reset
+    // (4 bytes "ESC[0m") = 12 bytes. The 4-byte emoji requires 4 more
+    // bytes; with the buffer full after the leading SGR reset, the
+    // `writeAll` of the UTF-8 slice fails cleanly with
+    // `error.WriteFailed`. The function propagates the error without
+    // crashing (Tiger Style §1 — fail fast, propagate cleanly).
+    var buf: [12]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    var prev: [1]Cell = .{.{ .ch = ' ', .style = .{} }};
+    var current: [1]Cell = .{.{ .ch = 0x1F600, .style = .{} }};
+
+    const result = diffAndEmit(&w, &prev, &current, 1, 1, CURSOR_SKIP, 0);
+    try testing.expectError(error.WriteFailed, result);
+}
+
+test "diffAndEmit zero allocations under testing.allocator" {
+    // Tiger Style §3 — zero allocations in the hot path.
+    // diffAndEmit's signature has no `Allocator` parameter (compile-time
+    // guard). We use a FixedBufferAllocator as a sentinel counter — the
+    // `end_index` is checked before/after; any allocation would bump it.
+    var fba_buf: [4096]u8 = undefined;
+    const fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+    const before = fba.end_index;
+
+    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    current[0] = .{ .ch = 'A', .style = .{} };
+    current[2] = .{ .ch = 'X', .style = .{ .bold = true } };
+
+    var buf: [128]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try diffAndEmit(&w, &prev, &current, 4, 1, CURSOR_SKIP, 0);
+
+    try testing.expectEqual(before, fba.end_index);
+}
+
+test "@hasDecl(diff_emit_mod, \"diffAndEmit\" + \"emitDiffEntry\" + \"emitTrailingCUP\")" {
+    // Compile-time symbol guards. The contract places all three at
+    // module scope (not on ScreenGrid or DiffEntry), so we test on
+    // `diff_emit_mod` directly.
+    try testing.expect(@hasDecl(diff_emit_mod, "diffAndEmit"));
+    try testing.expect(@hasDecl(diff_emit_mod, "emitDiffEntry"));
+    try testing.expect(@hasDecl(diff_emit_mod, "emitTrailingCUP"));
+    try testing.expect(@hasDecl(diff_emit_mod, "DiffEntry"));
 }

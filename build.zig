@@ -501,12 +501,28 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/screen_grid.zig"),
     });
+    // tui-ship-fast-phase2 (T-2.2.1) — DiffEntry + diffAndEmit pure renderer.
+    // Module root is src/diff_emit.zig (NEW file). The module imports
+    // `screen_grid` to consume Cell + CURSOR_SKIP; this import is wired
+    // explicitly because Zig 0.16's sibling-module-root ownership rule
+    // rejects `@import("screen_grid.zig")` from a sibling root. Tests in
+    // tests/tui/screen_grid.zig access diff_emit via the `diff_emit` import
+    // alias (wired below).
+    const diff_emit_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/diff_emit.zig"),
+        .imports = &.{
+            .{ .name = "screen_grid", .module = screen_grid_mod },
+        },
+    });
     const screen_grid_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("tests/tui/screen_grid.zig"),
         .imports = &.{
             .{ .name = "screen_grid", .module = screen_grid_mod },
+            .{ .name = "diff_emit", .module = diff_emit_mod },
         },
     });
     const screen_grid_test_step = b.addTest(.{ .root_module = screen_grid_test_mod });

@@ -159,6 +159,9 @@ run_step "test-terminal (140 tests, in-tree src/terminal/)" \
 run_step "test-tui (3 tests, terminal smoke canary)" \
   podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c 'zig build test-tui --summary all'
 
+run_step "test-tui-screen-grid (T-2.1.x + T-2.2.1, Phase 2 ScreenGrid + diffAndEmit)" \
+  podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c 'zig build test-tui-screen-grid --summary all'
+
 run_step "test-tui-runtime-thread (69 tests, Phase 0+0.5 TUI fixes)" \
   podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c 'zig build test-tui-runtime-thread --summary all'
 
