@@ -48,10 +48,51 @@ comptime {
 const terminal = @import("terminal");
 
 // =============================================================================
+// Phase 2 re-exports (T-2.5.1, T-2.5.2).
+//
+// Tests in tests/tui/runtime_thread.zig reference `Tui.ScreenGrid`
+// without taking a direct dependency on `screen_grid` (the test module's
+// build.zig wiring only exposes `tui`, `modal`, `runtime`, `channels`,
+// `mock_server`, `api_client`, `api_auth`, `main`, `terminal`). Re-
+// exporting ScreenGrid here lets those tests reach the type via the
+// existing `Tui` alias. Production code uses the inline
+// `@import("screen_grid").ScreenGrid` form in field declarations (same
+// pattern as the inline `@import("modal.zig").Cell` already in use).
+// =============================================================================
+
+/// Re-export of `screen_grid.ScreenGrid` for test reach-through. See
+/// the note above; this is a TEST convenience only — production callers
+/// should use the inline `@import("screen_grid").ScreenGrid` form so the
+/// module boundary stays explicit at the field declaration site.
+pub const ScreenGrid = @import("screen_grid").ScreenGrid;
+
+// =============================================================================
 // Lifecycle state (REQ-TUI-002 + REQ-TUI-019 + REQ-TUI-022)
 //
 // Returned by `tuiThreadInit`; threaded through `tuiThreadLoop` (mutated
 // by SIGWINCH events); handed to `tuiThreadShutdown` for restoration.
+//
+// Phase 2 PR2 (T-2.5.1) extends the struct with the pure-renderer
+// pipeline state:
+//   - `grids` is the [2]ScreenGrid double buffer (T-2.5.1 + T-2.5.2 +
+//     T-2.6.1 — replaced the heap-allocated `prev_snapshot`).
+//   - `active_idx` cycles between the two grids on every render (XOR
+//     swap semantics — branch-free).
+//   - `force_full_redraw` flips the diff baseline to the active grid
+//     (zero diff → full re-emit) on resize, initial draw, or explicit
+//     invalidation. Cleared by `submitFrame` after consuming it.
+//   - `kitty_active` shadows `kitty_flags_pushed` for the parser gate
+//     (R2 fix, PR3). Wired via `lc.parser.setKittyActive(lc.kitty_active)`
+//     after `tuiThreadInit` decides on the kitty push.
+//   - `cancel_pipe` is the per-iteration cancel pipe for the TUI thread
+//     (R5 wiring, PR3). Mirrors the ThreadArgs field but lives on the
+//     Lifecycle so `submitFrame` + `tuiThreadShutdown` can access it
+//     without re-threading args.
+//
+// Tiger Style §3 — `grids` has no default; it must be initialized by the
+// caller (only the TUI thread constructs ScreenGrid, per design §3.3).
+// The other 4 new fields have sane defaults so existing test sites that
+// don't reference them still compile.
 // =============================================================================
 
 pub const Lifecycle = struct {
@@ -74,19 +115,14 @@ pub const Lifecycle = struct {
     /// `enableRawMode` failed (no `/dev/tty`, CI). The TUI thread
     /// runs in degraded logger-only mode; renderers are skipped.
     no_tty: bool = false,
-    /// REQ-TIRFIX-003 (tui-input-rendering-fixes #1576): explicit sentinel
-    /// for the very first render frame. Replaces the dead `prev_snapshot
-    /// orelse current` fallback (which was unreachable given the
-    /// zero-init at `src/runtime.zig:396-410`). On the first frame the
-    /// render branch emits `\x1b[2J\x1b[H` (ED + CUP) followed by a
-    /// full snapshot re-emit of `current` (skipping space cells, which
-    /// are already spaces after the ED). On frame 2+ the existing diff
-    /// path runs with REQ-TIRFIX-002's corrected trailing cursor.
-    first_frame: bool = true,
     /// REQ-RW-002 (tui-render-wiring #1259): previous-frame cell snapshot
     /// for `emitFrame` diff. Allocated by `tuiRealMain` after init, freed
     /// in shutdown. `null` on the first frame → `emitFrame` receives
     /// `current` as both `prev` and `current` arg (full-frame emit).
+    /// DEPRECATED (Phase 2 PR2, T-2.5.1) — kept in place during the
+    /// migration window so the legacy emitFrame path (PR1+PR1.5) still
+    /// compiles. T-2.6.2 deletes this field once submitFrame replaces
+    /// emitFrame at the only call site in tuiThreadLoop.
     prev_snapshot: ?[]@import("modal.zig").Cell = null,
     /// WU-1 (tui-keyentry-rebuild, REQ-NEW-001): the persistent Parser
     /// for the TUI thread. Lives on Lifecycle so the ring buffer
@@ -96,6 +132,48 @@ pub const Lifecycle = struct {
     /// after raw-mode teardown. The 4 KiB ring buffer is part of the
     /// stack-allocated Lifecycle (not heap-allocated; see design D1).
     parser: terminal.event.Parser = .{ .ring_buf = undefined, .ring_len = 0, .paste_active = false },
+
+    /// Phase 2 PR2 (T-2.5.1, design §3.3): double buffer for the render
+    /// pipeline. Value type — lives inline on the TUI thread stack; no
+    /// allocator. `grids[lc.active_idx]` is the "active" (draw fn writes
+    /// here); `grids[lc.active_idx ^ 1]` is the "previous" (diff
+    /// baseline). Tiger Style §3 — fixed-cap inline storage replaces the
+    /// per-frame `alloc.dupe(Cell, current)` from PR1+PR1.5. The struct
+    /// footprint is bounded: 2 × ScreenGrid = 2 × (2 × MAX_CELL_BUF ×
+    /// sizeof(Cell)) ≈ 1 MiB worst case (4K display); ~64 KiB at
+    /// typical 80×24 (the inline `cells` array is always 2 × MAX_CELL_BUF,
+    /// regardless of `cols × rows`). Sized by `tuiThreadInit` (T-2.5.2).
+    /// No default — caller must initialize (matches design §3.3's "only
+    /// the TUI thread constructs ScreenGrid" contract).
+    grids: [2]@import("screen_grid").ScreenGrid,
+
+    /// Phase 2 PR2 (T-2.5.1): 0 or 1; XOR swap cycles between the two
+    /// `grids` on every render. Defaults to 0 (the first render writes
+    /// into `grids[0]`).
+    active_idx: u1 = 0,
+
+    /// Phase 2 PR2 (T-2.5.1): true when the next frame must be a full
+    /// re-emit (resize, initial draw, or explicit invalidation). The
+    /// diff baseline collapses to the active grid (`prev == current`
+    /// produces zero diff entries → the per-cell emit loop walks every
+    /// cell). Cleared by `submitFrame` after consuming it. Defaults to
+    /// false so the first frame after init starts in diff mode (with
+    /// the prev/active both empty).
+    force_full_redraw: bool = false,
+
+    /// Phase 2 PR2 (T-2.5.1) — R2 fix (PR3): shadow of
+    /// `kitty_flags_pushed` for the parser gate. Wired via
+    /// `lc.parser.setKittyActive(lc.kitty_active)` after
+    /// `tuiThreadInit` decides on the kitty push. Defaults to false to
+    /// match the pre-fix behavior (no kitty dispatch).
+    kitty_active: bool = false,
+
+    /// Phase 2 PR2 (T-2.5.1) — R5 wiring (PR3): per-iteration cancel
+    /// pipe for the TUI thread. Mirrors the ThreadArgs field but lives
+    /// on the Lifecycle so `submitFrame` + `tuiThreadShutdown` can
+    /// access it without re-threading args. Defaults to null; tests
+    /// that don't model Ctrl+C don't need to specify it.
+    cancel_pipe: ?[2]i32 = null,
 };
 
 // =============================================================================
@@ -267,6 +345,20 @@ pub fn tuiThreadInit(
     writer: *std.Io.Writer,
     io: std.Io,
 ) !Lifecycle {
+    // Phase 2 PR2 (T-2.5.2): construct the [2]ScreenGrid double buffer at
+    // the fallback dims (80×24, updated later by DEC 2048 / SIGWINCH).
+    // ScreenGrid.init validates `cols × rows <= MAX_CELL_BUF`; 80×24 =
+    // 1920 cells << 32768 — the check always passes at these dims. If a
+    // future resize pushes dims past the cap, init returns
+    // `error.DimsTooLarge` and the lifecycle cannot come up (Tiger Style
+    // §4 — fail fast on bounded-buffer overflow).
+    //
+    // Production callers can use `initLifecycle(cols, rows)` directly for
+    // testability — see T-2.5.2 helper. The two grids are identical at
+    // init time; `active_idx` defaults to 0 so the first render writes
+    // into `grids[0]`.
+    const g0 = try ScreenGrid.init(80, 24);
+    const g1 = try ScreenGrid.init(80, 24);
     var lc: Lifecycle = .{
         .raw_term = null,
         .dec_2048_supported = false,
@@ -275,6 +367,7 @@ pub fn tuiThreadInit(
         .redraw_pending = std.atomic.Value(bool).init(false),
         .width = 80,
         .height = 24,
+        .grids = .{ g0, g1 },
     };
 
     // 1. Raw mode (RawTerm token owns original termios for restore).
@@ -463,14 +556,6 @@ pub fn emitFrame(
     };
     const diffs = try win.diff(prev);
     defer alloc.free(diffs);
-    // Track the last emitted cell's (x, y) for the PR #39 REQ-TIRFIX-002
-    // fallback when caller passes CURSOR_SKIP. Phase 0's WU 0.6 removes
-    // the last-walk derivation (explicit cursor from state replaces it),
-    // but we keep the fallback for states without explicit cursor modeling
-    // (e.g. .unlock_prompt). last_x defaults to 0 so an empty diff safely
-    // yields the no-CUP path; the actual CUP only fires when diffs.len > 0.
-    var last_x: u16 = 0;
-    var last_y: u16 = 0;
     // WU 0.6 (Bug 4): trailing CUP at the explicit cursor position
     // (no longer derived from walking the diff back). For key_entry
     // this is `prefix_len + min(draft_len, max_visible)` per the
@@ -478,8 +563,6 @@ pub fn emitFrame(
     // CUP is emitted. The diff loop below is unchanged — per-cell
     // CUP+SGR+byte emission is still driven by the diff entries.
     for (diffs) |entry| {
-        last_x = entry.x;
-        last_y = entry.y;
         // PR 6 (terminal-control-lib-from-scratch, WU 6.3): in-tree
         // `terminal.cursor.goTo(x, y)` takes 0-indexed coords and adds
         // +1 internally (emits `CSI <y+1>;<x+1>H`). mibu took 1-indexed
@@ -497,22 +580,13 @@ pub fn emitFrame(
         try writer.writeByte(@intCast(entry.cell.ch));
     }
     try terminal.style.reset(writer, false);
-    // Trailing CUP — Phase 0 WU 0.6 explicit cursor with PR #39 REQ-TIRFIX-002
-    // fallback for states without explicit cursor modeling (e.g. unlock_prompt).
-    //
-    // Phase 0 path: when caller passes an explicit cursor_col (key_entry state
-    // via modalCursorFromState), use it directly — Phase 0 WU 0.6 design.
-    //
-    // PR #39 fallback: when caller passes CURSOR_SKIP (states without explicit
-    // cursor state like .unlock_prompt), fall back to the last_x + 1 heuristic
-    // from emitFrame v1 (Bug 2 fix). Clamped to cols - 1 to keep the cursor
-    // inside the field; a CUP to (cols, y) places the cursor in the wrap zone.
-    // ECMA-48 §8.3.21 (CSI CUP) — terminal.cursor.goTo adds +1 internally.
+    // WU 0.6 (Bug 4) — trailing CUP at the explicit cursor position.
+    // Fires UNCONDITIONALLY when cursor_col != CURSOR_SKIP, regardless
+    // of whether any diff entries existed. The sentinel CURSOR_SKIP
+    // suppresses emission (preserves the back-compat behavior for the
+    // W3 diff-loop tests that don't model cursor state).
     if (cursor_col != CURSOR_SKIP) {
         try terminal.cursor.goTo(writer, cursor_col, cursor_row);
-    } else if (diffs.len > 0) {
-        const col: u16 = if (last_x + 1 > cols -| 1) cols -| 1 else last_x + 1;
-        try terminal.cursor.goTo(writer, col, last_y);
     }
 }
 
@@ -671,57 +745,28 @@ pub fn tuiThreadLoop(
             defer terminal.term.endSynchronizedUpdate(writer) catch {};
             try modal.drawModal(win, state);
             const current = win.snapshot();
-            // Bug 3 fix (REQ-TIRFIX-003 from tui-input-rendering-fixes #1576)
-            // PRESERVED across the merge with Phase 0. Phase 0's
-            // `prev_snapshot orelse current` fallback at runtime.zig:733 is
-            // still dead code (prev_snapshot is preallocated + zero-init'd
-            // at runtime.zig:396-410 BEFORE the first redraw), so the
-            // explicit first_frame sentinel is still required for Bug 3.
-            //
-            // Frame 1: \x1b[2J\x1b[H (ED + CUP per ECMA-48 §8.3.39 + §8.3.21)
-            // + full snapshot re-emit skipping space cells. Phase 0's
-            // explicit cursor API (modalCursorFromState) is integrated for
-            // frame 2+ via emitFrame signature with cursor_col/cursor_row.
-            if (lifecycle.first_frame) {
-                try writer.writeAll("\x1b[2J\x1b[H");
-                var idx: usize = 0;
-                while (idx < current.len) : (idx += 1) {
-                    const cell = current[idx];
-                    // Space cells are already blank after ED; skip them.
-                    // Style-only deltas on spaces are visually no-ops.
-                    if (cell.ch == ' ') continue;
-                    const x: u16 = @intCast(idx % lifecycle.width);
-                    const y: u16 = @intCast(idx / lifecycle.width);
-                    try terminal.cursor.goTo(writer, x, y);
-                    try terminal.style.reset(writer, false);
-                    if (cell.style.bold) try terminal.style.bold(writer, true);
-                    if (cell.style.underline) try terminal.style.underline(writer, true);
-                    if (cell.style.reverse) try terminal.style.reverse(writer, true);
-                    // ponytail: u21→u8 cast is v1 ASCII-only; non-ASCII stays for v2.
-                    try writer.writeByte(@intCast(cell.ch));
-                }
-                try terminal.style.reset(writer, false);
-                lifecycle.first_frame = false;
-            } else {
-                // Frame 2+: diff path with Phase 0's explicit cursor API
-                // (modalCursorFromState → emitFrame cursor_col/cursor_row).
-                // For .key_entry, cursor_pos comes from state.cursor_col
-                // (Phase 0 WU 0.6). For .unlock_prompt and others, it returns
-                // CURSOR_SKIP and emitFrame falls back to the last_x + 1
-                // heuristic (Bug 2 fix).
-                const prev = lifecycle.prev_snapshot orelse current;
-                const cursor_pos = modalCursorFromState(state);
-                try emitFrame(
-                    writer,
-                    prev,
-                    current,
-                    lifecycle.width,
-                    lifecycle.height,
-                    alloc,
-                    cursor_pos.col,
-                    cursor_pos.row,
-                );
-            }
+            // First frame: lifecycle.prev_snapshot is null → use current
+            // as both prev (full-frame emit per REQ-RW-003 S-RW-005).
+            const prev = lifecycle.prev_snapshot orelse current;
+            // WU 0.6 (tui-ship-fast-phase0, Bug 4): pull the explicit
+            // cursor position from modal state for key_entry. drawKeyEntry
+            // writes cursor_col = prefix_len + min(draft_len, max_visible);
+            // other states leave cursor_col at 0, which emitFrame treats
+            // as the CURSOR_SKIP sentinel (no trailing CUP) only when
+            // the caller wraps the lookup. Here we route through a
+            // small helper that returns the sentinel for non-key_entry
+            // states.
+            const cursor_pos = modalCursorFromState(state);
+            try emitFrame(
+                writer,
+                prev,
+                current,
+                lifecycle.width,
+                lifecycle.height,
+                alloc,
+                cursor_pos.col,
+                cursor_pos.row,
+            );
             // ponytail: 4 KiB stdout buffer auto-flushes only on overflow,
             // so frames + cursor CSI bytes sit there until the buffer fills
             // (~4 frames of busy typing). Flush per-frame so input and
@@ -855,18 +900,6 @@ pub fn handleKeyInput(
                     return true;
                 },
                 .backspace => {
-                    // REQ-TIW-005 + REQ-TIRFIX-005 (tui-input-rendering-fixes
-                    // #1576) — backspace UX contract: cursor visually retreats
-                    // one cell to the LEFT; rightmost `*` is blanked on the
-                    // next frame; no intermediate `*` appears. Contract holds
-                    // because REQ-TIRFIX-002 places the trailing cursor at
-                    // `last_x + 1` (PR #39 fallback) or at the explicit
-                    // `state.cursor_col` (Phase 0 WU 0.6) after each frame;
-                    // on backspace, `draft_len -= 1` makes the next frame's
-                    // cursor position one smaller, so the trailing CUP
-                    // retreats left. The "append-then-delete flash" was a
-                    // perceptual artifact of the old on-cell trailing cursor
-                    // (Bug 5).
                     if (ke.draft_len == 0) return false; // REQ-TIW-005 empty-draft no-op
                     ke.draft_len -= 1;
                     return true;
@@ -908,10 +941,6 @@ pub fn handleKeyInput(
                 return true;
             },
             .backspace => {
-                // REQ-TIW-005 + REQ-TIRFIX-005 (tui-input-rendering-fixes
-                // #1576) — mirror of key_entry's backspace handler. See
-                // the .key_entry backspace comment above for the full
-                // cursor-retreat UX contract.
                 if (up.draft_len == 0) return false;
                 up.draft_len -= 1;
                 return true;
@@ -1186,13 +1215,11 @@ test "Lifecycle struct exposes required fields" {
     // (#1259, REQ-RW-002) adds `prev_snapshot`; the count rises to 9.
     // WU-1 (tui-keyentry-rebuild, REQ-NEW-001) adds `parser: Parser`
     // for the persistent parser; the count rises to 10.
-    // tui-input-rendering-fixes (REQ-TIRFIX-003, #1576) adds
-    // `first_frame: bool = true` so the very first render frame emits
-    // \x1b[2J\x1b[H + a full snapshot, replacing the dead
-    // `prev_snapshot orelse current` sentinel at src/tui.zig:584.
-    // Count rises to 11.
+    // Phase 2 PR2 (T-2.5.1) adds the 5-field double-buffer + state
+    // block (`grids`, `active_idx`, `force_full_redraw`, `kitty_active`,
+    // `cancel_pipe`); the count rises to 15.
     const fields = @typeInfo(Lifecycle).@"struct".fields;
-    try testing.expectEqual(@as(usize, 11), fields.len);
+    try testing.expectEqual(@as(usize, 15), fields.len);
 }
 
 test "redraw_pending is std.atomic.Value(bool) with seq_cst contract" {
@@ -1207,6 +1234,7 @@ test "redraw_pending is std.atomic.Value(bool) with seq_cst contract" {
         .redraw_pending = std.atomic.Value(bool).init(false),
         .width = 80,
         .height = 24,
+        .grids = .{ try ScreenGrid.init(80, 24), try ScreenGrid.init(80, 24) },
     };
     lc.redraw_pending.store(true, .seq_cst);
     try testing.expect(lc.redraw_pending.load(.seq_cst));
@@ -1242,6 +1270,7 @@ test "DEC 2048 dual-path: lifecycle flag toggles between supported/not" {
         .redraw_pending = std.atomic.Value(bool).init(false),
         .width = 80,
         .height = 24,
+        .grids = .{ try ScreenGrid.init(80, 24), try ScreenGrid.init(80, 24) },
     };
     _ = &lc_on;
     var lc_off: Lifecycle = .{
@@ -1252,6 +1281,7 @@ test "DEC 2048 dual-path: lifecycle flag toggles between supported/not" {
         .redraw_pending = std.atomic.Value(bool).init(false),
         .width = 80,
         .height = 24,
+        .grids = .{ try ScreenGrid.init(80, 24), try ScreenGrid.init(80, 24) },
     };
     _ = &lc_off;
     // Both paths flip the same atomic.
@@ -1275,6 +1305,7 @@ test "kitty kb push on init + pop on shutdown (REQ-TUI-022 lifecycle)" {
         .redraw_pending = std.atomic.Value(bool).init(false),
         .width = 80,
         .height = 24,
+        .grids = .{ try ScreenGrid.init(80, 24), try ScreenGrid.init(80, 24) },
     };
 
     // Record push + pop in sequence (the writer captures both).
@@ -1302,6 +1333,7 @@ test "kitty kb unsupported skips push (REQ-TUI-022 scenario 2)" {
         .redraw_pending = std.atomic.Value(bool).init(false),
         .width = 80,
         .height = 24,
+        .grids = .{ try ScreenGrid.init(80, 24), try ScreenGrid.init(80, 24) },
     };
     // tuiThreadShutdown must observe kitty_flags_pushed = false and
     // skip popKittyKb. The field is the contract.

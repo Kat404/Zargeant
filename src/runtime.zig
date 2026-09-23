@@ -371,6 +371,11 @@ fn tuiRealMain(args: *const ThreadArgs) void {
         // tuiThreadInit can fail when the handle is not a real TTY or
         // the writer cannot allocate. Build a stub Lifecycle with
         // no_tty=true so the loop falls through to logger-only mode.
+        // Phase 2 PR2 (T-2.5.1): the stub also carries the new
+        // [2]ScreenGrid field — sized to the same fallback dims
+        // (80×24) used by tuiThreadInit so callers that read
+        // `lc.grids[0].cols / .rows` see a consistent shape regardless
+        // of which branch returned the value.
         .{
             .raw_term = null,
             .dec_2048_supported = false,
@@ -380,6 +385,10 @@ fn tuiRealMain(args: *const ThreadArgs) void {
             .width = 80,
             .height = 24,
             .no_tty = true,
+            .grids = .{
+                tui_thread_mod.ScreenGrid.init(80, 24) catch unreachable,
+                tui_thread_mod.ScreenGrid.init(80, 24) catch unreachable,
+            },
         }};
 
     // REQ-RW-001: seed the first frame after init returns and we have a
