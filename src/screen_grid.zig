@@ -174,6 +174,54 @@ pub const ScreenGrid = struct {
     }
 };
 
+/// Intent for the blink cursor. Read by `cursorFromIntent` after the
+/// modal draw fn runs. Two variants only (resolved in design §8.2 —
+/// single `.hide` variant folds the CURSOR_SKIP sentinel).
+pub const CursorIntent = enum {
+    /// No cursor for this frame (non-key_entry states). CURSOR_SKIP tuple.
+    hide,
+    /// Visible blink cursor at the position returned by the draw fn.
+    show,
+};
+
+/// Sentinel value for `cursor_col` that suppresses the trailing CUP
+/// emission in `diffAndEmit`. Re-exported from `src/tui.zig:413` to keep
+/// the symbol surface stable for existing tests that reference
+/// `Tui.CURSOR_SKIP` (`tests/tui/runtime_thread.zig:99`,
+/// `:1398`, `:1408`, …).
+pub const CURSOR_SKIP: u16 = std.math.maxInt(u16);
+
+/// Resolve a `CursorIntent` to a concrete `(col, row)` or the
+/// CURSOR_SKIP sentinel. The `intent` parameter is the modal-supplied
+/// indicator; `cursor_col` / `cursor_row` are the draw-fn-computed
+/// positions (only meaningful for `.show`). `cols` allows the bounds
+/// check for `.show` (Tiger Style §4 — defensive precondition).
+///
+/// Behavior contract (design §8.2):
+/// - `cursorFromIntent(.hide, _, _, _)`     → `.{ .col = CURSOR_SKIP, .row = CURSOR_SKIP }`
+/// - `cursorFromIntent(.show, col, row, cols)` → assert `col < cols`; return `.{ .col = col, .row = row }`
+///
+/// Tiger Style §5 — the switch is exhaustive (no fallback prong); adding
+/// a 3rd `CursorIntent` variant forces a compile error here.
+pub fn cursorFromIntent(
+    intent: CursorIntent,
+    cursor_col: u16,
+    cursor_row: u16,
+    cols: u16,
+) struct { col: u16, row: u16 } {
+    return switch (intent) {
+        .hide => .{ .col = CURSOR_SKIP, .row = CURSOR_SKIP },
+        .show => blk: {
+            // Tiger Style §4 — defensive precondition. `cols > 0` first
+            // (a zero-col grid has no cursor position); then `cursor_col
+            // < cols` (the cursor lives inside the visible viewport).
+            std.debug.assert(cols > 0);
+            std.debug.assert(cursor_col < cols);
+            break :blk .{ .col = cursor_col, .row = cursor_row };
+        },
+    };
+}
+
 // ─── tests ───────────────────────────────────────────────────────────────────
 // Unit tests live in tests/tui/screen_grid.zig (the RED file). Inline
 // tests here would force a rebuild on every change; the dedicated test

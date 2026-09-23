@@ -151,18 +151,18 @@ just run-mock                  # manual TUI smoke test
 - **justfile recipes**: `AGENTS.md` §9
 - **OpenCode question tool bug**: `anomalyco/opencode/issues/25873#issuecomment-5781016715`
 
-## Verification evidence (to fill in as tasks complete)
+## Verification evidence (as tasks complete)
 
-| Task | Commit | `just` command | Expected |
-|------|--------|-----------------|----------|
-| T-2.1.1 | (pending) | `just test-tui-screen-grid` | TBD |
-| T-2.1.2 | (pending) | `just test-tui-screen-grid` | TBD |
-| ... | | | |
+| Task | Commit | `just` command | Expected | Status |
+|------|--------|-----------------|----------|--------|
+| T-2.1.1 | `4f5824a` | `just test-tui-screen-grid` | 10/10 PASS | ✅ DONE |
+| T-2.1.2 | (this WU) | `just test-tui-screen-grid` | 11/11 PASS | ✅ DONE |
+| ... | | | | |
 
 ## Progress
 
-- [ ] T-2.1.1 ScreenGrid value type
-- [ ] T-2.1.2 CursorIntent + cursorFromIntent
+- [x] T-2.1.1 ScreenGrid value type — **DONE** (`4f5824a`)
+- [x] T-2.1.2 CursorIntent + cursorFromIntent — **DONE** (this WU)
 - [ ] T-2.2.1 DiffEntry + diffAndEmit
 - [ ] T-2.3.1 renderKeyEntryToGrid
 - [ ] T-2.3.2 render*ToGrid (4 more)

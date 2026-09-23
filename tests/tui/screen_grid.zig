@@ -16,6 +16,9 @@ const screen_grid_mod = @import("screen_grid");
 const ScreenGrid = screen_grid_mod.ScreenGrid;
 const MAX_CELL_BUF = screen_grid_mod.MAX_CELL_BUF;
 const Cell = screen_grid_mod.Cell;
+const CursorIntent = screen_grid_mod.CursorIntent;
+const CURSOR_SKIP = screen_grid_mod.CURSOR_SKIP;
+const cursorFromIntent = screen_grid_mod.cursorFromIntent;
 
 // REQ-TUI-001: ScreenGrid struct shape + invariants
 // TDD RED: these tests fail because src/screen_grid.zig doesn't exist.
@@ -129,4 +132,79 @@ test "Cell is a compact value type (sizeof <= 16 bytes)" {
     // Cell = { ch: u21, style: Style } where Style = { 3 × bool }.
     // Packed: 3 (u21) + 3 (bools) + padding = ~8 bytes typical, capped at 16.
     try testing.expect(@sizeOf(Cell) <= 16);
+}
+
+// T-2.1.2: CursorIntent + CURSOR_SKIP + cursorFromIntent (REQ-TUI-001 §3.1,
+// design §3.1 + §8.2). All seven cases live in one block so the build
+// fails to compile while any required symbol is missing (RED guard).
+
+test "cursorFromIntent resolves CursorIntent to (col, row) or CURSOR_SKIP" {
+    // Case 1: .hide ignores cursor_col/cursor_row/cols and returns
+    // CURSOR_SKIP for both axes. Even out-of-range args are ignored.
+    {
+        const r = cursorFromIntent(.hide, 99, 50, 80);
+        try testing.expectEqual(@as(u16, CURSOR_SKIP), r.col);
+        try testing.expectEqual(@as(u16, CURSOR_SKIP), r.row);
+    }
+    {
+        // .hide with zero-sized grid still returns CURSOR_SKIP.
+        const r = cursorFromIntent(.hide, 0, 0, 0);
+        try testing.expectEqual(@as(u16, CURSOR_SKIP), r.col);
+        try testing.expectEqual(@as(u16, CURSOR_SKIP), r.row);
+    }
+
+    // Case 2: .show returns cursor_col/cursor_row verbatim when in bounds.
+    {
+        const r = cursorFromIntent(.show, 5, 3, 80);
+        try testing.expectEqual(@as(u16, 5), r.col);
+        try testing.expectEqual(@as(u16, 3), r.row);
+    }
+
+    // Case 3: .show at boundary (0, 0) returns (0, 0).
+    {
+        const r = cursorFromIntent(.show, 0, 0, 80);
+        try testing.expectEqual(@as(u16, 0), r.col);
+        try testing.expectEqual(@as(u16, 0), r.row);
+    }
+
+    // Case 4: .show near max — col=cols-1 (and row=rows-1) passes
+    // the bounds assert and returns verbatim.
+    {
+        const r = cursorFromIntent(.show, 79, 0, 80);
+        try testing.expectEqual(@as(u16, 79), r.col);
+        try testing.expectEqual(@as(u16, 0), r.row);
+    }
+    {
+        const r = cursorFromIntent(.show, 79, 23, 80);
+        try testing.expectEqual(@as(u16, 79), r.col);
+        try testing.expectEqual(@as(u16, 23), r.row);
+    }
+
+    // Case 5: CursorIntent has exactly 2 variants and the switch is
+    // exhaustive. Adding/removing a variant breaks compile (RED guard).
+    {
+        const fields = @typeInfo(CursorIntent).@"enum".fields;
+        try testing.expectEqual(@as(usize, 2), fields.len);
+        // Exhaustive switch — no `else` prong. If a 3rd variant is
+        // added, this block fails to compile.
+        const tag_hide: u8 = switch (CursorIntent.hide) {
+            .hide => 0,
+            .show => 1,
+        };
+        const tag_show: u8 = switch (CursorIntent.show) {
+            .show => 1,
+            .hide => 0,
+        };
+        try testing.expectEqual(@as(u8, 0), tag_hide);
+        try testing.expectEqual(@as(u8, 1), tag_show);
+    }
+
+    // Case 6: cursorFromIntent is a module-level pub fn (compile-time
+    // symbol existence guard). Note: the design places it at module
+    // scope (not on ScreenGrid), so we test on `screen_grid_mod`.
+    try testing.expect(@hasDecl(screen_grid_mod, "cursorFromIntent"));
+
+    // Case 7: CURSOR_SKIP sentinel is exactly u16 max. Stable surface
+    // for the `if (cursor_col != CURSOR_SKIP)` gate in src/tui.zig:443.
+    try testing.expectEqual(@as(u16, std.math.maxInt(u16)), CURSOR_SKIP);
 }
