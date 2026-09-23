@@ -1296,56 +1296,63 @@ test "W1-1: tuiRealMain seeds redraw_pending=true after tuiThreadInit" {
     try testing.expect(std.mem.indexOfPos(u8, content, sig, "lc.redraw_pending.store(true, .seq_cst)") != null);
 }
 
-test "W1-2: tuiRealMain allocates prev_snapshot via args.allocator.alloc" {
-    // REQ-RW-002 — `Lifecycle.prev_snapshot: ?[]Cell` is heap-allocated
-    // once at init via `args.allocator.alloc(...)`. Both the field
-    // assignment literal and the alloc call must appear in tuiRealMain.
-    const content = try std.Io.Dir.cwd().readFileAlloc(
+test "W1-2: tuiRealMain does NOT allocate prev_snapshot (T-2.6.2 inversion)" {
+    // Phase 2 PR2 (T-2.6.2) — the prev_snapshot heap allocation has
+    // been removed. submitFrame owns its own double-buffer storage
+    // via `lc.grids` (T-2.5.1 + T-2.6.1), so tuiRealMain no longer
+    // needs to allocate a prev-frame slice. The REQ-RW-002 contract
+    // is inverted: the field is gone, the alloc is gone, the
+    // free-before-shutdown is gone.
+    //
+    // Counter-anchor: this test passes after the T-2.6.2 GREEN commit
+    // and would FAIL if the prev_snapshot alloc were reintroduced.
+    const raw_content = try std.Io.Dir.cwd().readFileAlloc(
         testing.io,
         "src/runtime.zig",
         testing.allocator,
         .limited(1 << 20),
     );
-    defer testing.allocator.free(content);
+    defer testing.allocator.free(raw_content);
+    // Strip line comments so the legacy-mention comments don't trip
+    // the guard (a comment that says "prev_snapshot is gone" still
+    // contains the substring).
+    const content = stripLineComments(raw_content);
+    defer if (content.ptr != raw_content.ptr) testing.allocator.free(content);
 
     const sig = std.mem.indexOf(u8, content, "fn tuiRealMain") orelse {
         try testing.expect(false);
         return;
     };
-    try testing.expect(std.mem.indexOfPos(u8, content, sig, "prev_snapshot") != null);
-    try testing.expect(std.mem.indexOfPos(u8, content, sig, "args.allocator.alloc") != null);
+    // Within tuiRealMain's body, neither prev_snapshot nor its alloc
+    // should appear. Both are gone after T-2.6.2.
+    try testing.expect(std.mem.indexOfPos(u8, content, sig, "prev_snapshot") == null);
+    try testing.expect(std.mem.indexOfPos(u8, content, sig, "args.allocator.alloc") == null);
 }
 
-test "W1-3: prev_snapshot is zero-initialized at allocation (REQ-BUGFIX1-004)" {
-    // REQ-BUGFIX1-004 — `lifecycle.prev_snapshot` MUST be zero-initialized
-    // immediately after allocation. Without the @memset, alloc returns
-    // undefined memory and the first frame's diff compares against
-    // garbage, triggering a full-frame emit of ~38 KB that stalls slow
-    // terminals for ~2 s on the first 2 keystrokes (obs#1378 §Bug 3).
-    const content = try std.Io.Dir.cwd().readFileAlloc(
+test "W1-3: tuiRealMain has no prev_snapshot zero-init (T-2.6.2 inversion)" {
+    // Phase 2 PR2 (T-2.6.2) — REQ-BUGFIX1-004 (the prev_snapshot
+    // zero-init @memset) is moot once the field is removed. The
+    // ScreenGrid double buffer (T-2.5.1) is pre-cleared by
+    // `ScreenGrid.init`, so no per-frame zero-init is required.
+    //
+    // Counter-anchor: this test passes after T-2.6.2 GREEN. A future
+    // regression that reintroduces prev_snapshot alloc + zero-init
+    // would flip this to FAIL.
+    const raw_content = try std.Io.Dir.cwd().readFileAlloc(
         testing.io,
         "src/runtime.zig",
         testing.allocator,
         .limited(1 << 20),
     );
-    defer testing.allocator.free(content);
+    defer testing.allocator.free(raw_content);
+    // Strip line comments so the legacy-mention comments don't trip
+    // the guard.
+    const content = stripLineComments(raw_content);
+    defer if (content.ptr != raw_content.ptr) testing.allocator.free(content);
 
-    // Locate the prev_snapshot alloc site.
-    const alloc_pos = std.mem.indexOf(u8, content, "prev_snapshot = args.allocator.alloc") orelse {
-        try testing.expect(false);
-        return;
-    };
-    // The @memset MUST appear AFTER the alloc (within the same function
-    // body — within a generous window of 1024 bytes is plenty for the
-    // guarded null-check + @memset pair).
-    const slice_after_alloc = content[alloc_pos..@min(alloc_pos + 1024, content.len)];
-    try testing.expect(std.mem.indexOf(u8, slice_after_alloc, "@memset") != null);
-    // The @memset MUST use the canonical Cell-zero form: ch=' ' and
-    // style=Style{} (default). Zero-init to all-zero bytes would set
-    // ch=0 (NUL), which is NOT the same as ' ' (0x20) and would
-    // re-trigger the same first-frame full-emit bug.
-    try testing.expect(std.mem.indexOf(u8, slice_after_alloc, ".ch = ' '") != null);
-    try testing.expect(std.mem.indexOf(u8, slice_after_alloc, ".style = .{}") != null);
+    // The T-2.6.2 GREEN state has no prev_snapshot substring anywhere
+    // in src/runtime.zig — both the field and the zero-init are gone.
+    try testing.expect(std.mem.indexOf(u8, content, "prev_snapshot") == null);
 }
 
 // =============================================================================
@@ -1521,10 +1528,10 @@ test "W4-1: tuiThreadLoop renders modal on redraw_pending and emits CSI" {
         &shutdown_atomic,
         null, // cancel_pipe — null for tests
     );
-    // The loop allocated a prev_snapshot dupe; free it like tuiRealMain
-    // does on shutdown.
-    if (lc.prev_snapshot) |p| testing.allocator.free(p);
-    lc.prev_snapshot = null;
+    // Phase 2 PR2 (T-2.6.2) — `submitFrame` owns its own double-buffer
+    // storage via `lc.grids`; no prev_snapshot field exists on
+    // Lifecycle (T-2.5.1 deprecation completes). The loop no longer
+    // allocates a prev frame dupe, so there's nothing to free here.
     const out = buf[0..w.end];
     // beginSynchronizedUpdate bracket
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[?2026h") != null);
@@ -1595,9 +1602,17 @@ test "W5-1: Lifecycle.prev_snapshot updates per frame (no double-emit)" {
 }
 
 // T-SG-7: REQ-RW-014 (S-RW-017) — static-grep guard for the
-// tui-render-wiring slice. Three sub-assertions: (a) seed call appears
-// in src/runtime.zig:tuiRealMain; (b) emitFrame symbol appears in
-// src/tui.zig; (c) prev_snapshot field appears in src/tui.zig Lifecycle.
+// tui-render-wiring slice. Phase 2 PR2 (T-2.6.2) rewrote the
+// sub-assertions to cover the new pipeline:
+//
+//   (a) seed call appears in src/runtime.zig:tuiRealMain
+//       (unchanged from PR1c).
+//   (b) submitFrame signature appears in src/tui.zig (T-2.6.1 — replaces
+//       the legacy emitFrame as the production render orchestrator).
+//       The legacy emitFrame is kept as a separate fn for the W3 tests;
+//       we no longer require it to be the production call site.
+//   (c) counter-anchor: prev_snapshot field is REMOVED from tui.zig
+//       Lifecycle (T-2.6.2 — submitFrame owns its own double buffer).
 test "T-SG-7: render wiring is present after tui-render-wiring slice" {
     const runtime_src = try std.Io.Dir.cwd().readFileAlloc(
         testing.io,
@@ -1616,10 +1631,12 @@ test "T-SG-7: render wiring is present after tui-render-wiring slice" {
 
     // Sub-assertion 1: seed call literal in runtime.zig.
     try testing.expect(std.mem.indexOf(u8, runtime_src, "lc.redraw_pending.store(true, .seq_cst)") != null);
-    // Sub-assertion 2: emitFrame signature in tui.zig.
-    try testing.expect(std.mem.indexOf(u8, tui_src, "pub fn emitFrame(") != null);
-    // Sub-assertion 3: prev_snapshot field in tui.zig Lifecycle.
-    try testing.expect(std.mem.indexOf(u8, tui_src, "prev_snapshot:") != null);
+    // Sub-assertion 2: submitFrame signature in tui.zig (T-2.6.1).
+    try testing.expect(std.mem.indexOf(u8, tui_src, "pub fn submitFrame(") != null);
+    // Sub-assertion 3 (counter-anchor): prev_snapshot field is GONE
+    // from tui.zig Lifecycle (T-2.6.2 deletion). If a future PR
+    // reintroduces it, this assertion fails.
+    try testing.expect(std.mem.indexOf(u8, tui_src, "prev_snapshot:") == null);
 }
 
 // T-SG-8 fold-in: REQ-RW-008 (S-RW-011) — WindowMock + 5 draw fns

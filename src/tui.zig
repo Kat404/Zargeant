@@ -115,15 +115,6 @@ pub const Lifecycle = struct {
     /// `enableRawMode` failed (no `/dev/tty`, CI). The TUI thread
     /// runs in degraded logger-only mode; renderers are skipped.
     no_tty: bool = false,
-    /// REQ-RW-002 (tui-render-wiring #1259): previous-frame cell snapshot
-    /// for `emitFrame` diff. Allocated by `tuiRealMain` after init, freed
-    /// in shutdown. `null` on the first frame → `emitFrame` receives
-    /// `current` as both `prev` and `current` arg (full-frame emit).
-    /// DEPRECATED (Phase 2 PR2, T-2.5.1) — kept in place during the
-    /// migration window so the legacy emitFrame path (PR1+PR1.5) still
-    /// compiles. T-2.6.2 deletes this field once submitFrame replaces
-    /// emitFrame at the only call site in tuiThreadLoop.
-    prev_snapshot: ?[]@import("modal.zig").Cell = null,
     /// WU-1 (tui-keyentry-rebuild, REQ-NEW-001): the persistent Parser
     /// for the TUI thread. Lives on Lifecycle so the ring buffer
     /// survives across `nextWithTimeout` calls. Wired via
@@ -813,17 +804,26 @@ pub fn tuiThreadMain(args: *const ThreadArgs) void {
 /// Per-frame loop orchestrator (REQ-TUI-002 + REQ-TUI-021 + REQ-RW-004
 /// + REQ-RW-006). Polls mibu events in 16ms windows; when the redraw
 /// flag flips (from init seed, a resize event, or any other source),
-/// runs the modal render bracket and emits the cell diff via emitFrame.
-/// Exits on `Shutdown` arriving on any channel AFTER any pending render
-/// completes.
+/// invokes `submitFrame` to render the modal into the [2]ScreenGrid
+/// double buffer and emit the diff via DEC 2026. Exits on `Shutdown`
+/// arriving on any channel AFTER any pending render completes.
+///
+/// Phase 2 PR2 (T-2.6.2) — the inline render+emit block (the legacy
+/// `terminal.term.beginSynchronizedUpdate` + `modal.drawModal` +
+/// `emitFrame` + `alloc.dupe(prev_snapshot)` quadruple) is replaced
+/// with a single `submitFrame` call wrapped in `catch continue`. The
+/// per-frame WindowMock allocation is gone (Tiger Style §3 — zero
+/// hot-path allocation); the `[2]ScreenGrid` on `Lifecycle` is the
+/// sole frame-storage substrate. The `prev_snapshot` field has been
+/// removed from Lifecycle (T-2.5.1 deprecation completes).
 ///
 /// `state` is the modal state from src/modal.zig — its active variant
-/// dispatches via `modal.drawModal` to the per-fn draw* helper. The
-/// per-frame WindowMock is allocated + freed each iteration; the
-/// `prev_snapshot` buffer persists across frames (REQ-RW-002).
-///
-/// ponytail: per-frame WindowMock init/deinit is cheap at v1 frame
-/// rates; revisit if profiling shows allocation cost.
+/// dispatches via `modal.renderToGrid` to the per-fn `render*ToGrid`
+/// helper. The diff is computed by `diff_emit.diffAndEmit` against
+/// the two ScreenGrid slices (`lc.grids[lc.active_idx ^ 1].active()`
+/// vs `lc.grids[lc.active_idx].active()`); the writer gets paired
+/// DEC 2026 brackets + per-cell `<CUP><SGR><UTF-8><SGR reset>` bytes
+/// + an optional trailing CUP at the cursor position.
 pub fn tuiThreadLoop(
     lifecycle: *Lifecycle,
     handle: std.Io.File.Handle,
@@ -843,49 +843,22 @@ pub fn tuiThreadLoop(
     // within ≤100ms (REQ-NEW-006). Tests / no-TTY paths pass null.
     cancel_pipe: ?[2]i32,
 ) !void {
-    const modal = @import("modal.zig");
     const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
     while (true) {
         // 1. Render if pending (REQ-RW-004 sub-bullet 2-3) — runs before
         // Shutdown drain so a pending render always completes.
+        // Phase 2 PR2 (T-2.6.2): the entire render+emit+bracket stage is
+        // delegated to submitFrame. The `catch continue` per D1-a swallows
+        // writer errors (the dead-pty signature `WriteFailed`, POSIX
+        // EPIPE analog) so the loop iterates again — on the next pass
+        // it drains Shutdown from any channel and exits cleanly.
         if (lifecycle.redraw_pending.swap(false, .seq_cst)) {
-            try terminal.term.beginSynchronizedUpdate(writer);
-            var win = try modal.WindowMock.init(alloc, lifecycle.width, lifecycle.height);
-            defer win.deinit();
-            defer terminal.term.endSynchronizedUpdate(writer) catch {};
-            try modal.drawModal(win, state);
-            const current = win.snapshot();
-            // First frame: lifecycle.prev_snapshot is null → use current
-            // as both prev (full-frame emit per REQ-RW-003 S-RW-005).
-            const prev = lifecycle.prev_snapshot orelse current;
-            // WU 0.6 (tui-ship-fast-phase0, Bug 4): pull the explicit
-            // cursor position from modal state for key_entry. drawKeyEntry
-            // writes cursor_col = prefix_len + min(draft_len, max_visible);
-            // other states leave cursor_col at 0, which emitFrame treats
-            // as the CURSOR_SKIP sentinel (no trailing CUP) only when
-            // the caller wraps the lookup. Here we route through a
-            // small helper that returns the sentinel for non-key_entry
-            // states.
-            const cursor_pos = modalCursorFromState(state);
-            try emitFrame(
-                writer,
-                prev,
-                current,
-                lifecycle.width,
-                lifecycle.height,
-                alloc,
-                cursor_pos.col,
-                cursor_pos.row,
-            );
+            submitFrame(lifecycle, writer, state, lifecycle.width, lifecycle.height) catch continue;
             // ponytail: 4 KiB stdout buffer auto-flushes only on overflow,
             // so frames + cursor CSI bytes sit there until the buffer fills
             // (~4 frames of busy typing). Flush per-frame so input and
             // cursor stay in sync. One extra syscall/frame; not a bottleneck.
             writer.flush() catch continue;
-            // Swap prev_snapshot. Free the old buffer, dupe the new one.
-            if (lifecycle.prev_snapshot) |p| alloc.free(p);
-            const duped = try alloc.dupe(modal.Cell, current);
-            lifecycle.prev_snapshot = duped;
         }
         // 2. Drain channels.Shutdown from any edge (runtime signals all).
         if (channels.tui_to_agent.tryGet(io)) |ev| switch (ev) {
@@ -1328,8 +1301,11 @@ test "Lifecycle struct exposes required fields" {
     // Phase 2 PR2 (T-2.5.1) adds the 5-field double-buffer + state
     // block (`grids`, `active_idx`, `force_full_redraw`, `kitty_active`,
     // `cancel_pipe`); the count rises to 15.
+    // Phase 2 PR2 (T-2.6.2) deletes `prev_snapshot` — submitFrame owns
+    // its own double-buffer storage via `lc.grids`, so the external
+    // prev-frame dupe is no longer needed. Count drops to 14.
     const fields = @typeInfo(Lifecycle).@"struct".fields;
-    try testing.expectEqual(@as(usize, 15), fields.len);
+    try testing.expectEqual(@as(usize, 14), fields.len);
 }
 
 test "redraw_pending is std.atomic.Value(bool) with seq_cst contract" {
