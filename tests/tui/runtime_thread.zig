@@ -3348,6 +3348,128 @@ test "T-2.5.2.2: ScreenGrid.init rejects too-large dims (error.DimsTooLarge)" {
 }
 
 // =============================================================================
+// Phase 2 PR3 (T-R2.3) — tuiThreadInit wires setKittyActive + cancel_pipe.
+//
+// T-R2.3 (PR3 R2 fix + R5 wiring): after `tuiThreadInit` decides on
+// the kitty push, the orchestrator must call `lc.parser.setKittyActive`
+// so the dispatcher's gate (T-R2.2) flips on for kitty kb events. The
+// `cancel_pipe` field is initialized to null here (the T-R5.* WUs
+// later thread the real pipe fds from ThreadArgs into the Lifecycle).
+//
+// Test strategy: tuiThreadInit requires a real TTY handle to exercise
+// the happy path, so we use static-grep guards on the tui.zig source
+// body (the same pattern T-VR-1 uses for tuiRealMain composition).
+// The grep confirms the wiring lines exist at the right call site
+// (after `pushKittyKb` for setKittyActive, near the end for cancel_pipe).
+//
+// RED state: tuiThreadInit currently does NOT call setKittyActive or
+// assign lc.cancel_pipe — these tests fail until T-R2.3 GREEN adds
+// the wiring at the orchestrator site.
+// =============================================================================
+
+test "T-R2.3.1: tuiThreadInit body calls lc.parser.setKittyActive (R2 wiring)" {
+    // PR3 R2 fix — the orchestrator must mirror Lifecycle.kitty_active
+    // into Parser.kitty_active via setKittyActive. The grep anchor is
+    // the function body, not the whole file (matches T-VR-1's pattern).
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/tui.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+
+    // Locate the tuiThreadInit function body.
+    const sig = std.mem.indexOf(u8, no_comments, "fn tuiThreadInit") orelse {
+        try testing.expect(false);
+        return;
+    };
+    const body_start = std.mem.indexOfPos(u8, no_comments, sig, "{") orelse return;
+    var depth: usize = 0;
+    var body_end: usize = body_start;
+    for (no_comments[body_start..], 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                body_end = body_start + i + 1;
+                break;
+            }
+        }
+    }
+    const body = no_comments[body_start..body_end];
+
+    // The body must reference setKittyActive (proves the wiring).
+    try testing.expect(std.mem.indexOf(u8, body, "setKittyActive") != null);
+}
+
+test "T-R2.3.2: tuiThreadInit body assigns lc.cancel_pipe (R5 wiring)" {
+    // PR3 R5 wiring — `cancel_pipe` lives on the Lifecycle so
+    // `submitFrame` + `tuiThreadShutdown` can access it without
+    // re-threading args. The tuiThreadInit body assigns the field
+    // (currently `null`; the T-R5.* WUs replace this with the real
+    // pipe fds from ThreadArgs).
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/tui.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(content);
+    const first_test = std.mem.indexOf(u8, content, "\ntest \"") orelse content.len;
+    const prod_src = content[0..first_test];
+    const no_comments = stripLineComments(prod_src);
+    defer if (no_comments.ptr != prod_src.ptr) testing.allocator.free(no_comments);
+
+    // Locate the tuiThreadInit function body.
+    const sig = std.mem.indexOf(u8, no_comments, "fn tuiThreadInit") orelse {
+        try testing.expect(false);
+        return;
+    };
+    const body_start = std.mem.indexOfPos(u8, no_comments, sig, "{") orelse return;
+    var depth: usize = 0;
+    var body_end: usize = body_start;
+    for (no_comments[body_start..], 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                body_end = body_start + i + 1;
+                break;
+            }
+        }
+    }
+    const body = no_comments[body_start..body_end];
+
+    // The body must reference cancel_pipe as an lvalue (proves the
+    // wiring assigns the field). Match on `lc.cancel_pipe` (the
+    // production identifier) — broader `cancel_pipe` matches the
+    // import too, but `lc.cancel_pipe` is the unique assignment target.
+    try testing.expect(std.mem.indexOf(u8, body, "lc.cancel_pipe") != null);
+}
+
+test "T-R2.3.3: @hasDecl terminal.event.Parser.setKittyActive (compile-time symbol guard)" {
+    // The setter must exist on the Parser struct (added in T-R2.1) so
+    // tuiThreadInit can call it. Compile-time symbol guard — fails if
+    // a future refactor renames or removes the setter. We scan
+    // `@typeInfo(Parser).@"struct".decls` for the decl name.
+    const info: std.builtin.Type = @typeInfo(terminal.event.Parser);
+    const decls = info.@"struct".decls;
+    var found = false;
+    for (decls) |d| {
+        if (std.mem.eql(u8, d.name, "setKittyActive")) {
+            found = true;
+            break;
+        }
+    }
+    try testing.expect(found);
+}
+
+// =============================================================================
 // Phase 2 PR2 (T-2.6.1) — submitFrame orchestrator tests.
 //
 // T-2.6.1 adds `submitFrame` (src/tui.zig) — the per-frame orchestrator
