@@ -226,28 +226,16 @@ pub const Parser = struct {
     /// callers (the orchestrator) and tests both use this setter
     /// symmetrically — tests bypass the orchestrator and call
     /// `setKittyActive(true)` directly on their per-test Parser.
-    ///
-    /// T-R2.1 RED stub: the body deliberately does NOT mutate the field
-    /// so the GREEN commit (T-R2.1) can flip the body to write
-    /// `self.kitty_active = active;` and turn the GREEN tests green.
-    /// Until then, calling `setKittyActive(true)` followed by
-    /// `kittyActive()` returns false — RED observable.
     pub fn setKittyActive(self: *Parser, active: bool) void {
-        _ = self;
-        _ = active;
+        self.kitty_active = active;
     }
 
     /// R2 fix (T-R2.1, PR3): read the kitty-active gate. Returns the
     /// current value of `kitty_active`. The dispatcher's `final == 'u'`
     /// branch reads this BEFORE calling `parseKittyKb` so kitty kb
     /// events only surface when the terminal opted in.
-    ///
-    /// T-R2.1 RED stub: the body returns a constant `false` so the
-    /// GREEN commit can flip it to `return self.kitty_active;` and
-    /// turn the GREEN tests green.
     pub fn kittyActive(self: *const Parser) bool {
-        _ = self;
-        return false;
+        return self.kitty_active;
     }
 
     /// Refill the ring buffer by reading from `file` (non-blocking). Returns
