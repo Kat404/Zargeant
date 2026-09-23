@@ -22,7 +22,7 @@ const Cell = screen_grid_mod.Cell;
 // TDD GREEN: passing after the impl lands.
 
 test "ScreenGrid inits with deterministic buffer (REQ-TUI-001 happy path)" {
-    const grid = ScreenGrid.init(80, 24);
+    const grid = try ScreenGrid.init(80, 24);
     defer grid.deinit(testing.allocator);
 
     try testing.expectEqual(@as(u16, 80), grid.cols);
@@ -48,17 +48,19 @@ test "ScreenGrid rejects rows=0 (REQ-TUI-001 precondition)" {
 }
 
 test "ScreenGrid rejects cols*rows > MAX_CELL_BUF (REQ-TUI-003 hard cap)" {
-    // MAX_CELL_BUF is 32768 per the design. Try a 256×128 grid (32K = at cap, OK).
-    const atCap = ScreenGrid.init(256, 128);
-    try testing.expect(atCap == .ok); // wait, init may return error union — adjust in GREEN
-    // Try a 257×128 grid (32K+128 > MAX_CELL_BUF, should fail).
+    // MAX_CELL_BUF is 32768 per the design. 256×128 = 32768 = at cap, OK.
+    const atCap = try ScreenGrid.init(256, 128);
+    defer atCap.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 32768), atCap.active().len);
+
+    // 257×128 = 32896 > MAX_CELL_BUF, should fail.
     const overCap = ScreenGrid.init(257, 128);
     try testing.expectError(error.DimsTooLarge, overCap);
 }
 
 // REQ-TUI-001: Bounds-checked writeCell — out-of-bounds drops, returns false.
 test "ScreenGrid.writeCell at (col=cols, row=rows) drops cell (REQ-TUI-001 bounds)" {
-    const grid = ScreenGrid.init(80, 24);
+    var grid = try ScreenGrid.init(80, 24);
     defer grid.deinit(testing.allocator);
 
     // Out-of-bounds write returns false.
@@ -73,7 +75,7 @@ test "ScreenGrid.writeCell at (col=cols, row=rows) drops cell (REQ-TUI-001 bound
 
 // REQ-TUI-001: snapshot is read-only view, no mutation.
 test "ScreenGrid.snapshot returns const view of active grid" {
-    const grid = ScreenGrid.init(40, 12);
+    var grid = try ScreenGrid.init(40, 12);
     defer grid.deinit(testing.allocator);
 
     _ = grid.writeCell(5, 5, 'Y', .{});
@@ -85,7 +87,7 @@ test "ScreenGrid.snapshot returns const view of active grid" {
 
 // REQ-TUI-001: XOR swap cycles active_idx.
 test "ScreenGrid.swap toggles active_idx" {
-    const grid = ScreenGrid.init(40, 12);
+    var grid = try ScreenGrid.init(40, 12);
     defer grid.deinit(testing.allocator);
 
     try testing.expectEqual(@as(u1, 0), grid.active_idx);
@@ -97,7 +99,7 @@ test "ScreenGrid.swap toggles active_idx" {
 
 // REQ-TUI-001: clear resets only active grid (not previous).
 test "ScreenGrid.clear resets active but not previous" {
-    const grid = ScreenGrid.init(20, 10);
+    var grid = try ScreenGrid.init(20, 10);
     defer grid.deinit(testing.allocator);
 
     // Write to active grid (idx 0).
