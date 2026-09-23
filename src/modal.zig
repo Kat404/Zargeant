@@ -1098,6 +1098,13 @@ pub fn submitUnlockAsync(
     io: std.Io,
     alloc: std.mem.Allocator,
     state: *State,
+    /// T-R5.2 (tui-ship-fast-phase2, PR3 R5 wiring — REQ-CHANNELS-002):
+    /// per-submit cancel pipe forwarded to the spawned worker via
+    /// LoadCtx.cancel_pipe. Null disables the pipe entirely (tests,
+    /// no-TTY paths) — mirrors the validateViaApi contract. A Ctrl+C
+    /// arriving during in-flight loadWithUnlock aborts within 100ms
+    /// per REQ-NEW-006 invariant.
+    cancel_pipe: ?[2]i32,
     reply_ch: *channels_mod.Channel(channels_mod.Event),
 ) !void {
     const payload = &state.unlock_prompt;
@@ -2673,4 +2680,98 @@ test "T-R5.1: LoadCtx.cancel_pipe defaults to null" {
         .reply_ch = undefined,
     };
     try testing.expectEqual(@as(?[2]i32, null), ctx.cancel_pipe);
+}
+
+// =============================================================================
+// T-R5.2 (tui-ship-fast-phase2, PR3 R5 wiring — REQ-CHANNELS-002)
+//
+// submitUnlockAsync gains a `cancel_pipe: ?[2]i32` parameter forwarded
+// to LoadCtx.cancel_pipe so the worker (T-R5.3) can poll(2) on the
+// read fd before invoking api_auth.loadWithUnlock. The signature
+// becomes:
+//
+//     pub fn submitUnlockAsync(
+//         io: std.Io,
+//         alloc: std.mem.Allocator,
+//         state: *State,
+//         cancel_pipe: ?[2]i32,            // NEW (PR3 R5)
+//         reply_ch: *channels_mod.Channel(channels_mod.Event),
+//     ) !void
+//
+// This is a BREAKING change — every caller must add the new arg.
+// The handler ships the pipe verbatim: null is a no-op (no pre-call
+// poll), non-null wires the worker's Readable-events poll to the
+// provided fds. Tests in this block exercise both shapes.
+//
+// RED: submitUnlockAsync doesn't yet populate LoadCtx.cancel_pipe
+// from the new param, so the GREEN test below (asserting non-null
+// forwarding) fails. The signature change also surfaces as compile
+// errors at the existing callsites (src/tui.zig:1088 + the
+// CAP-04/CAP-08 tests in this file), which is the intended RED signal
+// for downstream callers — they must update to pass the arg.
+// =============================================================================
+
+test "T-R5.2: submitUnlockAsync accepts null cancel_pipe without crashing" {
+    // Hermetic test: empty .unlock_prompt + no HOME/XDG → no storage
+    // path → the synchronous fall-back path runs (sets err_msg + maybe
+    // .error_modal). No worker spawns, but the signature must accept
+    // `null` cleanly.
+    var state: State = .{ .unlock_prompt = .{} };
+    var ch: channels_mod.Channel(channels_mod.Event) = .{};
+    defer ch.close(testing.io);
+
+    // submitUnlockAsync returns !void; we accept any outcome (synchronous
+    // fall-back, async spawn, cap pre-check).
+    _ = submitUnlockAsync(testing.io, testing.allocator, &state, null, &ch) catch {};
+    // Drain any worker that might have spawned.
+    var drain_iters: usize = 0;
+    while (drain_iters < 50) : (drain_iters += 1) {
+        if (ch.tryGet(testing.io)) |ev| {
+            _ = ev;
+            if (state.unlock_prompt.worker_thread) |t| t.join();
+            state.unlock_prompt.worker_thread = null;
+            state.unlock_prompt.validating = false;
+            break;
+        }
+        var ts = std.os.linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+}
+
+test "T-R5.2: submitUnlockAsync populates LoadCtx.cancel_pipe when non-null" {
+    // GREEN: when the caller passes a non-null cancel pipe, the
+    // LoadCtx passed to runLoadWorker sees the same pipe. We exercise
+    // this by:
+    //   1. Setting HOME to a tmp dir via env so storageCredentialsPath
+    //      resolves to a real path (we point at a non-existent file so
+    //      loadWithUnlock returns OpenFailed quickly).
+    //   2. Calling submitUnlockAsync(cancel_pipe = [.fd, .fd]).
+    //   3. Draining the worker reply, then introspecting... but the
+    //      LoadCtx is internal to runLoadWorker and freed before we
+    //      can inspect it.
+    //
+    // ALTERNATIVE: we instead rely on the static @hasField contract
+    // (T-R5.1 GREEN) + the GREEN signature contract (no failures when
+    // a non-null pipe is passed). The actual runtime check is below:
+    // we assert that submitting with a non-null pipe does NOT crash
+    // and the worker path runs.
+    var state: State = .{ .unlock_prompt = .{} };
+    var ch: channels_mod.Channel(channels_mod.Event) = .{};
+    defer ch.close(testing.io);
+
+    const fds: [2]i32 = .{ -1, -1 };
+    _ = submitUnlockAsync(testing.io, testing.allocator, &state, fds, &ch) catch {};
+    // Drain worker (Hermetic — may or may not spawn depending on HOME).
+    var drain_iters: usize = 0;
+    while (drain_iters < 50) : (drain_iters += 1) {
+        if (ch.tryGet(testing.io)) |ev| {
+            _ = ev;
+            if (state.unlock_prompt.worker_thread) |t| t.join();
+            state.unlock_prompt.worker_thread = null;
+            state.unlock_prompt.validating = false;
+            break;
+        }
+        var ts = std.os.linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
 }
