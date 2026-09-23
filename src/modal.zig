@@ -859,6 +859,18 @@ const ValidateCtx = struct {
 /// Worker context for the per-submit loadWithUnlock worker (WU-2,
 /// CAP-04/08/11). Same shape as ValidateCtx plus the XDG path the
 /// worker reads from.
+///
+/// T-R5.1 (tui-ship-fast-phase2, PR3 R5 wiring — REQ-CHANNELS-001):
+/// gains `cancel_pipe: ?[2]i32 = null` so the load worker (PR3 T-R5.3)
+/// can poll(2) the cancel fd before invoking `api_auth.loadWithUnlock`.
+/// The pre-call poll aborts the worker within the 100ms REQ-NEW-006
+/// target when a Ctrl+C arrives during unlock submit; intra-KDF cancel
+/// is deferred to a future Phase 3+ KDF-hook slice (it requires
+/// extending `api_auth.loadWithUnlock`'s signature to take a cancel
+/// pipe through the Argon2id call site — out of scope here).
+///
+/// The default `null` matches ValidateCtx's contract — submitUnlockAsync
+/// overrides it at construction when the caller provides a pipe.
 const LoadCtx = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -2602,4 +2614,61 @@ test "CAP-08: worker reply observed within 16ms via channels.submit_reply" {
         try testing.expect(state.unlock_prompt.err_msg_len > 0);
         try testing.expectEqualStrings("Unlock failed: OpenFailed", state.unlock_prompt.err_msg_buf[0..state.unlock_prompt.err_msg_len]);
     }
+}
+
+// =============================================================================
+// T-R5.1 (tui-ship-fast-phase2, PR3 R5 wiring — REQ-CHANNELS-001)
+//
+// LoadCtx gains a `cancel_pipe: ?[2]i32` field mirroring the existing
+// ValidateCtx shape. The field is allocated/initialized by submitUnlockAsync
+// (T-R5.2) and polled by runLoadWorker (T-R5.3) so a Ctrl+C during the
+// unlock submit aborts the worker within the 100ms REQ-NEW-006 target.
+//
+// These tests assert the static field contract:
+//   1. The field exists.
+//   2. The default is `null` (when constructed without specifying it).
+//   3. The type is `?[2]i32` so the worker can poll(2) it directly.
+//
+// RED: these tests fail to compile because LoadCtx.cancel_pipe is not
+// yet declared — the failure to compile IS the RED signal.
+//
+// NOTE (Zig 0.16 quirk): `@TypeOf(LoadCtx.cancel_pipe)` is rejected when
+// the field has a default value. We use `@typeInfo(...).@"struct".fields`
+// to read the declared field type instead — it works regardless of
+// whether the field has a default.
+// =============================================================================
+
+test "T-R5.1: LoadCtx has cancel_pipe field with type ?[2]i32" {
+    // Compile-time assertion that the field exists with the expected
+    // type. Mirrors ValidateCtx's shape (validated against the parent
+    // commit's existing field; LoadCtx must match).
+    try testing.expect(@hasField(LoadCtx, "cancel_pipe"));
+
+    // Look up the field type via the typeInfo reflection — works with
+    // default-value fields (see NOTE above).
+    const info = @typeInfo(LoadCtx).@"struct";
+    var found_cancel_pipe = false;
+    for (info.fields) |f| {
+        if (std.mem.eql(u8, f.name, "cancel_pipe")) {
+            try testing.expectEqual(?[2]i32, f.type);
+            found_cancel_pipe = true;
+            break;
+        }
+    }
+    try testing.expect(found_cancel_pipe);
+}
+
+test "T-R5.1: LoadCtx.cancel_pipe defaults to null" {
+    // Default-constructed LoadCtx must default cancel_pipe to null
+    // (matches ValidateCtx's contract — submitUnlockAsync overrides the
+    // default at construction when the caller passes a pipe).
+    const ctx: LoadCtx = .{
+        .io = undefined,
+        .alloc = undefined,
+        .passphrase = undefined,
+        .path = undefined,
+        .next_attempts = 0,
+        .reply_ch = undefined,
+    };
+    try testing.expectEqual(@as(?[2]i32, null), ctx.cancel_pipe);
 }
