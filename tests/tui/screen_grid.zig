@@ -305,17 +305,18 @@ test "diffAndEmit bold style emits bold SGR (\\x1b[1m) and reset (\\x1b[0m)" {
 }
 
 test "diffAndEmit trailing CUP at cursor position when cursor_col != CURSOR_SKIP" {
-    // cursor_col=10, cursor_row=4 → trailing CUP "\x1b[5;11H".
-    // One cell change to force the function past the loop body; then
-    // emitTrailingCUP appends the trailing CUP.
-    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
-    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    // cursor_col=10, cursor_row=4 → trailing CUP "\x1b[5;11H". Grid is
+    // sized 20×10 so the precondition `cursor_col < cols && cursor_row < rows`
+    // holds (10 < 20, 4 < 10). One cell change to force the function past
+    // the loop body; then emitTrailingCUP appends the trailing CUP.
+    var prev: [200]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 200;
+    var current: [200]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 200;
     current[0] = .{ .ch = 'Z', .style = .{} };
 
-    var buf: [64]u8 = undefined;
+    var buf: [128]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
 
-    try diffAndEmit(&w, &prev, &current, 4, 1, 10, 4);
+    try diffAndEmit(&w, &prev, &current, 20, 10, 10, 4);
 
     // Trailing bytes after the last entry are exactly "\x1b[5;11H".
     const actual = buf[0..w.end];
@@ -354,11 +355,6 @@ test "diffAndEmit emits 3-byte UTF-8 (€) intact" {
     const actual = buf[0..w.end];
     // The 3-byte UTF-8 sequence must appear intact (NOT truncated to "\xac").
     try testing.expect(std.mem.indexOf(u8, actual, "\xe2\x82\xac") != null);
-    // And the single-byte truncation sentinel must NOT appear.
-    try testing.expect(std.mem.indexOf(u8, actual, "\xac") == null or
-        // "\xac" alone could appear inside another sequence; ensure the
-        // 3-byte sequence is present by checking the trailing byte.
-        std.mem.endsWith(u8, actual, "\xe2\x82\xac"));
     // Byte-exact: CUP + SGR reset + € + SGR reset
     try testing.expectEqualStrings(
         "\x1b[1;1H\x1b[0m\xe2\x82\xac\x1b[0m",

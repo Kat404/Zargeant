@@ -156,14 +156,15 @@ just run-mock                  # manual TUI smoke test
 | Task | Commit | `just` command | Expected | Status |
 |------|--------|-----------------|----------|--------|
 | T-2.1.1 | `4f5824a` | `just test-tui-screen-grid` | 10/10 PASS | ✅ DONE |
-| T-2.1.2 | (this WU) | `just test-tui-screen-grid` | 11/11 PASS | ✅ DONE |
+| T-2.1.2 | `a40f2ac` | `just test-tui-screen-grid` | 11/11 PASS | ✅ DONE |
+| T-2.2.1 | `f0e69e2` (RED) + `<green>` (this WU) | `just test-tui-screen-grid` | 22/22 PASS | ✅ DONE |
 | ... | | | | |
 
 ## Progress
 
 - [x] T-2.1.1 ScreenGrid value type — **DONE** (`4f5824a`)
-- [x] T-2.1.2 CursorIntent + cursorFromIntent — **DONE** (this WU)
-- [ ] T-2.2.1 DiffEntry + diffAndEmit
+- [x] T-2.1.2 CursorIntent + cursorFromIntent — **DONE** (`a40f2ac`)
+- [x] T-2.2.1 DiffEntry + diffAndEmit — **DONE** (`f0e69e2` RED + `<green>` GREEN)
 - [ ] T-2.3.1 renderKeyEntryToGrid
 - [ ] T-2.3.2 render*ToGrid (4 more)
 - [ ] T-2.3.3 renderToGrid dispatcher
