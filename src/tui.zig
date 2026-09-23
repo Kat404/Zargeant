@@ -429,6 +429,27 @@ pub fn tuiThreadInit(
         }
     }
 
+    // PR3 R2 fix (T-R2.3): mirror kitty_flags_pushed into kitty_active
+    // so the parser's dispatch gate (T-R2.2) flips on for terminals
+    // that successfully pushed kitty kb. When the push failed or the
+    // terminal didn't support kitty kb, kitty_active stays false and
+    // the dispatcher's `final == 'u'` branch returns `.invalid` for
+    // any `CSI ... u` sequence — preserving pre-fix behavior for
+    // legacy terminals that emit literal shift+u or non-kitty CSI
+    // extensions ending in `u`.
+    lc.kitty_active = lc.kitty_flags_pushed;
+    lc.parser.setKittyActive(lc.kitty_active);
+
+    // PR3 R5 wiring (T-R2.3): seed cancel_pipe = null here. The
+    // tuiThreadInit signature doesn't take ThreadArgs (the
+    // orchestrator's caller contract is the 3-arg form); the
+    // T-R5.* WUs thread the real pipe fds from ThreadArgs into
+    // the Lifecycle so submitFrame + tuiThreadShutdown can access
+    // them without re-threading args. Until then, cancel_pipe is
+    // null and tests that don't model Ctrl+C don't need to specify
+    // it.
+    lc.cancel_pipe = null;
+
     return lc;
 }
 
