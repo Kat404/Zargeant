@@ -491,12 +491,71 @@ pub fn drawKeyEntry(win: *WindowMock, state: *State) !void {
 /// `drawKeyEntry` — T-SG-8 contract preserves drawKeyEntry's signature
 /// verbatim (tested at tests/tui/runtime_thread.zig:1618).
 pub fn renderKeyEntryToGrid(grid: *ScreenGrid, state: *const State) void {
-    _ = grid;
-    _ = state;
-    // TDD RED skeleton — replaced in T-2.3.1 GREEN. The SkeletonNotImplemented
-    // sentinel is the project's standard "the body is not yet implemented"
-    // marker (mirrors src/diff_emit.zig's RED contract at T-2.2.1).
-    @panic("SkeletonNotImplemented: renderKeyEntryToGrid");
+    // Tiger Style §5 — exhaustive dispatch. T-2.3.3 will replace the
+    // `else => return` no-op with concrete handlers for the remaining
+    // 4 variants; today only `.key_entry` renders into the grid.
+    const payload = switch (state.*) {
+        .key_entry => &state.key_entry,
+        else => return,
+    };
+
+    // Tiger Style §4 — defensive precondition on the draft length and
+    // the inline err_msg_buf (mirrors drawKeyEntry's assert at line 365
+    // + the implicit `idx < cells.len` guard on the err_msg loop).
+    std.debug.assert(payload.draft_len <= payload.draft.len);
+    std.debug.assert(payload.err_msg_len <= payload.err_msg_buf.len);
+
+    const prompt = "Enter API key: ";
+    const prefix_len: usize = prompt.len;
+
+    // Row 0: prompt prefix at cols 0..14. Each cell is a single char
+    // (u8 → u21 widening is automatic).
+    for (prompt, 0..) |c, i| {
+        const col: u16 = @intCast(i);
+        if (col >= grid.cols) break;
+        _ = grid.writeCell(col, 0, c, .{});
+    }
+
+    // Row 0: masked draft chars (one `*` per draft byte) starting at
+    // col=prefix_len. `shown` caps at the visible window — the draft
+    // is too long to render the tail (mirrors drawKeyEntry lines 374-378).
+    const shown: usize = @min(payload.draft_len, @as(usize, grid.cols) -| prefix_len);
+    for (payload.draft[0..shown], 0..) |_, i| {
+        const col: u16 = @intCast(prefix_len + i);
+        if (col >= grid.cols) break;
+        _ = grid.writeCell(col, 0, '*', .{});
+    }
+
+    // Row 1 (zargeant/tui-display-err): inline err_msg_buf[0..err_msg_len]
+    // copied into cells[grid.cols..grid.cols+err_msg_len], bold. Mirrors
+    // drawKeyEntry's row-2 rendering at lines 386-393. Row index is 1
+    // because `grid.cols` cells-per-row means offset `cols` = row 1.
+    if (payload.err_msg_len > 0) {
+        const msg = payload.err_msg_buf[0..payload.err_msg_len];
+        for (msg, 0..) |c, i| {
+            const col: u16 = @intCast(i);
+            if (col >= grid.cols) break;
+            _ = grid.writeCell(col, 1, c, .{ .bold = true });
+        }
+    }
+
+    // Row 0: spinner glyph (`|`, bold) at the prompt's tail while
+    // `validating` is true. Cap at cols (NOT cells.len) per WU 1.5.2 R3
+    // — the original bug wrote `|` into row 1 when draft saturated the
+    // visible window. Mirrors drawKeyEntry's spinner guard at line 406.
+    if (payload.validating) {
+        const spinner_x: usize = prefix_len + shown;
+        if (spinner_x < @as(usize, grid.cols)) {
+            const col: u16 = @intCast(spinner_x);
+            _ = grid.writeCell(col, 0, '|', .{ .bold = true });
+        }
+    }
+    // NOTE: drawKeyEntry writes payload.cursor_col / cursor_row as a
+    // WU 0.6 side effect (Bug 4). renderKeyEntryToGrid is the pure
+    // Stage 1 renderer — it does NOT mutate state. The cursor position
+    // for the new three-stage pipeline is computed by the Phase 2
+    // dispatch layer (T-2.3.3) from the same prefix_len + shown
+    // formula; emitting the trailing CUP is diffAndEmit's job.
 }
 
 /// Format-pre-flight + API-validation submit handler for KeyEntry (WU-2:

@@ -544,8 +544,9 @@ test "renderKeyEntryToGrid mirrors drawKeyEntry into ScreenGrid (T-2.3.1)" {
         const active = grid.active();
         // (col=0, row=0) = 'E'
         try testing.expectEqual(@as(u21, 'E'), active[0 * 80 + 0].ch);
-        // (col=5, row=0) = 'A' (the 'A' of "API")
-        try testing.expectEqual(@as(u21, 'A'), active[0 * 80 + 5].ch);
+        // (col=6, row=0) = 'A' (the 'A' of "API"; col=5 is the space
+        // between "Enter" and "API")
+        try testing.expectEqual(@as(u21, 'A'), active[0 * 80 + 6].ch);
         // (col=14, row=0) = ' ' (trailing space of the prompt)
         try testing.expectEqual(@as(u21, ' '), active[0 * 80 + 14].ch);
     }
