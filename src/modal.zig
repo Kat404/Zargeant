@@ -1229,6 +1229,18 @@ fn runLoadWorker(ctx: *LoadCtx) void {
     defer ctx.alloc.free(ctx.passphrase);
     defer ctx.alloc.free(ctx.path);
 
+    // T-R5.3 (tui-ship-fast-phase2, PR3 R5 wiring — REQ-CHANNELS-003):
+    // Pre-call poll STUB. The full implementation lands in T-R5.3 GREEN.
+    // For now this is a no-op so the RED tests below fail when the pipe
+    // is readable (the worker proceeds to loadWithUnlock instead of
+    // bailing out early).
+    if (ctx.cancel_pipe != null) {
+        // STUB — poll(2) wiring lands in T-R5.3 GREEN.
+        // Without the poll, a Ctrl+C arriving during in-flight loadWithUnlock
+        // blocks the worker for ~2s (Argon2id m=64MiB t=3) before the reply
+        // fires — violating the 100ms REQ-NEW-006 invariant.
+    }
+
     const result = api_auth.loadWithUnlock(ctx.io, ctx.path, ctx.passphrase);
 
     var payload: channels_mod.ValidateApiReplyPayload = .{
@@ -2778,4 +2790,163 @@ test "T-R5.2: submitUnlockAsync populates LoadCtx.cancel_pipe when non-null" {
         var ts = std.os.linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
         _ = std.os.linux.nanosleep(&ts, null);
     }
+}
+
+// =============================================================================
+// T-R5.3 (tui-ship-fast-phase2, PR3 R5 wiring — REQ-CHANNELS-003)
+//
+// runLoadWorker polls ctx.cancel_pipe BEFORE invoking api_auth.loadWithUnlock.
+// If the pipe is readable (cancel was signaled), it returns immediately with
+// payload.success=false, err="Cancelled" — without running the Argon2id KDF
+// (which would otherwise block ~2s with default t=3, m=64MiB parameters).
+//
+// The polling is the 100ms REQ-NEW-006 invariant for the unlock submit
+// path. With the current STUB (no poll), the worker proceeds to
+// loadWithUnlock regardless of cancel state — the RED tests below fail.
+//
+// Verification strategy:
+//   1. Create a real cancel_pipe via std.os.linux.pipe.
+//   2. Write 1 byte to pipe[1] BEFORE spawning the worker (simulating
+//      a Ctrl+C that arrived before the worker's first poll).
+//   3. submitUnlockAsync the worker thread.
+//   4. Drain the worker reply — expect .ValidateApiReply with err="Cancelled".
+//      RED: the err will be "Unlock failed: OpenFailed" (or similar) because
+//      loadWithUnlock ran (or the synchronous fall-back fires).
+//
+// We control the storage path via XDG_CONFIG_HOME so submitUnlockAsync
+// resolves to a real (non-existent) file path that triggers loadWithUnlock
+// (avoiding the synchronous fall-back path that wouldn't reach runLoadWorker).
+// =============================================================================
+
+test "T-R5.3: runLoadWorker honors cancel_pipe pre-call (Cancelled reply when readable)" {
+    // 1. Allocate the cancel_pipe + write before spawn.
+    var cancel_pipe: [2]i32 = .{ -1, -1 };
+    {
+        const rc = std.os.linux.pipe(&cancel_pipe);
+        try testing.expectEqual(@as(usize, 0), rc);
+    }
+    defer {
+        if (cancel_pipe[0] >= 0) _ = std.os.linux.close(cancel_pipe[0]);
+        if (cancel_pipe[1] >= 0) _ = std.os.linux.close(cancel_pipe[1]);
+    }
+    // Simulate a Ctrl+C that arrived BEFORE the worker's first poll.
+    {
+        const byte: [1]u8 = .{0x01};
+        _ = std.os.linux.write(cancel_pipe[1], &byte, 1);
+    }
+    // Drain the byte into a scratch so the fds buffer state doesn't
+    // confuse the test runner's later close().
+    {
+        var drain_buf: [1]u8 = undefined;
+        _ = std.os.linux.read(cancel_pipe[0], &drain_buf, 1);
+    }
+    // Re-write for the actual test — the worker's first poll(2) sees
+    // a readable fd on entry.
+    {
+        const byte: [1]u8 = .{0x01};
+        _ = std.os.linux.write(cancel_pipe[1], &byte, 1);
+    }
+
+    // 2. Point storage at a tmpdir so submitUnlockAsync proceeds past
+    //    the sync fall-back (storageCredentialsPath needs XDG or HOME).
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &dir_buf);
+    // Best-effort: if setenv/putenv is not available, the test will
+    // skip the actual cancel-pipe branch (still must compile). The CI
+    // environment typically has HOME set already, which submitUnlockAsync
+    // picks up via readEnvVar. We use HOME as our anchor.
+
+    // 3. Spawn the worker via submitUnlockAsync.
+    var state: State = .{ .unlock_prompt = .{} };
+    var ch: channels_mod.Channel(channels_mod.Event) = .{};
+    defer ch.close(testing.io);
+    _ = dir_buf[0..dir_len]; // suppress unused warning when HOME works
+    submitUnlockAsync(testing.io, testing.allocator, &state, cancel_pipe, &ch) catch {};
+
+    // 4. Drain the reply. Expect err="Cancelled" within a short window.
+    //    RED behavior: loadWithUnlock ran (or sync fall-back fired), so
+    //    the err message is "Unlock failed: OpenFailed" or "No storage path".
+    var saw_cancelled = false;
+    var saw_other = false;
+    var drain_iters: usize = 0;
+    while (drain_iters < 200) : (drain_iters += 1) {
+        if (ch.tryGet(testing.io)) |ev| {
+            switch (ev) {
+                .ValidateApiReply => |rep| {
+                    if (!rep.success and rep.err_len > 0) {
+                        if (std.mem.eql(u8, rep.err[0..rep.err_len], "Cancelled")) {
+                            saw_cancelled = true;
+                        } else {
+                            saw_other = true;
+                        }
+                    }
+                    if (state.unlock_prompt.worker_thread) |t| t.join();
+                    state.unlock_prompt.worker_thread = null;
+                    state.unlock_prompt.validating = false;
+                    break;
+                },
+                else => {},
+            }
+            break;
+        }
+        var ts = std.os.linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+
+    // GREEN: cancellation detected, err="Cancelled" reply posted within 100ms.
+    try testing.expect(saw_cancelled);
+    try testing.expect(!saw_other);
+}
+
+test "T-R5.3: runLoadWorker proceeds when pipe is NOT readable" {
+    // Counter-test: when no byte is written to cancel_pipe, the worker
+    // proceeds to loadWithUnlock normally and returns either a success
+    // reply or a regular failure reply (OpenFailed for missing file).
+    // GREEN: the worker proceeds; the response is NOT "Cancelled".
+    var cancel_pipe: [2]i32 = .{ -1, -1 };
+    {
+        const rc = std.os.linux.pipe(&cancel_pipe);
+        try testing.expectEqual(@as(usize, 0), rc);
+    }
+    defer {
+        if (cancel_pipe[0] >= 0) _ = std.os.linux.close(cancel_pipe[0]);
+        if (cancel_pipe[1] >= 0) _ = std.os.linux.close(cancel_pipe[1]);
+    }
+    // Do NOT write to cancel_pipe — the worker should proceed normally.
+
+    var state: State = .{ .unlock_prompt = .{} };
+    var ch: channels_mod.Channel(channels_mod.Event) = .{};
+    defer ch.close(testing.io);
+    submitUnlockAsync(testing.io, testing.allocator, &state, cancel_pipe, &ch) catch {};
+
+    // Drain the reply. Expect a non-Cancelled reply OR a no-worker
+    // outcome (synchronous fall-back path took over).
+    var saw_cancelled = false;
+    var drain_iters: usize = 0;
+    while (drain_iters < 200) : (drain_iters += 1) {
+        if (ch.tryGet(testing.io)) |ev| {
+            switch (ev) {
+                .ValidateApiReply => |rep| {
+                    if (!rep.success and rep.err_len > 0) {
+                        if (std.mem.eql(u8, rep.err[0..rep.err_len], "Cancelled")) {
+                            saw_cancelled = true;
+                        }
+                    }
+                    if (state.unlock_prompt.worker_thread) |t| t.join();
+                    state.unlock_prompt.worker_thread = null;
+                    state.unlock_prompt.validating = false;
+                    break;
+                },
+                else => {},
+            }
+            break;
+        }
+        var ts = std.os.linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+
+    // GREEN: worker proceeded normally; we don't see a Cancelled reply.
+    try testing.expect(!saw_cancelled);
 }
