@@ -1349,14 +1349,16 @@ test "WindowMock adapter forwards 10 methods (T-2.4.1)" {
     {
         const win = try WindowMock.init(testing.allocator, 20, 10);
         defer win.deinit();
-        // Stain the grid with 'X' chars, then clear.
+        // Stain the grid with 'X' chars via the adapter's grid
+        // pointer (unwrap optional — init always sets it), then clear.
+        const g = win.grid.?;
         for (0..200) |i| {
             const c: u16 = @intCast(i % 20);
             const r: u16 = @intCast(i / 20);
-            _ = win.grid.writeCell(c, r, 'X', .{});
+            _ = g.writeCell(c, r, 'X', .{});
         }
         win.clear();
-        const active = win.grid.active();
+        const active = g.active();
         for (active) |cell| {
             try testing.expectEqual(@as(u21, ' '), cell.ch);
         }
@@ -1367,8 +1369,9 @@ test "WindowMock adapter forwards 10 methods (T-2.4.1)" {
     {
         const win = try WindowMock.init(testing.allocator, 20, 10);
         defer win.deinit();
+        const g = win.grid.?;
         try win.print("hello", .{});
-        const active = win.grid.active();
+        const active = g.active();
         try testing.expectEqual(@as(u21, 'h'), active[0].ch);
         try testing.expectEqual(@as(u21, 'e'), active[1].ch);
         try testing.expectEqual(@as(u21, 'l'), active[2].ch);
@@ -1395,7 +1398,7 @@ test "WindowMock adapter forwards 10 methods (T-2.4.1)" {
         const win = try WindowMock.init(testing.allocator, 20, 10);
         defer win.deinit();
         try win.print("€", .{});
-        const active = win.grid.active();
+        const active = win.grid.?.active();
         // Find the cell with ch=0x20AC (€).
         var found_euro: usize = 0;
         for (active) |cell| {
@@ -1416,7 +1419,7 @@ test "WindowMock adapter forwards 10 methods (T-2.4.1)" {
         const win = try WindowMock.init(testing.allocator, 20, 10);
         defer win.deinit();
         try win.print("X", .{ .bold = true });
-        const active = win.grid.active();
+        const active = win.grid.?.active();
         try testing.expect(active[0].style.bold);
     }
 
@@ -1461,7 +1464,7 @@ test "WindowMock adapter forwards 10 methods (T-2.4.1)" {
         const win = try WindowMock.init(testing.allocator, 20, 10);
         defer win.deinit();
 
-        _ = win.grid.writeCell(5, 3, 'X', .{ .bold = true });
+        _ = win.grid.?.writeCell(5, 3, 'X', .{ .bold = true });
 
         // Allocate an all-space prev slice using modal.Cell (matches
         // diff's parameter type). screen_grid.Cell and modal.Cell are
