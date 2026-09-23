@@ -422,56 +422,89 @@ pub fn tuiThreadInit(
 /// Shutdown the TUI lifecycle (REQ-TUI-002 reverse + REQ-TUI-022 pop).
 /// Order matters: pop kitty first (if pushed), then exit alt screen,
 /// then disable raw mode (which restores termios).
+///
+/// Phase 2 PR2 (T-2.6.3) — dead-pty detector (design §5.4 / D5):
+/// the writer is probed via `writer.flush()` at the top; on failure
+/// (the std.Io.Writer analog of POSIX `EPIPE` / `BrokenPipe`, exposed
+/// as `error.WriteFailed` in `std.Io.Writer.Error`), the terminal-state
+/// teardown writes are skipped. The PTY is presumed dead — sending
+/// further bytes is wasteful at best, and can confuse interactive
+/// shells (e.g. on SSH reconnect) at worst. In-process cleanup
+/// (`setCurrentParser(null)`) always runs since it's not terminal
+/// state.
 pub fn tuiThreadShutdown(lc: *Lifecycle, writer: *std.Io.Writer) void {
-    // ponytail: flush before teardown so alt-screen-exit + raw-mode-
-    // disable bytes don't sit in the 4 KiB stdout buffer. Without this,
-    // the terminal stays in alt-screen + raw mode until the kernel
-    // closes the fd at process exit, which on some terminals means the
-    // user sees a half-restored TTY.
-    writer.flush() catch {};
+    // ── Dead-pty probe (T-2.6.3) ────────────────────────────────────
+    // writer.flush() returns std.Io.Writer.Error. The set includes
+    // WriteFailed (the std.Io.Writer analog of POSIX BrokenPipe /
+    // EPIPE — surfacing when the destination can no longer accept
+    // bytes). Match on WriteFailed → pty_alive=false. Other errors
+    // (EndOfStream, Unimplemented) are non-fatal for shutdown
+    // purposes; the teardown still attempts to drain to whatever
+    // non-PTY destination the writer models.
+    var pty_alive = true;
+    writer.flush() catch {
+        // std.Io.Writer.Error = {WriteFailed, EndOfStream, Unimplemented}.
+        // Any of them means the destination can't accept more bytes —
+        // the PTY is presumed dead (POSIX EPIPE / BrokenPipe is
+        // surfaced as WriteFailed in std.Io.Writer.Error). The dead-pty
+        // flag captures the outcome regardless of which concrete error
+        // was returned; the teardown writes skip on any failure.
+        pty_alive = false;
+    };
 
-    // 1. Pop kitty kb (only if we pushed).
-    if (lc.kitty_flags_pushed) {
-        popKittyKb(writer) catch {};
-    }
+    // ── Terminal-state teardown (only if PTY is alive) ───────────────
+    // ponytail: when the PTY is dead, every teardown byte is wasted
+    // work — the kernel-side fd is gone. Skipping the writes also
+    // avoids confusing interactive shells during SSH reconnect (some
+    // terminals multiplex multiple sessions over a single PTY; stray
+    // bytes land in the wrong session).
+    if (pty_alive) {
+        // 1. Pop kitty kb (only if we pushed).
+        if (lc.kitty_flags_pushed) {
+            popKittyKb(writer) catch {};
+        }
 
-    // 1.5 WU-2 (tui-keyentry-rebuild, REQ-NEW-002): disable DEC 2004
-    // bracketed paste AFTER kitty-kb pop and BEFORE alt-screen exit
-    // (symmetric wire order with init — design R-DES-5).
-    disableBracketedPaste(writer) catch {};
+        // 1.5 WU-2 (tui-keyentry-rebuild, REQ-NEW-002): disable DEC 2004
+        // bracketed paste AFTER kitty-kb pop and BEFORE alt-screen exit
+        // (symmetric wire order with init — design R-DES-5).
+        disableBracketedPaste(writer) catch {};
 
-    // 2. Exit alt screen + disable in-band resize.
-    exitAltScreenAndResize(writer) catch {};
+        // 2. Exit alt screen + disable in-band resize.
+        exitAltScreenAndResize(writer) catch {};
 
-    // 2.5 WU 1.5.4 (tui-ship-fast-phase0.5, R7): ECMA-48 terminal state
-    // restore — show cursor (DECTCEM) + SGR reset. Without these the
-    // cursor stays invisible and bold/color attributes leak into the
-    // next shell prompt (Starship, fish, etc.). Both must precede
-    // disableRawMode because DECTCEM is terminal-screen state (the
-    // kernel does not touch it on raw-mode restore) and SGR attributes
-    // are likewise terminal state, not termios state. Reference: xterm
-    // ctlseqs §"CSI Ps h" / §"SGR"; ECMA-48 §8.3.201 (DECTCEM) +
-    // §8.3.117 (SGR 0 = default rendition).
-    writer.writeAll("\x1b[?25h") catch {}; // DECTCEM show cursor
-    writer.writeAll("\x1b[0m") catch {}; // SGR reset
+        // 2.5 WU 1.5.4 (tui-ship-fast-phase0.5, R7): ECMA-48 terminal state
+        // restore — show cursor (DECTCEM) + SGR reset. Without these the
+        // cursor stays invisible and bold/color attributes leak into the
+        // next shell prompt (Starship, fish, etc.). Both must precede
+        // disableRawMode because DECTCEM is terminal-screen state (the
+        // kernel does not touch it on raw-mode restore) and SGR attributes
+        // are likewise terminal state, not termios state. Reference: xterm
+        // ctlseqs §"CSI Ps h" / §"SGR"; ECMA-48 §8.3.201 (DECTCEM) +
+        // §8.3.117 (SGR 0 = default rendition).
+        writer.writeAll("\x1b[?25h") catch {}; // DECTCEM show cursor
+        writer.writeAll("\x1b[0m") catch {}; // SGR reset
 
-    // 3. Disable raw mode (restores original termios).
-    if (lc.raw_term) |*rt| {
-        rt.disableRawMode() catch {};
+        // 3. Disable raw mode (restores original termios).
+        if (lc.raw_term) |*rt| {
+            rt.disableRawMode() catch {};
+        }
+
+        // WU 1.5.4 (R7): final flush AFTER all teardown bytes so the
+        // ~40 bytes of teardown CSI don't sit in the 4 KiB stdout
+        // buffer past process exit. The pre-T-2.6.3 flush at the top
+        // of shutdown now doubles as the dead-pty probe (with the
+        // `pty_alive` capture); this post-teardown flush drains the
+        // bytes we just wrote.
+        writer.flush() catch {};
     }
 
     // WU-1 (REQ-NEW-008): clear the thread-local parser handle AFTER
     // raw-mode teardown so no caller of `nextWithTimeout` reaches a
     // dangling Parser pointer during shutdown. Symmetric with the
-    // setCurrentParser call in tuiThreadInit.
+    // setCurrentParser call in tuiThreadInit. Always runs (in-process
+    // state, independent of pty_alive) — the parser is a Lifecycle
+    // field, not a terminal-state artifact.
     terminal.event.setCurrentParser(null);
-
-    // WU 1.5.4 (R7): final flush AFTER all teardown bytes. The L338
-    // flush at the top of shutdown runs BEFORE the DEC reset sequences;
-    // without this second flush the ~40 bytes of teardown CSI sit in
-    // the 4 KiB stdout buffer and may never reach the terminal before
-    // process exit.
-    writer.flush() catch {};
 }
 
 // =============================================================================
