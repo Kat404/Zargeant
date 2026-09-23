@@ -633,13 +633,71 @@ pub fn submitFrame(
     cols: u16,
     rows: u16,
 ) !void {
-    _ = lifecycle;
-    _ = writer;
-    _ = state;
-    _ = cols;
-    _ = rows;
-    // T-2.6.1 RED skeleton — replaced in the GREEN commit.
-    @panic("SkeletonNotImplemented: submitFrame");
+    // Tiger Style §4 — defensive preconditions on the dims and the
+    // state pointer. Zig's type system rejects null `*const State`
+    // outside unsafe code; the cols/rows guard mirrors diffAndEmit's.
+    std.debug.assert(cols > 0);
+    std.debug.assert(rows > 0);
+    std.debug.assert(lifecycle.grids[lifecycle.active_idx].cols == cols);
+    std.debug.assert(lifecycle.grids[lifecycle.active_idx].rows == rows);
+
+    const modal = @import("modal.zig");
+    const diff_emit = @import("diff_emit");
+
+    // ── Bracket open (mandatory even on empty diff) ──────────────────
+    // DEC 2026 (synchronized update) brackets the diff+emit pair so
+    // the terminal atomically applies the changes. Without the
+    // bracket, busy terminals can tear mid-render and show partial
+    // frames. design §7 / D7 — paired brackets are non-negotiable
+    // even when diffAndEmit produces zero entries.
+    try writer.writeAll("\x1b[?2026h");
+
+    // ── Stage 1: clear + render into the active grid ────────────────
+    // renderToGrid assumes a freshly-cleared active grid (T-2.3.3
+    // caller contract). Cells it doesn't touch stay at the cleared
+    // value (default ' '), so leftover cells from the previous frame
+    // can't leak through.
+    lifecycle.grids[lifecycle.active_idx].clear();
+    modal.renderToGrid(&lifecycle.grids[lifecycle.active_idx], state);
+
+    // ── Stage 2: compute the cursor intent ──────────────────────────
+    // Per design §3.4, key_entry carries an explicit cursor contract
+    // (cursor_col, cursor_row). Other variants return CURSOR_SKIP so
+    // diffAndEmit's trailing-CUP stage emits nothing.
+    const cursor = modal.cursorIntentFromState(state);
+
+    // ── Stage 3: diff + emit ─────────────────────────────────────────
+    // diffAndEmit walks the two grid slices (prev/active) and writes a
+    // per-cell `<CUP><SGR><UTF-8><SGR reset>` byte stream for each
+    // changed cell, then a trailing CUP at the cursor position (or
+    // CURSOR_SKIP suppression). Tiger Style §3 — allocation-free; the
+    // two `[2]ScreenGrid` slices are value-typed inline storage.
+    try diff_emit.diffAndEmit(
+        writer,
+        lifecycle.grids[lifecycle.active_idx ^ 1].active(), // prev frame
+        lifecycle.grids[lifecycle.active_idx].active(), // current frame
+        cols,
+        rows,
+        cursor.col,
+        cursor.row,
+    );
+
+    // ── Bracket close (mandatory even on empty diff) ─────────────────
+    // Symmetric with the open bracket. The terminal flushes the
+    // buffered frame on the close transition.
+    try writer.writeAll("\x1b[?2026l");
+
+    // ── Consume the force_full_redraw flag ───────────────────────────
+    // Cleared after the first render so subsequent frames revert to
+    // incremental diffing (Tiger Style §5 — explicit state machine).
+    lifecycle.force_full_redraw = false;
+
+    // ── XOR swap (Lifecycle-level, not ScreenGrid-level) ────────────
+    // Branch-free (u1 ^ 1). On the next frame, the previously-inactive
+    // grid becomes active and the previously-active grid becomes the
+    // diff baseline. The ScreenGrid instances themselves never call
+    // their own `swap` — each one always reads/writes cells[0].
+    lifecycle.active_idx ^= 1;
 }
 
 // =============================================================================

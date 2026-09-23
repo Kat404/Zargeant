@@ -1683,6 +1683,16 @@ test "T-SG-9: no new third-party imports in src/tui.zig or src/runtime.zig" {
         // NOT a third-party dep — matches the design §3.3 contract that
         // only the TUI thread constructs ScreenGrid.
         "@import(\"screen_grid\")",
+        // Phase 2 PR2 (T-2.6.1): in-tree `diff_emit` module (added in
+        // PR1b as src/diff_emit.zig, wired via lib_mod.addImport at
+        // build.zig). submitFrame now calls `diff_emit.diffAndEmit`
+        // directly from src/tui.zig. In-tree sibling, NOT a
+        // third-party dep — same status as screen_grid above. Both
+        // spellings (`@import("diff_emit")` module alias +
+        // `@import("diff_emit.zig")` file-path) are accepted since
+        // they're routed through the same module graph.
+        "@import(\"diff_emit\")",
+        "@import(\"diff_emit.zig\")",
     };
     for (targets) |path| {
         const content = try std.Io.Dir.cwd().readFileAlloc(
