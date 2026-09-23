@@ -467,6 +467,29 @@ pub fn drawModal(win: *WindowMock, state: *State) !void {
     }
 }
 
+/// Compute the blink cursor position based on the current modal state
+/// (design §3.4 / T-2.6.1). Returns the (col, row) tuple that
+/// `submitFrame` threads into `diffAndEmit`'s trailing-CUP emission.
+///
+/// The sentinel `CURSOR_SKIP` (defined in `src/screen_grid.zig`) is
+/// returned for non-`key_entry` variants — those states don't carry a
+/// cursor layout contract. `.key_entry` returns the (col, row) written
+/// by `drawKeyEntry` (or its `renderKeyEntryToGrid` counterpart);
+/// `submitFrame` consumes them verbatim.
+///
+/// Tiger Style §5 — exhaustive switch over the `union(enum)` so adding
+/// a 7th State variant forces a compile error here AND in the per-fn
+/// handlers.
+pub fn cursorIntentFromState(state: *const State) struct { col: u16, row: u16 } {
+    return switch (state.*) {
+        .key_entry => |*ke| .{ .col = ke.cursor_col, .row = ke.cursor_row },
+        .welcome, .unlock_prompt, .consent_prompt, .agent_loop, .error_modal => .{
+            .col = screen_grid_mod.CURSOR_SKIP,
+            .row = 0,
+        },
+    };
+}
+
 /// Dispatch the active `state` variant to its `render*ToGrid` fn.
 /// Used by `submitFrame` (Phase 2 replacement for `drawModal`).
 ///

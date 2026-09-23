@@ -591,6 +591,58 @@ pub fn emitFrame(
 }
 
 // =============================================================================
+// submitFrame (T-2.6.1, design §3.3 — phase 2 PR2 second half).
+//
+// Per-frame orchestrator. Renders the modal into the active ScreenGrid,
+// calls `diffAndEmit` to write the diff + trailing CUP, and swaps the
+// double buffer. Replaces the inline render+emit logic in
+// `tuiThreadLoop` (T-2.6.2 wiring). Tiger Style §6 — error set is the
+// writer's error set (writer failures are the only realistic runtime
+// error; allocation-free means no OOM).
+//
+// Preconditions:
+// - `lifecycle.active_grid()` returns a freshly-cleared grid for the current frame
+// - `lifecycle.previous_grid()` returns the prior frame's diff baseline
+//
+// Caller contract: `tuiThreadLoop` invokes `submitFrame` once per
+// iteration when `redraw_pending` is true. On error, `tuiThreadLoop`
+// converts to a `catch continue`.
+// =============================================================================
+
+/// Phase 2 PR2 per-frame orchestrator (T-2.6.1). Writes paired DEC
+/// 2026 brackets (mandatory even on empty diff per design §7 / D7),
+/// clears + renders into the active ScreenGrid, diff+emit, swaps the
+/// double buffer, and consumes the `force_full_redraw` flag.
+///
+/// `state` is the modal state from `src/modal.zig`. The active grid
+/// is `lc.grids[lc.active_idx]`; the previous grid is
+/// `lc.grids[lc.active_idx ^ 1]`. Both ScreenGrid instances keep their
+/// internal `active_idx` at 0 (we never call `ScreenGrid.swap` — the
+/// Lifecycle-level XOR swap cycles between the two ScreenGrids
+/// wholesale).
+///
+/// Error set: `std.Io.Writer.Error` (propagated from `writeAll`) ∪
+/// `diff_emit.DiffEmitError`. The dead-pty signature `WriteFailed`
+/// (the analog of POSIX `BrokenPipe` in `std.Io.Writer.Error`) is
+/// detected at the call site by `tuiThreadShutdown`'s flush probe —
+/// `submitFrame` itself just propagates whatever the writer returns.
+pub fn submitFrame(
+    lifecycle: *Lifecycle,
+    writer: *std.Io.Writer,
+    state: *const @import("modal.zig").State,
+    cols: u16,
+    rows: u16,
+) !void {
+    _ = lifecycle;
+    _ = writer;
+    _ = state;
+    _ = cols;
+    _ = rows;
+    // T-2.6.1 RED skeleton — replaced in the GREEN commit.
+    @panic("SkeletonNotImplemented: submitFrame");
+}
+
+// =============================================================================
 // TUI thread body (R-PR 4 real lifecycle).
 //
 // The runtime orchestrator spawns this on its TUI thread. We drain

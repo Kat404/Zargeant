@@ -100,6 +100,11 @@ const Tui = struct {
     // grids without taking a direct dependency on screen_grid (the test
     // module's build.zig wiring only exposes `tui`, not `screen_grid`).
     pub const ScreenGrid = root.tui.ScreenGrid;
+    // Phase 2 PR2 (T-2.6.1): submitFrame orchestrator — the per-frame
+    // pipeline that replaces the legacy emitFrame call at the only
+    // site in tuiThreadLoop. Re-exported here so the RED + GREEN tests
+    // reach it via the same Tui namespace as the rest of the lifecycle.
+    pub const submitFrame = root.tui.submitFrame;
 };
 
 /// Key-event driver helper (REQ-TIW-013). Mirrors the wiring in
@@ -3320,4 +3325,278 @@ test "T-2.5.2.2: ScreenGrid.init rejects too-large dims (error.DimsTooLarge)" {
     defer at_cap.deinit(testing.allocator);
     try testing.expectEqual(@as(u16, 256), at_cap.cols);
     try testing.expectEqual(@as(u16, 128), at_cap.rows);
+}
+
+// =============================================================================
+// Phase 2 PR2 (T-2.6.1) — submitFrame orchestrator tests.
+//
+// T-2.6.1 adds `submitFrame` (src/tui.zig) — the per-frame orchestrator
+// that wires together `modal.renderToGrid` + `diff_emit.diffAndEmit` +
+// the [2]ScreenGrid double-buffer swap. Sister to the legacy `emitFrame`
+// (which is heap-allocated and per-frame `alloc.dupe`); submitFrame is
+// allocation-free (Tiger Style §3) and writes paired DEC 2026 brackets
+// even on empty diff (design §7 / D7).
+//
+// Test design (9 tests, all RED before the GREEN impl):
+//
+//   1. submitFrame writes paired DEC 2026 brackets even on empty diff.
+//   2. submitFrame writes diff bytes for changed cells.
+//   3. submitFrame swaps lc.active_idx after rendering.
+//   4. submitFrame consumes lc.force_full_redraw after rendering.
+//   5. submitFrame returns error.WriteFailed when writer's drain fails
+//      (std.Io.Writer.failing — fails on first writeAll).
+//   6. submitFrame propagates the dead-pty writer error (analog of
+//      POSIX BrokenPipe, surfaced through std.Io.Writer.Error.WriteFailed)
+//      when the writer can't accept any bytes.
+//   7. submitFrame on state.welcome skips the trailing CUP (CURSOR_SKIP).
+//   8. submitFrame on state.key_entry emits the trailing CUP at the
+//      (cursor_col, cursor_row) returned by cursorIntentFromState.
+//   9. @hasDecl(src.tui, "submitFrame") — compile-time symbol guard.
+//
+// Helper: FailingFlushWriter — a std.Io.Writer with a vtable whose
+// drain + flush + rebase + sendFile all return error.WriteFailed. Used
+// by tests 5+6 to verify error propagation. Mirrors std.Io.Writer.failing
+// but extends `flush` to also fail (so the dead-pty detector in
+// tuiThreadShutdown can be tested separately in T-2.6.3).
+// =============================================================================
+
+// Compile-time symbol guard for T-2.6.1 — submitFrame must exist on
+// the Tui module by the end of the GREEN commit.
+test "T-2.6.1.9: @hasDecl Tui.submitFrame (compile-time symbol guard)" {
+    try testing.expect(@hasDecl(Tui, "submitFrame"));
+}
+
+/// A std.Io.Writer whose drain + flush + sendFile + rebase all return
+/// `error.WriteFailed`. Constructed via `FailingFlushWriter.make(&buf)`.
+/// Uses static vtable pointers (const fn ptrs) so the helper is
+/// thread-safe in the `test-tui-runtime-thread` artifact (all tests
+/// run on the same thread by default).
+const FailingFlushWriter = struct {
+    fn failingFlushOnly(_: *std.Io.Writer) std.Io.Writer.Error!void {
+        return error.WriteFailed;
+    }
+
+    const vtable: std.Io.Writer.VTable = .{
+        .drain = std.Io.Writer.failingDrain,
+        .flush = failingFlushOnly,
+        .sendFile = std.Io.Writer.failingSendFile,
+        .rebase = std.Io.Writer.failingRebase,
+    };
+
+    /// Construct a writer that fails on every drain / flush / rebase /
+    /// sendFile call. The `buffer` is unused (the vtable never reads
+    /// it); pass a `&[_]u8{}` placeholder to satisfy the type.
+    pub fn make(buffer: []u8) std.Io.Writer {
+        return .{
+            .vtable = &vtable,
+            .buffer = buffer,
+        };
+    }
+};
+
+/// Construct a Lifecycle with default fields + a 10×3 ScreenGrid double
+/// buffer. The grid dims match the modal-state width/height contract
+/// for the key_entry state (prompt "Enter API key: " + draft region).
+fn makeLifecycleForSubmitFrame(width: u16, height: u16) !Tui.Lifecycle {
+    return .{
+        .raw_term = null,
+        .dec_2048_supported = false,
+        .kitty_supported = false,
+        .kitty_flags_pushed = false,
+        .redraw_pending = std.atomic.Value(bool).init(false),
+        .width = width,
+        .height = height,
+        .grids = .{
+            try Tui.ScreenGrid.init(width, height),
+            try Tui.ScreenGrid.init(width, height),
+        },
+    };
+}
+
+test "T-2.6.1.1: submitFrame writes paired DEC 2026 brackets even on empty diff" {
+    // REQ-TUI-021 + design §7 / D7 — the synchronized-update bracket is
+    // mandatory even when prev == active (zero diff entries). Without
+    // the bracket, terminals that batch updates between begin/end pairs
+    // would flush nothing for empty frames (subtle visual stutter).
+    //
+    // Empty-diff scenario: state.welcome (no cells written by
+    // renderToGrid — the .welcome arm is a no-op) + both grids empty
+    // (default ' ' cells from ScreenGrid.init). diffAndEmit walks the
+    // grid finding zero changes, then emitTrailingCUP sees CURSOR_SKIP
+    // and emits nothing.
+    var lc = try makeLifecycleForSubmitFrame(10, 3);
+    defer lc.grids[0].deinit(testing.allocator);
+    defer lc.grids[1].deinit(testing.allocator);
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    var state: M.State = .{ .welcome = {} };
+    try Tui.submitFrame(&lc, &w, &state, lc.width, lc.height);
+
+    const out = buf[0..w.end];
+    // Both bracket halves must appear in the byte stream.
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?2026h") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?2026l") != null);
+
+    // Bracket open must precede bracket close (innermost ordering).
+    const open_idx = std.mem.indexOf(u8, out, "\x1b[?2026h").?;
+    const close_idx = std.mem.indexOf(u8, out, "\x1b[?2026l").?;
+    try testing.expect(open_idx < close_idx);
+}
+
+test "T-2.6.1.2: submitFrame writes diff bytes for changed cells between prev and active" {
+    // REQ-DE-001 + REQ-DE-003 — submitFrame's diff+emit stage writes
+    // the byte stream for changed cells: `<CUP><SGR><UTF-8><SGR reset>`
+    // per entry. We seed the previous grid with spaces + the active
+    // grid (post-renderToGrid) with a single non-space cell; the diff
+    // must contain a CUP escape pointing at the changed cell's coords.
+    //
+    // Setup: state.key_entry with empty draft — renderKeyEntryToGrid
+    // writes only the prompt prefix "Enter API key: " to row 0,
+    // columns 0..14. With a 16-col grid the diff is just the 15
+    // prompt chars (vs the prev frame's all-spaces baseline).
+    var lc = try makeLifecycleForSubmitFrame(16, 4);
+    defer lc.grids[0].deinit(testing.allocator);
+    defer lc.grids[1].deinit(testing.allocator);
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    var state: M.State = .{ .key_entry = .{} };
+    try Tui.submitFrame(&lc, &w, &state, lc.width, lc.height);
+
+    const out = buf[0..w.end];
+    // The prompt prefix writes 'E' at (col=0, row=0) → CUP "\x1b[1;1H".
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;1H") != null);
+    // The literal 'E' from the prompt prefix must appear.
+    try testing.expect(std.mem.indexOf(u8, out, "E") != null);
+}
+
+test "T-2.6.1.3: submitFrame swaps active_idx after rendering" {
+    // REQ-LIFECYCLE-002 — submitFrame cycles `lc.active_idx` between
+    // 0 and 1 (XOR swap semantics, branch-free). Initial state: 0.
+    // After one call: 1. After two calls: 0 (idempotent pair).
+    var lc = try makeLifecycleForSubmitFrame(10, 3);
+    defer lc.grids[0].deinit(testing.allocator);
+    defer lc.grids[1].deinit(testing.allocator);
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var state: M.State = .{ .welcome = {} };
+
+    try testing.expectEqual(@as(u1, 0), lc.active_idx);
+    try Tui.submitFrame(&lc, &w, &state, lc.width, lc.height);
+    try testing.expectEqual(@as(u1, 1), lc.active_idx);
+
+    try Tui.submitFrame(&lc, &w, &state, lc.width, lc.height);
+    try testing.expectEqual(@as(u1, 0), lc.active_idx);
+}
+
+test "T-2.6.1.4: submitFrame clears force_full_redraw after consuming it" {
+    // REQ-LIFECYCLE-003 — submitFrame consumes the force_full_redraw
+    // flag (resize, initial-draw, explicit invalidation trigger a
+    // full re-emit). Cleared by submitFrame so the next frame reverts
+    // to incremental diffing.
+    var lc = try makeLifecycleForSubmitFrame(10, 3);
+    defer lc.grids[0].deinit(testing.allocator);
+    defer lc.grids[1].deinit(testing.allocator);
+    lc.force_full_redraw = true;
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var state: M.State = .{ .welcome = {} };
+
+    try testing.expect(lc.force_full_redraw);
+    try Tui.submitFrame(&lc, &w, &state, lc.width, lc.height);
+    try testing.expect(!lc.force_full_redraw);
+}
+
+test "T-2.6.1.5: submitFrame returns error.WriteFailed when writer's drain fails" {
+    // REQ-DE error propagation — submitFrame's first writeAll (the
+    // DEC 2026 bracket open) calls into the writer's vtable.drain.
+    // With FailingFlushWriter.make, drain returns WriteFailed. The
+    // error must propagate to the caller — submitFrame does NOT
+    // swallow writer errors (Tiger Style §1 fail-fast).
+    var lc = try makeLifecycleForSubmitFrame(10, 3);
+    defer lc.grids[0].deinit(testing.allocator);
+    defer lc.grids[1].deinit(testing.allocator);
+
+    var placeholder_buf: [1]u8 = undefined;
+    var w = FailingFlushWriter.make(&placeholder_buf);
+    var state: M.State = .{ .welcome = {} };
+
+    const result = Tui.submitFrame(&lc, &w, &state, lc.width, lc.height);
+    try testing.expectError(error.WriteFailed, result);
+}
+
+test "T-2.6.1.6: submitFrame propagates writer errors past the bracket (diff stage)" {
+    // The design contract (T-2.6.1 / D7) — the bracket open succeeds
+    // (8 bytes fit in the small buffer) but the diff+emit overflows.
+    // The error from diffAndEmit must propagate. This mirrors the
+    // "BrokenPipe" case from POSIX where a writer hits EPIPE mid-write:
+    // submitFrame doesn't swallow the error; the caller uses
+    // `catch continue` to keep the loop alive.
+    var lc = try makeLifecycleForSubmitFrame(80, 4);
+    defer lc.grids[0].deinit(testing.allocator);
+    defer lc.grids[1].deinit(testing.allocator);
+
+    // 32 bytes is enough for the 16-byte bracket pair but the diff
+    // (with 15 prompt chars + 15 SGR sequences) overflows.
+    var small_buf: [32]u8 = undefined;
+    var w = std.Io.Writer.fixed(&small_buf);
+    var state: M.State = .{ .key_entry = .{} };
+
+    const result = Tui.submitFrame(&lc, &w, &state, lc.width, lc.height);
+    try testing.expectError(error.WriteFailed, result);
+}
+
+test "T-2.6.1.7: submitFrame on state.welcome skips trailing CUP (CURSOR_SKIP)" {
+    // WU 0.6 / Bug 4 — non-key_entry states don't carry a cursor
+    // layout contract. cursorIntentFromState returns CURSOR_SKIP for
+    // .welcome, so diffAndEmit's emitTrailingCUP sees the sentinel
+    // and emits nothing. The byte stream ends with the bracket close
+    // + the previous bracket open pattern (no CUP after the bracket).
+    var lc = try makeLifecycleForSubmitFrame(10, 3);
+    defer lc.grids[0].deinit(testing.allocator);
+    defer lc.grids[1].deinit(testing.allocator);
+
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var state: M.State = .{ .welcome = {} };
+
+    try Tui.submitFrame(&lc, &w, &state, lc.width, lc.height);
+    const out = buf[0..w.end];
+
+    // The bracket close is the last thing in the stream.
+    try testing.expect(std.mem.endsWith(u8, out, "\x1b[?2026l"));
+}
+
+test "T-2.6.1.8: submitFrame on state.key_entry emits trailing CUP at cursor position" {
+    // WU 0.6 / Bug 4 — key_entry carries an explicit cursor position
+    // written by drawKeyEntry / renderKeyEntryToGrid. After the
+    // diff loop, submitFrame threads cursor_col / cursor_row into
+    // diffAndEmit's trailing CUP. We construct a key_entry state with
+    // cursor_col=4, cursor_row=0; the trailing CUP fires at
+    // (col=4, row=0) → "\x1b[1;5H" (1-indexed translation).
+    var lc = try makeLifecycleForSubmitFrame(16, 4);
+    defer lc.grids[0].deinit(testing.allocator);
+    defer lc.grids[1].deinit(testing.allocator);
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    const draft_buf: [256]u8 = .{0} ** 256;
+    var state: M.State = .{ .key_entry = .{
+        .draft = draft_buf,
+        .draft_len = 0,
+        .cursor_col = 4,
+        .cursor_row = 0,
+    } };
+
+    try Tui.submitFrame(&lc, &w, &state, lc.width, lc.height);
+    const out = buf[0..w.end];
+
+    // Trailing CUP at (col=4, row=0) → "\x1b[1;5H".
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;5H") != null);
 }
