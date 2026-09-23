@@ -32,6 +32,14 @@ const emitTrailingCUP = diff_emit_mod.emitTrailingCUP;
 const modal_root = @import("modal");
 const modal_ns = modal_root.modal;
 const renderKeyEntryToGrid = modal_ns.renderKeyEntryToGrid;
+// tui-ship-fast-phase2 (T-2.3.2) — 4 more render*ToGrid fns (renderUnlockToGrid,
+// renderConsentPromptToGrid, renderErrorModalToGrid, renderAgentLoopToGrid).
+// Same pattern as renderKeyEntryToGrid (T-2.3.1, line above): each mirrors
+// its corresponding draw* fn and writes to a *ScreenGrid instead of *WindowMock.
+const renderUnlockToGrid = modal_ns.renderUnlockToGrid;
+const renderConsentPromptToGrid = modal_ns.renderConsentPromptToGrid;
+const renderErrorModalToGrid = modal_ns.renderErrorModalToGrid;
+const renderAgentLoopToGrid = modal_ns.renderAgentLoopToGrid;
 const ModalState = modal_ns.State;
 
 // REQ-TUI-001: ScreenGrid struct shape + invariants
@@ -555,4 +563,562 @@ test "renderKeyEntryToGrid mirrors drawKeyEntry into ScreenGrid (T-2.3.1)" {
     //         Compile-time symbol existence — passes even in RED because
     //         the stub fn is declared (just panics at runtime).
     try testing.expect(@hasDecl(modal_ns, "renderKeyEntryToGrid"));
+}
+
+// T-2.3.2: renderUnlockToGrid (REQ-MODAL-001, design §3.4, T-SG-8 preserved).
+//
+// One test block with 5 sub-cases — mirrors the umbrella test pattern
+// for renderKeyEntryToGrid (line 455) and cursorFromIntent (line 155).
+// All sub-cases share the same setup (80×24 ScreenGrid + State.unlock_prompt).
+//
+// RED state: renderUnlockToGrid panics with "SkeletonNotImplemented" (T-2.3.2
+// stub at src/modal.zig:720). The first sub-case to invoke the fn terminates
+// the test process. Sub-case 5 (`@hasDecl` compile-time guard) is the only
+// one that passes in RED. The GREEN impl replaces the stub and all 5
+// sub-cases pass.
+test "renderUnlockToGrid writes unlock modal content (T-2.3.2)" {
+    const prefix_len: usize = "Unlock passphrase: ".len; // 19
+
+    // Case 1: unlock_prompt + draft "secret-passphrase" (17 chars) writes
+    //         17 '*' cells at row 0, cols 19..35 (the mask region after
+    //         the prompt). drawUnlock writes '*' at win.cells[prefix_len+i]
+    //         for i in 0..shown; renderUnlockToGrid writes the same via
+    //         grid.writeCell(prefix_len+i, 0, '*', .{}).
+    {
+        const draft_str = "secret-passphrase"; // 17 chars
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..draft_str.len], draft_str);
+        const state: ModalState = .{
+            .unlock_prompt = .{
+                .draft = draft_buf,
+                .draft_len = draft_str.len,
+            },
+        };
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderUnlockToGrid(&grid, &state);
+
+        const active = grid.active();
+        for (0..draft_str.len) |i| {
+            try testing.expectEqual(@as(u21, '*'), active[prefix_len + i].ch);
+        }
+    }
+
+    // Case 2: unlock_prompt + empty draft writes 0 mask cells (no '*' in
+    //         the mask region; prompt still fills cols 0..18).
+    {
+        const state: ModalState = .{ .unlock_prompt = .{} };
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderUnlockToGrid(&grid, &state);
+
+        const active = grid.active();
+        // No '*' should appear anywhere in row 0 (mask region only).
+        for (0..80) |i| {
+            try testing.expect(active[i].ch != '*');
+        }
+        // The prompt prefix chars are still written at cols 0..18.
+        const prompt = "Unlock passphrase: ";
+        for (prompt, 0..) |expected, i| {
+            try testing.expectEqual(@as(u21, expected), active[i].ch);
+        }
+    }
+
+    // Case 3: renderUnlockToGrid does NOT mutate state. drawUnlock is a
+    //         pure renderer too, but we still assert no mutation happens
+    //         (per design §3.4 contract: "Pure renderer — does NOT mutate
+    //         state"). All payload fields stay byte-identical.
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..5], "abcde");
+        var state: ModalState = .{
+            .unlock_prompt = .{
+                .draft = draft_buf,
+                .draft_len = 5,
+                .attempts = 2,
+                .validating = false,
+            },
+        };
+        const before = state;
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderUnlockToGrid(&grid, &state);
+
+        // State fields are byte-identical — no assignment happened.
+        try testing.expectEqual(before.unlock_prompt.draft_len, state.unlock_prompt.draft_len);
+        try testing.expectEqual(@as(u8, 2), state.unlock_prompt.attempts);
+        try testing.expectEqual(before.unlock_prompt.validating, state.unlock_prompt.validating);
+        try testing.expectEqualSlices(u8, &before.unlock_prompt.draft, &state.unlock_prompt.draft);
+    }
+
+    // Case 4: renderUnlockToGrid is a no-op when state is the WRONG
+    //         variant (T-2.3.3 dispatcher will route correctly; the
+    //         per-fn guard prevents over-render). Pre-clear the grid
+    //         with a marker char; calling with .key_entry leaves it
+    //         intact (the fn early-returns before writing anything).
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..3], "xyz");
+        const state: ModalState = .{
+            .key_entry = .{
+                .draft = draft_buf,
+                .draft_len = 3,
+            },
+        };
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+        // Mark the entire active grid with 'X' (clear + write all).
+        grid.clear();
+        for (0..80 * 24) |i| {
+            _ = grid.writeCell(@intCast(i % 80), @intCast(i / 80), 'X', .{});
+        }
+
+        renderUnlockToGrid(&grid, &state);
+
+        // Every cell must still be 'X' — no-op confirmed.
+        const active = grid.active();
+        for (active) |cell| {
+            try testing.expectEqual(@as(u21, 'X'), cell.ch);
+        }
+    }
+
+    // Case 5: `@hasDecl(modal_ns, "renderUnlockToGrid")` static guard.
+    try testing.expect(@hasDecl(modal_ns, "renderUnlockToGrid"));
+}
+
+// T-2.3.2: renderConsentPromptToGrid (REQ-MODAL-001, design §3.4,
+// T-SG-8 preserved). Mirrors drawConsentPrompt which prints:
+//   "Store key at " + path (underline) + " (mode 0o600, last-4 " +
+//   last_four (bold) + ")?"
+// on row 0.
+test "renderConsentPromptToGrid writes consent prompt content (T-2.3.2)" {
+    // Case 1: consent_prompt with path "test.json" + last_four "WXYZ"
+    //         writes the literal fragments at expected positions on row 0.
+    //         Layout (col 0-indexed):
+    //           "Store key at " (13 chars)         → cols 0..12
+    //           path "test.json"  (9 chars)        → cols 13..21  (underline)
+    //           " (mode 0o600, last-4 " (22 chars) → cols 22..43
+    //           last_four "WXYZ"  (4 chars)        → cols 44..47  (bold)
+    //           ")?"  (2 chars)                    → cols 48..49
+    {
+        var last_four: [4]u8 = .{0} ** 4;
+        @memcpy(last_four[0..4], "WXYZ");
+        const path = "test.json";
+        const state: ModalState = .{
+            .consent_prompt = .{
+                .consent = true,
+                .last_four = last_four,
+                .path = path,
+            },
+        };
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderConsentPromptToGrid(&grid, &state);
+
+        const active = grid.active();
+        // Col 0 = 'S' (start of "Store")
+        try testing.expectEqual(@as(u21, 'S'), active[0].ch);
+        // Col 6 = 'k' from "Store k" (the 'k' of "key")
+        try testing.expectEqual(@as(u21, 'k'), active[6].ch);
+        // Col 12 = ' ' (trailing space of "Store key at ")
+        try testing.expectEqual(@as(u21, ' '), active[12].ch);
+        // Col 13 = 't' (start of path "test.json") — underlined
+        try testing.expectEqual(@as(u21, 't'), active[13].ch);
+        try testing.expect(active[13].style.underline);
+        // Col 21 = 'n' (last char of "test.json")
+        try testing.expectEqual(@as(u21, 'n'), active[21].ch);
+        // Col 44 = 'W' (start of last_four "WXYZ") — bold
+        try testing.expectEqual(@as(u21, 'W'), active[44].ch);
+        try testing.expect(active[44].style.bold);
+        // Col 47 = 'Z' (last char of "WXYZ")
+        try testing.expectEqual(@as(u21, 'Z'), active[47].ch);
+        // Col 48 = ')' (the close paren)
+        try testing.expectEqual(@as(u21, ')'), active[48].ch);
+        // Col 49 = '?' (the question mark)
+        try testing.expectEqual(@as(u21, '?'), active[49].ch);
+    }
+
+    // Case 2: consent_prompt + default (empty path, last_four zeros)
+    //         renders the static "Store key at " prefix at cols 0..12
+    //         followed by the closing " (mode 0o600, last-4    )?" suffix.
+    //         The path + last_four regions just contain spaces/zeros.
+    {
+        const state: ModalState = .{ .consent_prompt = .{} };
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderConsentPromptToGrid(&grid, &state);
+
+        const active = grid.active();
+        // Prompt prefix "Store key at " at cols 0..12.
+        const prefix = "Store key at ";
+        for (prefix, 0..) |expected, i| {
+            try testing.expectEqual(@as(u21, expected), active[i].ch);
+        }
+        // ")?" at cols (13 + 0) = 13, (13 + 0) = 13 — wait, with
+        // empty path (len=0) + " (mode 0o600, last-4 " (22 chars) +
+        // "    " (4 zero-bytes as spaces? actually last_four is [4]u8
+        // initialised to .{0} ** 4 — bytes are 0x00, NOT spaces).
+        // The draw fn writes &payload.last_four verbatim, which means
+        // the bytes 0x00 land in cells[13 + 0..13 + 4]. For the render
+        // fn, we mirror the same — those cells become u21 = 0x00
+        // (NUL). We just sample that ")" and "?" land at the end:
+        // total suffix is 22 (prefix string) + 4 (last_four) + 2 (")?")
+        // = 28 chars after col 13. So ")" is at col 13 + 22 + 4 = 39
+        // and "?" at col 40. (We test the closing parenthesis as a
+        // definite landmark.)
+        try testing.expectEqual(@as(u21, ')'), active[39].ch);
+        try testing.expectEqual(@as(u21, '?'), active[40].ch);
+    }
+
+    // Case 3: renderConsentPromptToGrid does NOT mutate state.
+    {
+        var last_four: [4]u8 = .{0} ** 4;
+        @memcpy(last_four[0..4], "ABCD");
+        const state: ModalState = .{
+            .consent_prompt = .{
+                .consent = true,
+                .last_four = last_four,
+                .path = "/tmp/x.json",
+            },
+        };
+        const before = state;
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderConsentPromptToGrid(&grid, &state);
+
+        // State fields are byte-identical — no assignment happened.
+        try testing.expectEqual(before.consent_prompt.consent, state.consent_prompt.consent);
+        try testing.expectEqualSlices(u8, &before.consent_prompt.last_four, &state.consent_prompt.last_four);
+        try testing.expectEqualStrings(before.consent_prompt.path, state.consent_prompt.path);
+    }
+
+    // Case 4: renderConsentPromptToGrid is a no-op when state is the
+    //         WRONG variant. Mark grid with 'X'; calling with .key_entry
+    //         leaves every cell intact.
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..3], "xyz");
+        const state: ModalState = .{
+            .key_entry = .{
+                .draft = draft_buf,
+                .draft_len = 3,
+            },
+        };
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+        grid.clear();
+        for (0..80 * 24) |i| {
+            _ = grid.writeCell(@intCast(i % 80), @intCast(i / 80), 'X', .{});
+        }
+
+        renderConsentPromptToGrid(&grid, &state);
+
+        // Every cell must still be 'X' — no-op confirmed.
+        const active = grid.active();
+        for (active) |cell| {
+            try testing.expectEqual(@as(u21, 'X'), cell.ch);
+        }
+    }
+
+    // Case 5: `@hasDecl(modal_ns, "renderConsentPromptToGrid")` static guard.
+    try testing.expect(@hasDecl(modal_ns, "renderConsentPromptToGrid"));
+}
+
+// T-2.3.2: renderErrorModalToGrid (REQ-MODAL-001, design §3.4, T-SG-8
+// preserved). Mirrors drawErrorModal which prints:
+//   "Error: " (bold) + "[<class>]" (bold) + " " + message + (if
+//   kind == .tls_gated) " — set ZARGEANT_RUN_TLS_HANDSHAKE=1" (bold)
+// on row 0.
+test "renderErrorModalToGrid writes error modal content (T-2.3.2)" {
+    // Case 1: error_modal + kind=.auth + message "API rejected key" writes
+    //         the literal fragments at expected positions on row 0.
+    //         Layout:
+    //           "Error: "  (7 chars)             → cols 0..6   (bold)
+    //           "[auth]"  (6 chars)              → cols 7..12  (bold)
+    //           " "  (1 char)                    → col 13
+    //           "API rejected key" (16 chars)    → cols 14..29
+    {
+        const msg = "API rejected key";
+        var msg_buf: [128]u8 = .{0} ** 128;
+        const msg_len = copyInline(&msg_buf, msg);
+        const state: ModalState = .{
+            .error_modal = .{
+                .kind = .auth,
+                .message_buf = msg_buf,
+                .message_len = msg_len,
+            },
+        };
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderErrorModalToGrid(&grid, &state);
+
+        const active = grid.active();
+        // Col 0 = 'E' (start of "Error")
+        try testing.expectEqual(@as(u21, 'E'), active[0].ch);
+        try testing.expect(active[0].style.bold);
+        // Col 6 = ':' (last char of "Error: ")
+        try testing.expectEqual(@as(u21, ':'), active[6].ch);
+        // Col 7 = '[' (start of "[auth]" class banner)
+        try testing.expectEqual(@as(u21, '['), active[7].ch);
+        try testing.expect(active[7].style.bold);
+        // Col 8 = 'a' (start of "auth")
+        try testing.expectEqual(@as(u21, 'a'), active[8].ch);
+        // Col 11 = 'h' (last char of "auth")
+        try testing.expectEqual(@as(u21, 'h'), active[11].ch);
+        // Col 12 = ']' (close of "[auth]")
+        try testing.expectEqual(@as(u21, ']'), active[12].ch);
+        // Col 13 = ' ' (space after class banner)
+        try testing.expectEqual(@as(u21, ' '), active[13].ch);
+        // Col 14 = 'A' (start of "API rejected key")
+        try testing.expectEqual(@as(u21, 'A'), active[14].ch);
+        // Col 29 = 'y' (last char of "API rejected key")
+        try testing.expectEqual(@as(u21, 'y'), active[29].ch);
+    }
+
+    // Case 2: error_modal + kind=.tls_gated + message "TLS handshake
+    //         blocked" appends the bold env-var hint after the message.
+    //         Total length: 7 + "[tls_gated]".len + 1 + "TLS handshake
+    //         blocked".len + " — set ZARGEANT_RUN_TLS_HANDSHAKE=1".len.
+    {
+        const msg = "TLS handshake blocked";
+        var msg_buf: [128]u8 = .{0} ** 128;
+        const msg_len = copyInline(&msg_buf, msg);
+        const state: ModalState = .{
+            .error_modal = .{
+                .kind = .tls_gated,
+                .message_buf = msg_buf,
+                .message_len = msg_len,
+            },
+        };
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderErrorModalToGrid(&grid, &state);
+
+        const active = grid.active();
+        // Find the env-var hint "ZARGEANT_RUN_TLS_HANDSHAKE" by char
+        // sample — pick a representative cell from the hint suffix.
+        // Total prefix length = 7 (Error:) + 10 ([tls_gated]) + 1 (space)
+        // + 20 (TLS handshake blocked) = 38 chars. So the hint " — set
+        // ZARGEANT_RUN_TLS_HANDSHAKE=1" starts at col 38.
+        // Col 38 = ' ' (the em-dash separator's leading space)
+        try testing.expectEqual(@as(u21, ' '), active[38].ch);
+        // Col 39 = '—' (em-dash, U+2014)
+        try testing.expectEqual(@as(u21, '—'), active[39].ch);
+        // Col 44 = 's' (start of "set")
+        try testing.expectEqual(@as(u21, 's'), active[44].ch);
+        // Col 51 = 'Z' (start of "ZARGEANT_RUN_TLS_HANDSHAKE=1") — bold
+        try testing.expectEqual(@as(u21, 'Z'), active[51].ch);
+        try testing.expect(active[51].style.bold);
+    }
+
+    // Case 3: renderErrorModalToGrid does NOT mutate state.
+    {
+        var msg_buf: [128]u8 = .{0} ** 128;
+        const msg_len = copyInline(&msg_buf, "boom");
+        const state: ModalState = .{
+            .error_modal = .{
+                .kind = .network,
+                .message_buf = msg_buf,
+                .message_len = msg_len,
+                .prior = .key_entry,
+            },
+        };
+        const before = state;
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderErrorModalToGrid(&grid, &state);
+
+        // State fields are byte-identical — no assignment happened.
+        try testing.expectEqual(@as(modal_ns.ErrorKind, .network), state.error_modal.kind);
+        try testing.expectEqual(before.error_modal.message_len, state.error_modal.message_len);
+        try testing.expectEqualSlices(u8, &before.error_modal.message_buf, &state.error_modal.message_buf);
+        try testing.expectEqual(@as(modal_ns.PriorKind, .key_entry), state.error_modal.prior);
+    }
+
+    // Case 4: renderErrorModalToGrid is a no-op when state is the
+    //         WRONG variant. Mark grid with 'X'; calling with .key_entry
+    //         leaves every cell intact.
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..3], "xyz");
+        const state: ModalState = .{
+            .key_entry = .{
+                .draft = draft_buf,
+                .draft_len = 3,
+            },
+        };
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+        grid.clear();
+        for (0..80 * 24) |i| {
+            _ = grid.writeCell(@intCast(i % 80), @intCast(i / 80), 'X', .{});
+        }
+
+        renderErrorModalToGrid(&grid, &state);
+
+        // Every cell must still be 'X' — no-op confirmed.
+        const active = grid.active();
+        for (active) |cell| {
+            try testing.expectEqual(@as(u21, 'X'), cell.ch);
+        }
+    }
+
+    // Case 5: `@hasDecl(modal_ns, "renderErrorModalToGrid")` static guard.
+    try testing.expect(@hasDecl(modal_ns, "renderErrorModalToGrid"));
+}
+
+// T-2.3.2: renderAgentLoopToGrid (REQ-MODAL-001, design §3.4, T-SG-8
+// preserved). Mirrors drawAgentLoopView which writes:
+//   - cumulative text on row 0 (cols 0..min(items.len, cols))
+//   - status bar "model={s} tokens={d} t={d}ms" on the bottom row
+//     (reverse style)
+test "renderAgentLoopToGrid writes agent loop content (T-2.3.2)" {
+    // Case 1: agent_loop + cumulative "Hello" (5 chars) + model "MiniMax-M3"
+    //         writes "Hello" at cols 0..4 on row 0, and the status bar
+    //         (starting with "model=") on row 23 (the bottom row of 80x24).
+    {
+        const alloc = testing.allocator;
+        var state: ModalState = .{
+            .agent_loop = .{
+                .allocator = alloc,
+                .model = "MiniMax-M3",
+                .tokens = 42,
+                .last_update_ms = 100,
+            },
+        };
+        defer state.agent_loop.cumulative.deinit(alloc);
+        try state.agent_loop.cumulative.appendSlice(alloc, "Hello");
+
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderAgentLoopToGrid(&grid, &state);
+
+        const active = grid.active();
+        // Row 0, cols 0..4 = "Hello"
+        try testing.expectEqual(@as(u21, 'H'), active[0 * 80 + 0].ch);
+        try testing.expectEqual(@as(u21, 'e'), active[0 * 80 + 1].ch);
+        try testing.expectEqual(@as(u21, 'l'), active[0 * 80 + 2].ch);
+        try testing.expectEqual(@as(u21, 'l'), active[0 * 80 + 3].ch);
+        try testing.expectEqual(@as(u21, 'o'), active[0 * 80 + 4].ch);
+        // Row 23 (bottom row), cols 0..5 = "model=" — reverse style.
+        const last_row = 23;
+        try testing.expectEqual(@as(u21, 'm'), active[last_row * 80 + 0].ch);
+        try testing.expect(active[last_row * 80 + 0].style.reverse);
+        try testing.expectEqual(@as(u21, 'o'), active[last_row * 80 + 1].ch);
+        try testing.expectEqual(@as(u21, 'd'), active[last_row * 80 + 2].ch);
+        try testing.expectEqual(@as(u21, 'e'), active[last_row * 80 + 3].ch);
+        try testing.expectEqual(@as(u21, 'l'), active[last_row * 80 + 4].ch);
+        try testing.expectEqual(@as(u21, '='), active[last_row * 80 + 5].ch);
+    }
+
+    // Case 2: agent_loop + empty cumulative + model "" + tokens=0 +
+    //         last_update_ms=0 writes ONLY the status bar on row 23.
+    //         The status bar starts with "model=" (since model="" the
+    //         rendered text is "model= tokens=0 t=0ms"). Row 0 stays
+    //         empty (no cumulative text).
+    {
+        const alloc = testing.allocator;
+        var state: ModalState = .{
+            .agent_loop = .{
+                .allocator = alloc,
+                .model = "",
+                .tokens = 0,
+                .last_update_ms = 0,
+            },
+        };
+        defer state.agent_loop.cumulative.deinit(alloc);
+
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderAgentLoopToGrid(&grid, &state);
+
+        const active = grid.active();
+        // Row 0 must be entirely spaces (no cumulative text).
+        for (0..80) |i| {
+            try testing.expectEqual(@as(u21, ' '), active[0 * 80 + i].ch);
+        }
+        // Row 23 (bottom row) col 0..5 = "model=" — reverse style.
+        const last_row = 23;
+        try testing.expectEqual(@as(u21, 'm'), active[last_row * 80 + 0].ch);
+        try testing.expect(active[last_row * 80 + 0].style.reverse);
+    }
+
+    // Case 3: renderAgentLoopToGrid does NOT mutate state. Cumulative
+    //         buffer, model, tokens, last_update_ms all stay identical.
+    {
+        const alloc = testing.allocator;
+        var state: ModalState = .{
+            .agent_loop = .{
+                .allocator = alloc,
+                .model = "MiniMax-M3",
+                .tokens = 999,
+                .last_update_ms = 12345,
+            },
+        };
+        defer state.agent_loop.cumulative.deinit(alloc);
+        try state.agent_loop.cumulative.appendSlice(alloc, "some text");
+
+        const before = state;
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderAgentLoopToGrid(&grid, &state);
+
+        // State fields are byte-identical — no assignment happened.
+        try testing.expectEqualStrings(before.agent_loop.model, state.agent_loop.model);
+        try testing.expectEqual(@as(u64, 999), state.agent_loop.tokens);
+        try testing.expectEqual(@as(i64, 12345), state.agent_loop.last_update_ms);
+        try testing.expectEqualSlices(u8, before.agent_loop.cumulative.items, state.agent_loop.cumulative.items);
+    }
+
+    // Case 4: renderAgentLoopToGrid is a no-op when state is the
+    //         WRONG variant. Mark grid with 'X'; calling with .key_entry
+    //         leaves every cell intact.
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..3], "xyz");
+        const state: ModalState = .{
+            .key_entry = .{
+                .draft = draft_buf,
+                .draft_len = 3,
+            },
+        };
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+        grid.clear();
+        for (0..80 * 24) |i| {
+            _ = grid.writeCell(@intCast(i % 80), @intCast(i / 80), 'X', .{});
+        }
+
+        renderAgentLoopToGrid(&grid, &state);
+
+        // Every cell must still be 'X' — no-op confirmed.
+        const active = grid.active();
+        for (active) |cell| {
+            try testing.expectEqual(@as(u21, 'X'), cell.ch);
+        }
+    }
+
+    // Case 5: `@hasDecl(modal_ns, "renderAgentLoopToGrid")` static guard.
+    try testing.expect(@hasDecl(modal_ns, "renderAgentLoopToGrid"));
+}
+
+// Local helper: copy a literal into the inline message/err buffer.
+// Mirrors the shape of modal.copyInline but lives here so the test file
+// doesn't need to expose a pub fn for it.
+fn copyInline(dst: *[128]u8, src: []const u8) usize {
+    const len: usize = @min(src.len, dst.len);
+    @memcpy(dst[0..len], src[0..len]);
+    return len;
 }
