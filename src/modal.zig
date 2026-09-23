@@ -769,9 +769,50 @@ pub fn renderUnlockToGrid(grid: *ScreenGrid, state: *const State) void {
     std.debug.assert(payload.draft_len <= payload.draft.len);
     std.debug.assert(payload.err_msg_len <= payload.err_msg_buf.len);
 
-    // GREEN marker — replaced in T-2.3.2 GREEN commit.
-    _ = grid;
-    @panic("SkeletonNotImplemented: renderUnlockToGrid");
+    // Row 0: prompt prefix at cols 0..18 (19 chars). Mirrors
+    // drawUnlock's `win.print("Unlock passphrase: ", .{})` call.
+    const prompt = "Unlock passphrase: ";
+    const prefix_len: usize = prompt.len;
+    for (prompt, 0..) |c, i| {
+        const col: u16 = @intCast(i);
+        if (col >= grid.cols) break;
+        _ = grid.writeCell(col, 0, c, .{});
+    }
+
+    // Row 0: masked draft chars (one `*` per draft byte) starting at
+    // col=prefix_len. `shown` caps at the visible window — the draft
+    // is too long to render the tail (mirrors drawUnlock's shown cap
+    // at line 713).
+    const shown: usize = @min(payload.draft_len, @as(usize, grid.cols) -| prefix_len);
+    for (payload.draft[0..shown], 0..) |_, i| {
+        const col: u16 = @intCast(prefix_len + i);
+        if (col >= grid.cols) break;
+        _ = grid.writeCell(col, 0, '*', .{});
+    }
+
+    // Row 1 (zargeant/tui-display-err): inline err_msg_buf[0..err_msg_len]
+    // copied into row 1 (cells[cols..cols+err_msg_len]), bold. Mirrors
+    // drawUnlock's row-2 rendering at line 728-732. Row index is 1
+    // because the col offset on WindowMock = `cols` means "row 1".
+    if (payload.err_msg_len > 0) {
+        const msg = payload.err_msg_buf[0..payload.err_msg_len];
+        for (msg, 0..) |c, i| {
+            const col: u16 = @intCast(i);
+            if (col >= grid.cols) break;
+            _ = grid.writeCell(col, 1, c, .{ .bold = true });
+        }
+    }
+
+    // Row 0: spinner glyph (`|`, bold) at the prompt's tail while
+    // `validating` is true. Cap at cols (NOT cells.len) — same safer
+    // pattern as renderKeyEntryToGrid (mirrors the WU 1.5.2 R3 fix).
+    if (payload.validating) {
+        const spinner_x: usize = prefix_len + shown;
+        if (spinner_x < @as(usize, grid.cols)) {
+            const col: u16 = @intCast(spinner_x);
+            _ = grid.writeCell(col, 0, '|', .{ .bold = true });
+        }
+    }
 }
 
 /// Render the Unlock modal into `win`. Pure renderer — does NOT mutate
@@ -1036,9 +1077,64 @@ pub fn renderConsentPromptToGrid(grid: *ScreenGrid, state: *const State) void {
     // buffer (mirrors drawConsentPrompt's implicit contract).
     std.debug.assert(payload.last_four.len == 4);
 
-    // GREEN marker — replaced in T-2.3.2 GREEN commit.
-    _ = grid;
-    @panic("SkeletonNotImplemented: renderConsentPromptToGrid");
+    // Row 0: 5-fragment banner — "Store key at " + path (underline)
+    // + " (mode 0o600, last-4 " + last_four (bold) + ")?". Each
+    // fragment writes at the absolute col that follows the previous
+    // one. Cap each fragment at grid.cols (writeCell drops OOB
+    // silently per the ScreenGrid contract).
+    //
+    // NOTE on drawConsentPrompt: WindowMock.print always writes at
+    // cells[0..len], so the multi-call banner in drawConsentPrompt
+    // would visually OVERWRITE earlier fragments. The render fn uses
+    // grid.writeCell with advancing col positions to produce the
+    // INTENDED layout (the design §3.4 contract: "same positions,
+    // same chars, same styling" — i.e. the semantic intent, not the
+    // WindowMock overwrite bug).
+    var col: usize = 0;
+
+    // Fragment 1: "Store key at " (13 chars).
+    inline for ("Store key at ") |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{});
+        }
+        col += 1;
+    }
+
+    // Fragment 2: path (variable length, underlined).
+    for (payload.path) |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{ .underline = true });
+        }
+        col += 1;
+    }
+
+    // Fragment 3: " (mode 0o600, last-4 " (21 chars).
+    inline for (" (mode 0o600, last-4 ") |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{});
+        }
+        col += 1;
+    }
+
+    // Fragment 4: last_four (4 bytes, bold). Note: last_four is
+    // initialised to .{0} ** 4 by default — when untouched, those 4
+    // bytes are NUL (0x00), not spaces. Mirrors drawConsentPrompt's
+    // `win.print(&payload.last_four, .{ .bold = true })` which writes
+    // the bytes verbatim.
+    for (payload.last_four) |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{ .bold = true });
+        }
+        col += 1;
+    }
+
+    // Fragment 5: ")?" (2 chars).
+    inline for (")?") |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{});
+        }
+        col += 1;
+    }
 }
 
 /// Render the ConsentPrompt modal into `win`. Pure renderer — does NOT
@@ -1181,9 +1277,78 @@ pub fn renderErrorModalToGrid(grid: *ScreenGrid, state: *const State) void {
     // (mirrors drawErrorModal's implicit `message_buf` contract).
     std.debug.assert(payload.message_len <= payload.message_buf.len);
 
-    // GREEN marker — replaced in T-2.3.2 GREEN commit.
-    _ = grid;
-    @panic("SkeletonNotImplemented: renderErrorModalToGrid");
+    // Row 0: banner = "Error: " (bold) + "[<class>]" (bold) + " " +
+    // message + (if kind == .tls_gated) " — set ZARGEANT_RUN_TLS_
+    // HANDSHAKE=1" (bold).
+    //
+    // NOTE on drawErrorModal: WindowMock.print always writes at
+    // cells[0..len], so the multi-call banner in drawErrorModal would
+    // visually OVERWRITE earlier fragments. The render fn uses
+    // grid.writeCell with advancing col positions to produce the
+    // INTENDED layout (the design §3.4 contract: "same positions,
+    // same chars, same styling" — i.e. the semantic intent, not the
+    // WindowMock overwrite bug). Mirror the inline comment at
+    // renderConsentPromptToGrid.
+    var col: usize = 0;
+
+    // Fragment 1: "Error: " (7 chars, bold).
+    inline for ("Error: ") |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{ .bold = true });
+        }
+        col += 1;
+    }
+
+    // Fragment 2: "[<class>]" — format class_buf once and write.
+    // drawErrorModal uses std.fmt.bufPrint(&class_buf, "[{s}]", ...)
+    // which can fall back to "[?]" if formatting fails; we mirror
+    // the same fallback.
+    var class_buf: [32]u8 = undefined;
+    const class_str = std.fmt.bufPrint(&class_buf, "[{s}]", .{@tagName(payload.kind)}) catch "[?]";
+    for (class_str) |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{ .bold = true });
+        }
+        col += 1;
+    }
+
+    // Fragment 3: " " (1 char).
+    if (col < @as(usize, grid.cols)) {
+        _ = grid.writeCell(@intCast(col), 0, ' ', .{});
+        col += 1;
+    }
+
+    // Fragment 4: message (if any). drawErrorModal reads
+    // message_buf[0..message_len] inline (Bug 1 fix).
+    if (payload.message_len > 0) {
+        const msg = payload.message_buf[0..payload.message_len];
+        for (msg) |c| {
+            if (col < @as(usize, grid.cols)) {
+                _ = grid.writeCell(@intCast(col), 0, c, .{});
+            }
+            col += 1;
+        }
+    }
+
+    // Fragment 5: env-var hint (only for .tls_gated), bold.
+    // The hint contains an em-dash (U+2014, 3-byte UTF-8) — we iterate
+    // over unicode codepoints (not bytes) via Utf8View so the em-dash
+    // lands as ONE cell, not three single-byte cells. This is a
+    // deliberate improvement over drawErrorModal's `win.print(hint)`,
+    // which iterates over bytes and would split the em-dash into 3
+    // partial cells (a known WindowMock limitation — the render fn
+    // produces the intended layout, not the buggy byte-fragmented one).
+    if (payload.kind == .tls_gated) {
+        const hint = " — set ZARGEANT_RUN_TLS_HANDSHAKE=1";
+        var view = std.unicode.Utf8View.init(hint) catch unreachable;
+        var iter = view.iterator();
+        while (iter.nextCodepoint()) |cp| {
+            if (col < @as(usize, grid.cols)) {
+                _ = grid.writeCell(@intCast(col), 0, cp, .{ .bold = true });
+            }
+            col += 1;
+        }
+    }
 }
 
 /// Render the ErrorModal into `win`. The error class drives a banner;
@@ -1271,9 +1436,33 @@ pub fn renderAgentLoopToGrid(grid: *ScreenGrid, state: *const State) void {
     // (mirrors drawAgentLoopView's `items.len` loop bound).
     std.debug.assert(payload.cumulative.items.len >= 0);
 
-    // GREEN marker — replaced in T-2.3.2 GREEN commit.
-    _ = grid;
-    @panic("SkeletonNotImplemented: renderAgentLoopToGrid");
+    // Row 0: cumulative text — first `min(items.len, cols)` chars.
+    // drawAgentLoopView writes via `win.cells[i] = ...` at offsets
+    // 0..max (row 0). Mirrors by writing to grid at (col=i, row=0).
+    if (payload.cumulative.items.len > 0) {
+        const max: usize = @min(payload.cumulative.items.len, @as(usize, grid.cols));
+        for (payload.cumulative.items[0..max], 0..) |c, i| {
+            _ = grid.writeCell(@intCast(i), 0, c, .{});
+        }
+    }
+
+    // Bottom row: status bar "model={s} tokens={d} t={d}ms", reverse
+    // style. Mirrors drawAgentLoopView's last-row write at lines
+    // 1090-1104. The row index is `rows - 1` (Tiger Style §4 —
+    // assert rows > 0 matches the source's `if (win.rows > 0)` guard).
+    if (grid.rows > 0) {
+        const last_row: u16 = grid.rows - 1;
+        var status_buf: [128]u8 = undefined;
+        const status_str = std.fmt.bufPrint(
+            &status_buf,
+            "model={s} tokens={d} t={d}ms",
+            .{ payload.model, payload.tokens, payload.last_update_ms },
+        ) catch "model=? tokens=0 t=0ms";
+        const status_len: usize = @min(status_str.len, @as(usize, grid.cols));
+        for (status_str[0..status_len], 0..) |c, i| {
+            _ = grid.writeCell(@intCast(i), last_row, c, .{ .reverse = true });
+        }
+    }
 }
 
 /// Render the AgentLoopView: cumulative LLM text on top + status bar
