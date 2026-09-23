@@ -3610,3 +3610,155 @@ test "T-2.6.1.8: submitFrame on state.key_entry emits trailing CUP at cursor pos
     // Trailing CUP at (col=4, row=0) → "\x1b[1;5H".
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;5H") != null);
 }
+
+// =============================================================================
+// Phase 2 PR2 (T-2.6.2) — tuiThreadLoop calls submitFrame.
+//
+// T-2.6.2 replaces the inline render+emit block in tuiThreadLoop
+// (currently `terminal.term.beginSynchronizedUpdate` + `modal.drawModal`
+// + `emitFrame` + `alloc.dupe(prev_snapshot)`) with a single call to
+// `submitFrame` wrapped in `catch continue`. The per-frame WindowMock
+// allocation goes away (Tiger Style §3); the `prev_snapshot` field on
+// Lifecycle is removed because submitFrame owns its own double buffer
+// via `lc.grids`.
+//
+// Test design (3 RED tests before the GREEN refactor):
+//
+//   1. Static-grep: tuiThreadLoop's body references submitFrame. RED
+//      before T-2.6.2 lands — the body still uses emitFrame +
+//      WindowMock + prev_snapshot.
+//   2. Static-grep: the render block wraps submitFrame in `catch
+//      continue` so writer errors don't exit the loop (D1-a).
+//   3. Behavioral: tuiThreadLoop continues iterating when submitFrame
+//      returns WriteFailed (dead-pty analog). With FailingFlushWriter +
+//      Shutdown queued, the loop must return void (Shutdown drain),
+//      NOT propagate WriteFailed.
+// =============================================================================
+
+/// Pull the body of `pub fn tuiThreadLoop(` out of src/tui.zig as a
+/// substring (best-effort brace counter). Used by the structural
+/// T-2.6.2 tests below. Returns `null` if the function can't be located.
+fn tuiThreadLoopBody(tui_src: []const u8) ?[]const u8 {
+    const marker = "pub fn tuiThreadLoop(";
+    const fn_start = std.mem.indexOf(u8, tui_src, marker) orelse return null;
+    const body_open = std.mem.indexOfPos(u8, tui_src, fn_start, "{") orelse return null;
+
+    // Walk the source counting braces until the matching close. Naïve
+    // counter — comment + string edge cases are tolerated by the
+    // substring searches below (they don't accidentally span braces).
+    var depth: usize = 1;
+    var i: usize = body_open + 1;
+    while (i < tui_src.len and depth > 0) : (i += 1) {
+        if (tui_src[i] == '{') depth += 1 else if (tui_src[i] == '}') depth -= 1;
+    }
+    if (depth != 0) return null;
+    return tui_src[body_open..i];
+}
+
+test "T-2.6.2.1: tuiThreadLoop body references submitFrame (structural)" {
+    // T-2.6.2 GREEN refactor: the inline render+emit block in
+    // tuiThreadLoop is replaced with a single `submitFrame(...)` call.
+    // RED anchor — before the refactor, tuiThreadLoop uses
+    // terminal.term.beginSynchronizedUpdate + modal.drawModal +
+    // emitFrame, not submitFrame.
+    const tui_src = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/tui.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(tui_src);
+
+    const body = tuiThreadLoopBody(tui_src) orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expect(std.mem.indexOf(u8, body, "submitFrame(") != null);
+}
+
+test "T-2.6.2.2: tuiThreadLoop render block uses catch continue around submitFrame (D1-a)" {
+    // D1-a contract — a writer error (dead-pty signature WriteFailed)
+    // must NOT exit the loop. The render block wraps submitFrame in
+    // `catch continue` so the loop iterates again and (on the next
+    // pass) drains Shutdown from any channel. RED anchor — before
+    // the refactor, the render block uses `try` and propagates the
+    // error up.
+    const tui_src = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        "src/tui.zig",
+        testing.allocator,
+        .limited(1 << 20),
+    );
+    defer testing.allocator.free(tui_src);
+
+    const body = tuiThreadLoopBody(tui_src) orelse {
+        try testing.expect(false);
+        return;
+    };
+    // The structural pair: `submitFrame(... )` followed by `catch continue`.
+    const submit_idx = std.mem.indexOf(u8, body, "submitFrame(") orelse {
+        try testing.expect(false); // T-2.6.2.1 already covers this — fail loud here too
+        return;
+    };
+    const after_submit = body[submit_idx..];
+    const catch_idx = std.mem.indexOf(u8, after_submit, "catch continue") orelse {
+        try testing.expect(false);
+        return;
+    };
+    // Sanity: `catch continue` must be reachable from the submitFrame
+    // call site (substring ordering — `catch` must follow `submitFrame`).
+    try testing.expect(catch_idx < body.len - submit_idx);
+}
+
+test "T-2.6.2.3: tuiThreadLoop continues iterating after submitFrame returns WriteFailed" {
+    // Behavioral contract — when submitFrame returns WriteFailed
+    // (the dead-pty signature exposed by std.Io.Writer.Error), the
+    // loop MUST swallow it and iterate again. We queue Shutdown on
+    // the channel so the next iteration drains it + returns void.
+    //
+    // Setup:
+    //   - FailingFlushWriter (drain returns WriteFailed immediately).
+    //   - redraw_pending=true so submitFrame is invoked on iter 1.
+    //   - tui_to_agent has Shutdown queued before the call so iter 2
+    //     drains it and exits.
+    //
+    // RED: the existing inline impl uses `try beginSynchronizedUpdate`
+    // which propagates WriteFailed up. tuiThreadLoop returns
+    // WriteFailed from this call → `try Tui.tuiThreadLoop(...)` fails.
+    //
+    // GREEN: submitFrame is wrapped in `catch continue` so the loop
+    // iterates again, finds Shutdown, returns void.
+    var ch: Ch.Channels = Ch.Channels.init();
+    defer ch.closeAll(testing.io);
+
+    var lc = try makeLifecycleForSubmitFrame(40, 12);
+    defer lc.grids[0].deinit(testing.allocator);
+    defer lc.grids[1].deinit(testing.allocator);
+    lc.redraw_pending.store(true, .seq_cst);
+
+    var modal_state: M.State = .{ .key_entry = .{} };
+
+    var placeholder_buf: [1]u8 = undefined;
+    var w = FailingFlushWriter.make(&placeholder_buf);
+
+    var shutdown_atomic = std.atomic.Value(bool).init(false);
+
+    // Queue Shutdown so the loop has something to drain on iter 2.
+    try ch.tui_to_agent.tryPut(testing.io, .Shutdown);
+
+    try Tui.tuiThreadLoop(
+        &lc,
+        std.Io.File.stdin().handle,
+        testing.io,
+        &w,
+        &ch,
+        &modal_state,
+        testing.allocator,
+        &shutdown_atomic,
+        null, // cancel_pipe — null for tests
+    );
+    // GREEN: the function returns void (loop continued + Shutdown drained).
+    // RED: the function returns WriteFailed and the `try` above fails.
+    // No explicit assertion here — the `try` on the tuiThreadLoop call
+    // is the assertion (passes in GREEN, fails in RED).
+}
