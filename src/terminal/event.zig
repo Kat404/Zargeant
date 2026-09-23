@@ -633,13 +633,28 @@ pub const Parser = struct {
         // emits a CSI ... u sequence, parse it as a modified key event with
         // press/repeat/release distinction + shift/alt/ctrl/super modifiers.
         //
-        // For PR 4 we assume kitty kb mode is ACTIVE for every `u` sequence
-        // (the caller-side `lifecycle.kitty_flags_pushed` gate lands in PR 6
-        // per the apply prompt's PR 6 caller check). The push format
-        // `CSI > N u` is rejected inside parseKittyKb (params[0] == '>').
-        // If parseKittyKb returns null (malformed input), control falls
-        // through to the existing dispatch logic which returns `.invalid`.
+        // PR3 R2 fix (T-R2.2): gate the kitty kb parse on
+        // `self.kitty_active`. The terminal only opts in to kitty kb
+        // events after a successful `CSI > 1 u` push
+        // (Lifecycle.kitty_flags_pushed mirrors this). Without the
+        // gate, any terminal emitting `CSI ... u` for non-kitty
+        // reasons (literal shift+u bindings, non-kitty CSI extensions)
+        // would surface a phantom kitty kb event. With the gate, the
+        // same bytes return `.invalid` so downstream consumers don't
+        // see a fake `.key` event.
+        //
+        // The gate sits BEFORE `parseKittyKb` (not inside it) so the
+        // Phase 0.4 functional-codepoint mapping (9→tab, 13→enter,
+        // 27→esc, 127→backspace) is preserved when the gate is open.
+        // Per ODD risk §4: gate placement inside parseKittyKb would
+        // regress the codepoint mapping. See T-R2.2.4 RED test.
+        //
+        // The push format `CSI > N u` is rejected inside parseKittyKb
+        // (params[0] == '>'). If parseKittyKb returns null (malformed
+        // input), control falls through to the existing dispatch
+        // logic which returns `.invalid`.
         if (final == 'u' and params.len > 0) {
+            if (!self.kitty_active) return .invalid;
             if (parseKittyKb(params)) |key| {
                 return .{ .key = key };
             }
