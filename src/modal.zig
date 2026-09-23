@@ -350,6 +350,37 @@ pub fn drawModal(win: *WindowMock, state: *State) !void {
     }
 }
 
+/// Dispatch the active `state` variant to its `render*ToGrid` fn.
+/// Used by `submitFrame` (Phase 2 replacement for `drawModal`).
+///
+/// Implementation: exhaustively switch on `state.*`. For each variant:
+/// - The 5 modal variants (`.key_entry`, `.unlock_prompt`, `.consent_prompt`,
+///   `.error_modal`, `.agent_loop`): call the corresponding render fn.
+/// - Any other variant: NO-OP (grid unchanged). These are transient states
+///   (e.g., welcome, loading, shutdown_pending) that don't render content.
+///
+/// Preconditions:
+/// - `grid` is a freshly cleared active ScreenGrid
+/// - `state` is a valid State pointer
+///
+/// Caller contract: invoked once per `tuiThreadLoop` iteration AFTER
+/// `grid.clear()` and BEFORE `diffAndEmit`. Pure dispatch — no I/O, no
+/// allocation, no state mutation.
+///
+/// T-2.3.3 (tui-ship-fast-phase2, design §3.4 / spec REQ-MODAL-002):
+/// the Stage 1 dispatcher of the three-stage pipeline
+/// `renderToGrid → diffAndEmit → submitFrame`. Sister to `drawModal`
+/// (the Phase 1 WindowMock dispatcher above) — T-SG-8 contract
+/// preserves drawModal's signature verbatim.
+pub fn renderToGrid(
+    grid: *ScreenGrid,
+    state: *const State,
+) void {
+    _ = grid;
+    _ = state;
+    @panic("SkeletonNotImplemented: renderToGrid");
+}
+
 // =============================================================================
 // Modal draw fns (tasks 3.3 - 3.7)
 //
