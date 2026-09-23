@@ -179,9 +179,9 @@ just run-mock                  # manual TUI smoke test
 - [x] T-2.6.1 submitFrame orchestrator — **DONE** (`0b07620` RED + `2ad1eb9` GREEN; `modal.cursorIntentFromState` pub fn + `tui.submitFrame` orchestrator; 9 new tests in `tests/tui/runtime_thread.zig`; `lib_mod.addImport("diff_emit", diff_emit_mod)` wired at `build.zig`)
 - [x] T-2.6.2 tuiThreadLoop calls submitFrame — **DONE** (`bab6c5a` RED + `d977370` GREEN; inline render+emit block replaced with `submitFrame(...)` + `catch continue` per D1-a; `Lifecycle.prev_snapshot` removed (T-2.5.1 deprecation completes); `tuiRealMain` no longer allocates/frees the prev frame; W4-1 + W1-2/W1-3 + T-SG-7 tests updated)
 - [x] T-2.6.3 Dead-pty detector — **DONE** (`eaaa628` RED + `5112b24` GREEN; `writer.flush()` probe at top of `tuiThreadShutdown`; `if (pty_alive)` guard around the teardown writes; `setCurrentParser(null)` runs unconditionally)
-- [ ] T-R2.1 Parser.kitty_active field
-- [ ] T-R2.2 parseKittyKb gate
-- [ ] T-R2.3 tuiThreadInit wires setKittyActive
+- [x] T-R2.1 Parser.kitty_active field — **DONE** (`45ef4ab` RED + `324fed9` GREEN; `Parser.kitty_active: bool = false` field + `setKittyActive` + `kittyActive` accessors in src/terminal/event.zig; 3 RED tests in tests/terminal/kitty_active.zig)
+- [x] T-R2.2 parseKittyKb gate — **DONE** (`db9d2aa` RED + `b65c92c` GREEN; `if (!self.kitty_active) return .invalid` guard in dispatchCsi before parseKittyKb call; 6 gate-truth-table RED tests in tests/terminal/kitty_active.zig; 15 existing event_kitty tests patched to call `parser.setKittyActive(true)`)
+- [x] T-R2.3 tuiThreadInit wires setKittyActive — **DONE** (`cd85833` RED + `38cd8a3` GREEN; `lc.kitty_active = lc.kitty_flags_pushed; lc.parser.setKittyActive(lc.kitty_active); lc.cancel_pipe = null;` added at end of tuiThreadInit; 3 static-grep RED tests in tests/tui/runtime_thread.zig)
 - [ ] T-R5.1 LoadCtx.cancel_pipe field
 - [ ] T-R5.2 submitUnlockAsync takes cancel_pipe
 - [ ] T-R5.3 runLoadWorker polls cancel_pipe
