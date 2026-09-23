@@ -1112,10 +1112,21 @@ pub fn handleKeyInput(
             .enter => {
                 // WU-2 (CAP-04): spawn worker, return ≤1ms. State
                 // transitions on submit_reply consumption, not here.
+                // T-R5.4 (PR3 R5 wiring): thread cancel_pipe from
+                // handleKeyInput's param through to submitUnlockAsync
+                // so the spawned worker can poll(2) the read fd before
+                // invoking api_auth.loadWithUnlock. The `cancel_pipe`
+                // arg originates from `args.cancel_pipe` in
+                // runtime.zig's ThreadArgs → tuiThreadLoop parameter →
+                // handleKeyInput parameter → submitUnlockAsync → LoadCtx
+                // (T-R5.2). It mirrors the cancel_pipe threading on
+                // the .key_entry arm for submitKeyEntryAsync (line
+                // ~1047).
                 try @import("modal.zig").submitUnlockAsync(
                     io,
                     alloc,
                     state,
+                    cancel_pipe,
                     &channels.submit_reply,
                 ); // REQ-TIW-006
                 return true;

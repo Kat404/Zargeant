@@ -1174,6 +1174,9 @@ pub fn submitUnlockAsync(
         .passphrase = pass_copy,
         .path = path_copy,
         .next_attempts = next_attempts,
+        // T-R5.2: forward the caller-provided pipe so runLoadWorker can
+        // poll(2) the read fd before invoking api_auth.loadWithUnlock.
+        .cancel_pipe = cancel_pipe,
         .reply_ch = reply_ch,
     };
 
@@ -2522,7 +2525,8 @@ test "CAP-04: submitUnlockAsync returns ≤1ms and transitions state to .validat
     defer ch.close(testing.io);
 
     const start = std.Io.Timestamp.now(testing.io, .real).nanoseconds;
-    submitUnlockAsync(testing.io, testing.allocator, &state, &ch) catch {};
+    // T-R5.2: cancel_pipe param added (4th arg); tests pass null.
+    submitUnlockAsync(testing.io, testing.allocator, &state, null, &ch) catch {};
     const elapsed_ns = std.Io.Timestamp.now(testing.io, .real).nanoseconds - start;
 
     // Either the worker was spawned (state.validating == true) OR the
@@ -2565,7 +2569,7 @@ test "CAP-08: worker reply observed within 16ms via channels.submit_reply" {
     var ch: channels_mod.Channel(channels_mod.Event) = .{};
     defer ch.close(testing.io);
 
-    try submitUnlockAsync(testing.io, testing.allocator, &state, &ch);
+    try submitUnlockAsync(testing.io, testing.allocator, &state, null, &ch);
     // The worker is in flight. Either validating is true (worker
     // spawned) or we fell back synchronously (no HOME — skip the
     // observation assertion).
