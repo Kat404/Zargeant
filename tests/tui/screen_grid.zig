@@ -697,12 +697,12 @@ test "renderUnlockToGrid writes unlock modal content (T-2.3.2)" {
 test "renderConsentPromptToGrid writes consent prompt content (T-2.3.2)" {
     // Case 1: consent_prompt with path "test.json" + last_four "WXYZ"
     //         writes the literal fragments at expected positions on row 0.
-    //         Layout (col 0-indexed):
+    //         Layout (col 0-indexed; byte counts verified at test write):
     //           "Store key at " (13 chars)         → cols 0..12
     //           path "test.json"  (9 chars)        → cols 13..21  (underline)
-    //           " (mode 0o600, last-4 " (22 chars) → cols 22..43
-    //           last_four "WXYZ"  (4 chars)        → cols 44..47  (bold)
-    //           ")?"  (2 chars)                    → cols 48..49
+    //           " (mode 0o600, last-4 " (21 chars) → cols 22..42
+    //           last_four "WXYZ"  (4 chars)        → cols 43..46  (bold)
+    //           ")?"  (2 chars)                    → cols 47..48
     {
         var last_four: [4]u8 = .{0} ** 4;
         @memcpy(last_four[0..4], "WXYZ");
@@ -731,15 +731,15 @@ test "renderConsentPromptToGrid writes consent prompt content (T-2.3.2)" {
         try testing.expect(active[13].style.underline);
         // Col 21 = 'n' (last char of "test.json")
         try testing.expectEqual(@as(u21, 'n'), active[21].ch);
-        // Col 44 = 'W' (start of last_four "WXYZ") — bold
-        try testing.expectEqual(@as(u21, 'W'), active[44].ch);
-        try testing.expect(active[44].style.bold);
-        // Col 47 = 'Z' (last char of "WXYZ")
-        try testing.expectEqual(@as(u21, 'Z'), active[47].ch);
-        // Col 48 = ')' (the close paren)
-        try testing.expectEqual(@as(u21, ')'), active[48].ch);
-        // Col 49 = '?' (the question mark)
-        try testing.expectEqual(@as(u21, '?'), active[49].ch);
+        // Col 43 = 'W' (start of last_four "WXYZ") — bold
+        try testing.expectEqual(@as(u21, 'W'), active[43].ch);
+        try testing.expect(active[43].style.bold);
+        // Col 46 = 'Z' (last char of "WXYZ")
+        try testing.expectEqual(@as(u21, 'Z'), active[46].ch);
+        // Col 47 = ')' (the close paren)
+        try testing.expectEqual(@as(u21, ')'), active[47].ch);
+        // Col 48 = '?' (the question mark)
+        try testing.expectEqual(@as(u21, '?'), active[48].ch);
     }
 
     // Case 2: consent_prompt + default (empty path, last_four zeros)
@@ -759,20 +759,13 @@ test "renderConsentPromptToGrid writes consent prompt content (T-2.3.2)" {
         for (prefix, 0..) |expected, i| {
             try testing.expectEqual(@as(u21, expected), active[i].ch);
         }
-        // ")?" at cols (13 + 0) = 13, (13 + 0) = 13 — wait, with
-        // empty path (len=0) + " (mode 0o600, last-4 " (22 chars) +
-        // "    " (4 zero-bytes as spaces? actually last_four is [4]u8
-        // initialised to .{0} ** 4 — bytes are 0x00, NOT spaces).
-        // The draw fn writes &payload.last_four verbatim, which means
-        // the bytes 0x00 land in cells[13 + 0..13 + 4]. For the render
-        // fn, we mirror the same — those cells become u21 = 0x00
-        // (NUL). We just sample that ")" and "?" land at the end:
-        // total suffix is 22 (prefix string) + 4 (last_four) + 2 (")?")
-        // = 28 chars after col 13. So ")" is at col 13 + 22 + 4 = 39
-        // and "?" at col 40. (We test the closing parenthesis as a
-        // definite landmark.)
-        try testing.expectEqual(@as(u21, ')'), active[39].ch);
-        try testing.expectEqual(@as(u21, '?'), active[40].ch);
+        // ")?" suffix lands at cols 38..39 with empty path + 21-char
+        // " (mode 0o600, last-4 " + 4 zero-bytes of last_four
+        // (13 + 0 + 21 + 4 = 38). We test the closing punctuation as
+        // a definite landmark — the last_four cells in between hold
+        // u21 = 0x00 (NUL bytes verbatim).
+        try testing.expectEqual(@as(u21, ')'), active[38].ch);
+        try testing.expectEqual(@as(u21, '?'), active[39].ch);
     }
 
     // Case 3: renderConsentPromptToGrid does NOT mutate state.
@@ -863,8 +856,10 @@ test "renderErrorModalToGrid writes error modal content (T-2.3.2)" {
         // Col 0 = 'E' (start of "Error")
         try testing.expectEqual(@as(u21, 'E'), active[0].ch);
         try testing.expect(active[0].style.bold);
-        // Col 6 = ':' (last char of "Error: ")
-        try testing.expectEqual(@as(u21, ':'), active[6].ch);
+        // Col 5 = ':' (last char of "Error")
+        try testing.expectEqual(@as(u21, ':'), active[5].ch);
+        // Col 6 = ' ' (trailing space of "Error: ")
+        try testing.expectEqual(@as(u21, ' '), active[6].ch);
         // Col 7 = '[' (start of "[auth]" class banner)
         try testing.expectEqual(@as(u21, '['), active[7].ch);
         try testing.expect(active[7].style.bold);
@@ -905,18 +900,19 @@ test "renderErrorModalToGrid writes error modal content (T-2.3.2)" {
         const active = grid.active();
         // Find the env-var hint "ZARGEANT_RUN_TLS_HANDSHAKE" by char
         // sample — pick a representative cell from the hint suffix.
-        // Total prefix length = 7 (Error:) + 10 ([tls_gated]) + 1 (space)
-        // + 20 (TLS handshake blocked) = 38 chars. So the hint " — set
-        // ZARGEANT_RUN_TLS_HANDSHAKE=1" starts at col 38.
-        // Col 38 = ' ' (the em-dash separator's leading space)
-        try testing.expectEqual(@as(u21, ' '), active[38].ch);
-        // Col 39 = '—' (em-dash, U+2014)
-        try testing.expectEqual(@as(u21, '—'), active[39].ch);
-        // Col 44 = 's' (start of "set")
-        try testing.expectEqual(@as(u21, 's'), active[44].ch);
-        // Col 51 = 'Z' (start of "ZARGEANT_RUN_TLS_HANDSHAKE=1") — bold
-        try testing.expectEqual(@as(u21, 'Z'), active[51].ch);
-        try testing.expect(active[51].style.bold);
+        // Byte counts: "Error: " (7) + "[tls_gated]" (11) + " " (1)
+        // + "TLS handshake blocked" (21) = 40 prefix chars. So the
+        // hint " — set ZARGEANT_RUN_TLS_HANDSHAKE=1" (37 chars) starts
+        // at col 40.
+        // Col 40 = ' ' (leading space of hint)
+        try testing.expectEqual(@as(u21, ' '), active[40].ch);
+        // Col 41 = '—' (em-dash, U+2014)
+        try testing.expectEqual(@as(u21, '—'), active[41].ch);
+        // Col 43 = 's' (start of "set")
+        try testing.expectEqual(@as(u21, 's'), active[43].ch);
+        // Col 47 = 'Z' (start of "ZARGEANT_RUN_TLS_HANDSHAKE=1") — bold
+        try testing.expectEqual(@as(u21, 'Z'), active[47].ch);
+        try testing.expect(active[47].style.bold);
     }
 
     // Case 3: renderErrorModalToGrid does NOT mutate state.
