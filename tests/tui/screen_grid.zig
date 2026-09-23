@@ -24,6 +24,15 @@ const DiffEntry = diff_emit_mod.DiffEntry;
 const diffAndEmit = diff_emit_mod.diffAndEmit;
 const emitDiffEntry = diff_emit_mod.emitDiffEntry;
 const emitTrailingCUP = diff_emit_mod.emitTrailingCUP;
+// tui-ship-fast-phase2 (T-2.3.1) — renderKeyEntryToGrid tests below
+// import `modal` via lib_mod (wired in build.zig:536). The test file
+// accesses the modal namespace through `modal_root.modal.<symbol>`
+// because lib_mod re-exports modal via `pub const modal = @import("modal.zig")`
+// in src/root.zig:38.
+const modal_root = @import("modal");
+const modal_ns = modal_root.modal;
+const renderKeyEntryToGrid = modal_ns.renderKeyEntryToGrid;
+const ModalState = modal_ns.State;
 
 // REQ-TUI-001: ScreenGrid struct shape + invariants
 // TDD RED: these tests fail because src/screen_grid.zig doesn't exist.
@@ -429,4 +438,120 @@ test "@hasDecl(diff_emit_mod, \"diffAndEmit\" + \"emitDiffEntry\" + \"emitTraili
     try testing.expect(@hasDecl(diff_emit_mod, "emitDiffEntry"));
     try testing.expect(@hasDecl(diff_emit_mod, "emitTrailingCUP"));
     try testing.expect(@hasDecl(diff_emit_mod, "DiffEntry"));
+}
+
+// T-2.3.1: renderKeyEntryToGrid (REQ-MODAL-001, design §3.4, T-SG-8 preserved).
+//
+// One test block with 5 sub-cases — mirrors the umbrella test pattern
+// already used at "cursorFromIntent resolves CursorIntent ..." (line 146)
+// and "diffAndEmit one changed cell emits ..." (line 246). All sub-cases
+// share the same setup pattern (80×24 ScreenGrid + State.key_entry).
+//
+// RED state: renderKeyEntryToGrid panics with "SkeletonNotImplemented"
+// (T-2.3.1 stub at src/modal.zig:462). The first sub-case to invoke the
+// function terminates the test process; sub-cases 1..4 fail by panic.
+// Sub-case 5 (`@hasDecl` compile-time guard) is the only one that passes
+// in RED. The GREEN impl replaces the stub and all 5 sub-cases pass.
+test "renderKeyEntryToGrid mirrors drawKeyEntry into ScreenGrid (T-2.3.1)" {
+    const prefix_len: usize = "Enter API key: ".len; // 15
+
+    // Case 1: key_entry + draft "abcd" writes 4 '*' cells at positions
+    //         15..18 (the mask region immediately after the prompt).
+    //
+    //   drawKeyEntry writes '*' at win.cells[15 + i] for i in 0..shown.
+    //   renderKeyEntryToGrid writes the same via grid.writeCell(15+i, 0, '*', .{}).
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..4], "abcd");
+        const state: ModalState = .{
+            .key_entry = .{
+                .draft = draft_buf,
+                .draft_len = 4,
+            },
+        };
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderKeyEntryToGrid(&grid, &state);
+
+        const active = grid.active();
+        for (0..4) |i| {
+            try testing.expectEqual(@as(u21, '*'), active[prefix_len + i].ch);
+        }
+    }
+
+    // Case 2: key_entry + empty draft writes 0 mask cells (no '*' in
+    //         the mask region; prompt still fills cols 0..14).
+    {
+        const state: ModalState = .{ .key_entry = .{} };
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderKeyEntryToGrid(&grid, &state);
+
+        const active = grid.active();
+        // No '*' should appear anywhere in row 0 (mask region only).
+        for (0..80) |i| {
+            try testing.expect(active[i].ch != '*');
+        }
+        // The prompt prefix chars are still written at cols 0..14.
+        const prompt = "Enter API key: ";
+        for (prompt, 0..) |expected, i| {
+            try testing.expectEqual(@as(u21, expected), active[i].ch);
+        }
+    }
+
+    // Case 3: renderKeyEntryToGrid does NOT mutate state. drawKeyEntry
+    //         writes payload.cursor_col / cursor_row as a side effect
+    //         (WU 0.6 fix); the new fn explicitly does NOT touch state
+    //         (per design §3.4 caller contract: "Pure renderer — does NOT
+    //         mutate state"). All payload fields stay byte-identical.
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..3], "xyz");
+        var state: ModalState = .{
+            .key_entry = .{
+                .draft = draft_buf,
+                .draft_len = 3,
+                .cursor_col = 7,
+                .cursor_row = 11,
+            },
+        };
+        const before = state;
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderKeyEntryToGrid(&grid, &state);
+
+        // State fields are byte-identical — no assignment happened.
+        try testing.expectEqual(before.key_entry.draft_len, state.key_entry.draft_len);
+        try testing.expectEqual(@as(u16, 7), state.key_entry.cursor_col);
+        try testing.expectEqual(@as(u16, 11), state.key_entry.cursor_row);
+        try testing.expectEqualSlices(u8, &before.key_entry.draft, &state.key_entry.draft);
+    }
+
+    // Case 4: prompt text is written at expected row/col positions. The
+    //         prompt is "Enter API key: " (15 chars) at row 0, cols 0..14.
+    //         We sample representative chars (positions 0, 5, 14) to pin
+    //         the layout without enumerating all 15.
+    {
+        const state: ModalState = .{ .key_entry = .{} };
+        var grid = try ScreenGrid.init(80, 24);
+        defer grid.deinit(testing.allocator);
+
+        renderKeyEntryToGrid(&grid, &state);
+
+        const active = grid.active();
+        // (col=0, row=0) = 'E'
+        try testing.expectEqual(@as(u21, 'E'), active[0 * 80 + 0].ch);
+        // (col=5, row=0) = 'A' (the 'A' of "API")
+        try testing.expectEqual(@as(u21, 'A'), active[0 * 80 + 5].ch);
+        // (col=14, row=0) = ' ' (trailing space of the prompt)
+        try testing.expectEqual(@as(u21, ' '), active[0 * 80 + 14].ch);
+    }
+
+    // Case 5: `@hasDecl(modal_ns, "renderKeyEntryToGrid")` static guard.
+    //         Compile-time symbol existence — passes even in RED because
+    //         the stub fn is declared (just panics at runtime).
+    try testing.expect(@hasDecl(modal_ns, "renderKeyEntryToGrid"));
 }

@@ -23,6 +23,14 @@ const builtin = @import("builtin");
 const logger = @import("logger.zig");
 const api_auth = @import("api_auth.zig");
 const channels_mod = @import("channels.zig");
+// tui-ship-fast-phase2 (T-2.3.1) — renderKeyEntryToGrid writes cells into
+// a ScreenGrid instead of WindowMock.cells. Wired via build.zig's
+// lib_mod.addImport("screen_grid", screen_grid_mod) (T-2.3.1 wiring at
+// build.zig:504). The sibling-module ownership rule rejects
+// `@import("screen_grid.zig")` from modal.zig's lib_mod namespace, so we
+// use the module-import alias registered by the build system.
+const screen_grid_mod = @import("screen_grid");
+const ScreenGrid = screen_grid_mod.ScreenGrid;
 
 // =============================================================================
 // Linux-only comptime guard (matches every other module in the project).
@@ -463,6 +471,32 @@ pub fn drawKeyEntry(win: *WindowMock, state: *State) !void {
     std.debug.assert(cursor_x <= win.size().cols);
     payload.cursor_col = cursor_x;
     payload.cursor_row = 0;
+}
+
+/// Render the KeyEntry modal into `grid`. Pure renderer — does NOT
+/// mutate state. Mirrors `drawKeyEntry` exactly; the only difference is
+/// the destination type (ScreenGrid instead of WindowMock).
+///
+/// Preconditions:
+/// - `grid` is a freshly cleared active ScreenGrid (cells all ' ')
+/// - `state.* == .key_entry`
+///
+/// Caller contract: invoked once per `tuiThreadLoop` iteration AFTER
+/// `grid.clear()` and AFTER the modal's drawing phase. Does NOT read
+/// from `grid` (only writes via `writeCell`).
+///
+/// T-2.3.1 (tui-ship-fast-phase2, design §3.4 / spec REQ-MODAL-001):
+/// the Stage 1 renderer of the three-stage pipeline
+/// `renderToGrid → diffAndEmit → submitFrame`. Added ALONGSIDE
+/// `drawKeyEntry` — T-SG-8 contract preserves drawKeyEntry's signature
+/// verbatim (tested at tests/tui/runtime_thread.zig:1618).
+pub fn renderKeyEntryToGrid(grid: *ScreenGrid, state: *const State) void {
+    _ = grid;
+    _ = state;
+    // TDD RED skeleton — replaced in T-2.3.1 GREEN. The SkeletonNotImplemented
+    // sentinel is the project's standard "the body is not yet implemented"
+    // marker (mirrors src/diff_emit.zig's RED contract at T-2.2.1).
+    @panic("SkeletonNotImplemented: renderKeyEntryToGrid");
 }
 
 /// Format-pre-flight + API-validation submit handler for KeyEntry (WU-2:
