@@ -877,6 +877,7 @@ const LoadCtx = struct {
     passphrase: []u8,
     path: []u8,
     next_attempts: u8,
+    cancel_pipe: ?[2]i32 = null,
     reply_ch: *channels_mod.Channel(channels_mod.Event),
 };
 
@@ -2645,14 +2646,15 @@ test "T-R5.1: LoadCtx has cancel_pipe field with type ?[2]i32" {
     try testing.expect(@hasField(LoadCtx, "cancel_pipe"));
 
     // Look up the field type via the typeInfo reflection — works with
-    // default-value fields (see NOTE above).
+    // default-value fields (see NOTE above). Inline the loop so the
+    // index / type match happens at comptime (Zig 0.16 rejects
+    // runtime use of `StructField` values).
     const info = @typeInfo(LoadCtx).@"struct";
     var found_cancel_pipe = false;
-    for (info.fields) |f| {
+    inline for (info.fields) |f| {
         if (std.mem.eql(u8, f.name, "cancel_pipe")) {
             try testing.expectEqual(?[2]i32, f.type);
             found_cancel_pipe = true;
-            break;
         }
     }
     try testing.expect(found_cancel_pipe);
