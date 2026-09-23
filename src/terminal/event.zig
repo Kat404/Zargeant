@@ -198,12 +198,56 @@ pub const Parser = struct {
     /// paste-active short-circuit and dispatchCsi branches.
     paste_active: bool = false,
 
+    /// R2 fix (T-R2.1, PR3): when true, the dispatcher routes
+    /// `CSI ... u` sequences through `parseKittyKb`. When false, the
+    /// same bytes return `.invalid` (the terminal did not push kitty kb
+    /// flags, so any `u`-terminated CSI is not a kitty kb event — likely
+    /// a literal shift+u or a non-kitty terminal extension).
+    ///
+    /// The field defaults to false so the dispatcher stays conservative
+    /// for untrusted terminals. `tuiThreadInit` flips it to true after a
+    /// successful `pushKittyKb` (mirrors `Lifecycle.kitty_flags_pushed`).
+    /// T-R2.2 wires the actual dispatch gate; T-R2.3 wires the
+    /// `setKittyActive` call from `tuiThreadInit`.
+    kitty_active: bool = false,
+
     pub fn init() Parser {
         return .{
             .ring_buf = undefined,
             .ring_len = 0,
             .paste_active = false,
+            .kitty_active = false,
         };
+    }
+
+    /// R2 fix (T-R2.1, PR3): set the kitty-active gate. Called by
+    /// `tuiThreadInit` after `pushKittyKb` succeeds; the gate stays
+    /// false for terminals that did not opt in to kitty kb. Production
+    /// callers (the orchestrator) and tests both use this setter
+    /// symmetrically — tests bypass the orchestrator and call
+    /// `setKittyActive(true)` directly on their per-test Parser.
+    ///
+    /// T-R2.1 RED stub: the body deliberately does NOT mutate the field
+    /// so the GREEN commit (T-R2.1) can flip the body to write
+    /// `self.kitty_active = active;` and turn the GREEN tests green.
+    /// Until then, calling `setKittyActive(true)` followed by
+    /// `kittyActive()` returns false — RED observable.
+    pub fn setKittyActive(self: *Parser, active: bool) void {
+        _ = self;
+        _ = active;
+    }
+
+    /// R2 fix (T-R2.1, PR3): read the kitty-active gate. Returns the
+    /// current value of `kitty_active`. The dispatcher's `final == 'u'`
+    /// branch reads this BEFORE calling `parseKittyKb` so kitty kb
+    /// events only surface when the terminal opted in.
+    ///
+    /// T-R2.1 RED stub: the body returns a constant `false` so the
+    /// GREEN commit can flip it to `return self.kitty_active;` and
+    /// turn the GREEN tests green.
+    pub fn kittyActive(self: *const Parser) bool {
+        _ = self;
+        return false;
     }
 
     /// Refill the ring buffer by reading from `file` (non-blocking). Returns
