@@ -180,3 +180,21 @@ pub const ScreenGrid = struct {
 // artifact is the canonical location (mirrors T-SG-8 contract for
 // src/modal.zig, where the 5 draw fns are tested from
 // tests/tui/runtime_thread.zig, not inline).
+//
+// The two inline tests below are minimal smoke checks that satisfy the
+// project's T-SG "every src/*.zig has test blocks" guard at
+// `just check-tdd`. The full coverage is in tests/tui/screen_grid.zig.
+
+test "ScreenGrid: MAX_CELL_BUF is a comptime usize in the 4096..65536 range" {
+    // Smoke test — confirms MAX_CELL_BUF is within bounds at comptime.
+    // Full coverage in tests/tui/screen_grid.zig.
+    const lo: usize = 4096;
+    const hi: usize = 65536;
+    try std.testing.expect(MAX_CELL_BUF >= lo and MAX_CELL_BUF <= hi);
+}
+
+test "ScreenGrid: Cell is a compact value type (sizeof <= 16 bytes)" {
+    // Smoke test — confirms the Cell struct packs within 16 bytes.
+    // Full coverage in tests/tui/screen_grid.zig.
+    try std.testing.expect(@sizeOf(Cell) <= 16);
+}
