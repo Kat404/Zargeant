@@ -159,7 +159,7 @@ just run-mock                  # manual TUI smoke test
 | T-2.1.2 | `a40f2ac` | `just test-tui-screen-grid` | 11/11 PASS | ✅ DONE |
 | T-2.2.1 | `f0e69e2` (RED) + `<green>` (this WU) | `just test-tui-screen-grid` | 22/22 PASS | ✅ DONE |
 | T-2.3.1 | `aecfe03` (RED) + `<green>` (this WU) | `just test-tui-screen-grid` | 23/23 PASS | ✅ DONE |
-| T-2.3.2 | `93a85ec` (RED) + `7b8504e` (GREEN) | `just test-tui-screen-grid` | 27/27 PASS | ✅ DONE |
+| T-2.3.2 | `93a85ec` (RED) + `bca7639` (GREEN) | `just test-tui-screen-grid` | 27/27 PASS | ✅ DONE |
 
 ## Progress
 
@@ -167,7 +167,7 @@ just run-mock                  # manual TUI smoke test
 - [x] T-2.1.2 CursorIntent + cursorFromIntent — **DONE** (`a40f2ac`)
 - [x] T-2.2.1 DiffEntry + diffAndEmit — **DONE** (`f0e69e2` RED + `<green>` GREEN)
 - [x] T-2.3.1 renderKeyEntryToGrid — **DONE** (`aecfe03` RED + `<green>` GREEN)
-- [x] T-2.3.2 render*ToGrid (4 more) — **DONE** (`93a85ec` RED + `ba06562` GREEN)
+- [x] T-2.3.2 render*ToGrid (4 more) — **DONE** (`93a85ec` RED + `bca7639` GREEN)
 - [ ] T-2.3.3 renderToGrid dispatcher
 - [ ] T-2.4.1 WindowMock adapter
 - [ ] T-2.5.1 Lifecycle fields
