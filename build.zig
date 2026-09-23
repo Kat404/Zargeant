@@ -501,6 +501,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/screen_grid.zig"),
     });
+    // tui-ship-fast-phase2 (T-2.3.1) — renderKeyEntryToGrid in src/modal.zig
+    // needs `@import("screen_grid")` to access ScreenGrid + Style. Without
+    // this addImport, modal.zig cannot reach screen_grid_mod (sibling-module
+    // ownership rule, Zig 0.16 — see term_mod/dpm_mod comment at line 130).
+    // Mirrors lib_mod.addImport("terminal", terminal_mod) at line 154.
+    lib_mod.addImport("screen_grid", screen_grid_mod);
     // tui-ship-fast-phase2 (T-2.2.1) — DiffEntry + diffAndEmit pure renderer.
     // Module root is src/diff_emit.zig (NEW file). The module imports
     // `screen_grid` to consume Cell + CURSOR_SKIP; this import is wired
@@ -523,6 +529,11 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "screen_grid", .module = screen_grid_mod },
             .{ .name = "diff_emit", .module = diff_emit_mod },
+            // tui-ship-fast-phase2 (T-2.3.1) — tests/tui/screen_grid.zig
+            // needs to construct modal.State + call renderKeyEntryToGrid.
+            // The import resolves through lib_mod (which re-exports modal
+            // via root.zig), so test code reads `@import("modal").modal.renderKeyEntryToGrid`.
+            .{ .name = "modal", .module = lib_mod },
         },
     });
     const screen_grid_test_step = b.addTest(.{ .root_module = screen_grid_test_mod });
