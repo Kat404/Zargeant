@@ -84,6 +84,10 @@ test-terminal:
 test-tui:
     zig build test-tui --summary all
 
+# Run tests/tui/screen_grid.zig (T-2.1.1 — Phase 2 ScreenGrid value type)
+test-tui-screen-grid:
+    zig build test-tui-screen-grid --summary all
+
 # Run tests/tui/runtime_thread.zig (69 tests, PR1+PR1.5 TUI fix coverage)
 test-runtime-thread:
     zig build test-tui-runtime-thread --summary all
