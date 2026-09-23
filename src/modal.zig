@@ -739,6 +739,41 @@ fn runValidateWorker(ctx: *ValidateCtx) void {
     ctx.reply_ch.tryPut(ctx.io, .{ .ValidateApiReply = payload }) catch {};
 }
 
+/// Render the Unlock modal into `grid`. Pure renderer — does NOT
+/// mutate state. Mirrors `drawUnlock` exactly; the only difference is
+/// the destination type (ScreenGrid instead of WindowMock).
+///
+/// Preconditions:
+/// - `grid` is a freshly cleared active ScreenGrid (cells all ' ')
+/// - `state.* == .unlock_prompt`
+///
+/// Caller contract: invoked once per `tuiThreadLoop` iteration AFTER
+/// `grid.clear()` and AFTER the modal's drawing phase. Does NOT read
+/// from `grid` (only writes via `writeCell`).
+///
+/// T-2.3.2 (tui-ship-fast-phase2, design §3.4 / spec REQ-MODAL-001):
+/// added ALONGSIDE `drawUnlock` — T-SG-8 contract preserves drawUnlock's
+/// signature verbatim (tested at tests/tui/runtime_thread.zig:1618).
+pub fn renderUnlockToGrid(grid: *ScreenGrid, state: *const State) void {
+    // Tiger Style §5 — exhaustive dispatch. T-2.3.3 will replace the
+    // `else => return` no-op with concrete handlers for the remaining
+    // 4 variants; today only `.unlock_prompt` renders into the grid.
+    const payload = switch (state.*) {
+        .unlock_prompt => &state.unlock_prompt,
+        else => return,
+    };
+
+    // Tiger Style §4 — defensive precondition on the draft length and
+    // the inline err_msg_buf (mirrors drawUnlock's assert at line 712
+    // + the implicit `idx < cells.len` guard on the err_msg loop).
+    std.debug.assert(payload.draft_len <= payload.draft.len);
+    std.debug.assert(payload.err_msg_len <= payload.err_msg_buf.len);
+
+    // GREEN marker — replaced in T-2.3.2 GREEN commit.
+    _ = grid;
+    @panic("SkeletonNotImplemented: renderUnlockToGrid");
+}
+
 /// Render the Unlock modal into `win`. Pure renderer — does NOT mutate
 /// state. Callers drive `unlock_prompt → agent_loop` (or → key_entry on
 /// Esc) via `submitUnlockAsync` / `cancelUnlock` (REQ-TUI-007).
@@ -971,6 +1006,41 @@ pub fn cancelUnlock(state: *State) void {
     state.* = .{ .key_entry = .{} };
 }
 
+/// Render the ConsentPrompt modal into `grid`. Pure renderer — does
+/// NOT mutate state. Mirrors `drawConsentPrompt` exactly; the only
+/// difference is the destination type (ScreenGrid instead of
+/// WindowMock).
+///
+/// Preconditions:
+/// - `grid` is a freshly cleared active ScreenGrid (cells all ' ')
+/// - `state.* == .consent_prompt`
+///
+/// Caller contract: invoked once per `tuiThreadLoop` iteration AFTER
+/// `grid.clear()` and AFTER the modal's drawing phase. Does NOT read
+/// from `grid` (only writes via `writeCell`).
+///
+/// T-2.3.2 (tui-ship-fast-phase2, design §3.4 / spec REQ-MODAL-001):
+/// added ALONGSIDE `drawConsentPrompt` — T-SG-8 contract preserves
+/// drawConsentPrompt's signature verbatim (tested at
+/// tests/tui/runtime_thread.zig:1618).
+pub fn renderConsentPromptToGrid(grid: *ScreenGrid, state: *const State) void {
+    // Tiger Style §5 — exhaustive dispatch. T-2.3.3 will replace the
+    // `else => return` no-op with concrete handlers for the remaining
+    // 4 variants; today only `.consent_prompt` renders into the grid.
+    const payload = switch (state.*) {
+        .consent_prompt => &state.consent_prompt,
+        else => return,
+    };
+
+    // Tiger Style §4 — defensive precondition on the inline last_four
+    // buffer (mirrors drawConsentPrompt's implicit contract).
+    std.debug.assert(payload.last_four.len == 4);
+
+    // GREEN marker — replaced in T-2.3.2 GREEN commit.
+    _ = grid;
+    @panic("SkeletonNotImplemented: renderConsentPromptToGrid");
+}
+
 /// Render the ConsentPrompt modal into `win`. Pure renderer — does NOT
 /// mutate state. Callers drive `consent_prompt → agent_loop` via
 /// `submitConsentGrant` (REQ-TUI-008).
@@ -1080,6 +1150,42 @@ pub fn cancelConsent(state: *State) void {
     state.consent_prompt.consent = false;
 }
 
+/// Render the ErrorModal into `grid`. The error class drives a banner;
+/// tls_gated shows the env-var hint `ZARGEANT_RUN_TLS_HANDSHAKE=1`
+/// prominently (REQ-TUI-009 scenario 1). Pure renderer — does NOT
+/// mutate state. Mirrors `drawErrorModal` exactly; the only difference
+/// is the destination type (ScreenGrid instead of WindowMock).
+///
+/// Preconditions:
+/// - `grid` is a freshly cleared active ScreenGrid (cells all ' ')
+/// - `state.* == .error_modal`
+///
+/// Caller contract: invoked once per `tuiThreadLoop` iteration AFTER
+/// `grid.clear()` and AFTER the modal's drawing phase. Does NOT read
+/// from `grid` (only writes via `writeCell`).
+///
+/// T-2.3.2 (tui-ship-fast-phase2, design §3.4 / spec REQ-MODAL-001):
+/// added ALONGSIDE `drawErrorModal` — T-SG-8 contract preserves
+/// drawErrorModal's signature verbatim (tested at
+/// tests/tui/runtime_thread.zig:1618).
+pub fn renderErrorModalToGrid(grid: *ScreenGrid, state: *const State) void {
+    // Tiger Style §5 — exhaustive dispatch. T-2.3.3 will replace the
+    // `else => return` no-op with concrete handlers for the remaining
+    // 4 variants; today only `.error_modal` renders into the grid.
+    const payload = switch (state.*) {
+        .error_modal => &state.error_modal,
+        else => return,
+    };
+
+    // Tiger Style §4 — defensive precondition on the inline message_buf
+    // (mirrors drawErrorModal's implicit `message_buf` contract).
+    std.debug.assert(payload.message_len <= payload.message_buf.len);
+
+    // GREEN marker — replaced in T-2.3.2 GREEN commit.
+    _ = grid;
+    @panic("SkeletonNotImplemented: renderErrorModalToGrid");
+}
+
 /// Render the ErrorModal into `win`. The error class drives a banner;
 /// tls_gated shows the env-var hint `ZARGEANT_RUN_TLS_HANDSHAKE=1`
 /// prominently (REQ-TUI-009 scenario 1).
@@ -1132,6 +1238,42 @@ pub fn openErrorModal(state: *State, kind: ErrorKind, message: []const u8) void 
         .message_len = msg_len,
         .prior = prior,
     } };
+}
+
+/// Render the AgentLoopView into `grid`: cumulative LLM text on top +
+/// status bar (model name, token count, last-update timestamp) on the
+/// bottom row. Pure renderer — does NOT mutate state. Mirrors
+/// `drawAgentLoopView` exactly; the only difference is the destination
+/// type (ScreenGrid instead of WindowMock).
+///
+/// Preconditions:
+/// - `grid` is a freshly cleared active ScreenGrid (cells all ' ')
+/// - `state.* == .agent_loop`
+///
+/// Caller contract: invoked once per `tuiThreadLoop` iteration AFTER
+/// `grid.clear()` and AFTER the modal's drawing phase. Does NOT read
+/// from `grid` (only writes via `writeCell`).
+///
+/// T-2.3.2 (tui-ship-fast-phase2, design §3.4 / spec REQ-MODAL-001):
+/// added ALONGSIDE `drawAgentLoopView` — T-SG-8 contract preserves
+/// drawAgentLoopView's signature verbatim (tested at
+/// tests/tui/runtime_thread.zig:1618).
+pub fn renderAgentLoopToGrid(grid: *ScreenGrid, state: *const State) void {
+    // Tiger Style §5 — exhaustive dispatch. T-2.3.3 will replace the
+    // `else => return` no-op with concrete handlers for the remaining
+    // 4 variants; today only `.agent_loop` renders into the grid.
+    const payload = switch (state.*) {
+        .agent_loop => &state.agent_loop,
+        else => return,
+    };
+
+    // Tiger Style §4 — defensive precondition on the cumulative buffer
+    // (mirrors drawAgentLoopView's `items.len` loop bound).
+    std.debug.assert(payload.cumulative.items.len >= 0);
+
+    // GREEN marker — replaced in T-2.3.2 GREEN commit.
+    _ = grid;
+    @panic("SkeletonNotImplemented: renderAgentLoopToGrid");
 }
 
 /// Render the AgentLoopView: cumulative LLM text on top + status bar
