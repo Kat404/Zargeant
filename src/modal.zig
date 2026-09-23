@@ -376,9 +376,29 @@ pub fn renderToGrid(
     grid: *ScreenGrid,
     state: *const State,
 ) void {
-    _ = grid;
-    _ = state;
-    @panic("SkeletonNotImplemented: renderToGrid");
+    // Tiger Style §4 — defensive preconditions on the grid. A
+    // freshly-initialised ScreenGrid always has cols > 0 and rows > 0
+    // (per screen_grid.init's error.DimsTooLarge guard), so any
+    // non-zero-sized grid satisfies this assert. `state` is non-null
+    // by Zig's type system — `*const State` cannot be null in safe
+    // code (mirrors the per-fn guards in renderKeyEntryToGrid etc.).
+    std.debug.assert(grid.cols > 0);
+    std.debug.assert(grid.rows > 0);
+
+    // Tiger Style §5 — exhaustive switch over the `union(enum)`. No
+    // `else` arm: adding a 7th State variant fails compilation here
+    // AND in every other State switch (drawModal, render*ToGrid fns,
+    // runtimeDriverTick, etc.). The 5 modal variants route to their
+    // render fns; `.welcome` is the only no-op (transient state —
+    // boot screen / post-shutdown that doesn't render content).
+    switch (state.*) {
+        .welcome => {},
+        .key_entry => renderKeyEntryToGrid(grid, state),
+        .unlock_prompt => renderUnlockToGrid(grid, state),
+        .consent_prompt => renderConsentPromptToGrid(grid, state),
+        .agent_loop => renderAgentLoopToGrid(grid, state),
+        .error_modal => renderErrorModalToGrid(grid, state),
+    }
 }
 
 // =============================================================================
