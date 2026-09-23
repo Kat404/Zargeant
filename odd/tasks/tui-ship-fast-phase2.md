@@ -176,9 +176,9 @@ just run-mock                  # manual TUI smoke test
 - [x] T-2.4.1 WindowMock adapter — **DONE** (`9db7f6d` RED + `<green>` GREEN)
 - [x] T-2.5.1 Lifecycle fields — **DONE** (RED + GREEN combined; see test counts above)
 - [x] T-2.5.2 tuiRealMain grids alloc — **DONE** (grid-init verification tests land here; the actual `tuiThreadInit` + stub-`Lifecycle` grid init was already in the T-2.5.1 commit because adding the `grids` field without initializing it would not compile)
-- [ ] T-2.6.1 submitFrame orchestrator
-- [ ] T-2.6.2 tuiThreadLoop calls submitFrame
-- [ ] T-2.6.3 Dead-pty detector
+- [x] T-2.6.1 submitFrame orchestrator — **DONE** (`0b07620` RED + `2ad1eb9` GREEN; `modal.cursorIntentFromState` pub fn + `tui.submitFrame` orchestrator; 9 new tests in `tests/tui/runtime_thread.zig`; `lib_mod.addImport("diff_emit", diff_emit_mod)` wired at `build.zig`)
+- [x] T-2.6.2 tuiThreadLoop calls submitFrame — **DONE** (`bab6c5a` RED + `d977370` GREEN; inline render+emit block replaced with `submitFrame(...)` + `catch continue` per D1-a; `Lifecycle.prev_snapshot` removed (T-2.5.1 deprecation completes); `tuiRealMain` no longer allocates/frees the prev frame; W4-1 + W1-2/W1-3 + T-SG-7 tests updated)
+- [x] T-2.6.3 Dead-pty detector — **DONE** (`eaaa628` RED + `5112b24` GREEN; `writer.flush()` probe at top of `tuiThreadShutdown`; `if (pty_alive)` guard around the teardown writes; `setCurrentParser(null)` runs unconditionally)
 - [ ] T-R2.1 Parser.kitty_active field
 - [ ] T-R2.2 parseKittyKb gate
 - [ ] T-R2.3 tuiThreadInit wires setKittyActive
