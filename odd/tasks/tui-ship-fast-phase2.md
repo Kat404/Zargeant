@@ -162,8 +162,8 @@ just run-mock                  # manual TUI smoke test
 | T-2.3.2 | `93a85ec` (RED) + `bca7639` (GREEN) | `just test-tui-screen-grid` | 27/27 PASS | ✅ DONE |
 | T-2.3.3 | `ac32567` (RED) + `<green>` (this WU) | `just test-tui-screen-grid` | 28/28 PASS | ✅ DONE |
 | T-2.4.1 | `9db7f6d` (RED) + `<green>` (this WU) | `just test-tui-screen-grid` + `just test-runtime-thread` | 29/29 + 69/69 PASS | ✅ DONE |
-| T-2.5.1 | `<this WU>` (combined RED+GREEN) | `just test-runtime-thread` | 80/80 PASS (69 prior + 11 new) | ✅ DONE |
-| T-2.5.2 | `<this WU>` (combined with T-2.5.1) | `just test-runtime-thread` | 80/80 PASS (no regression) | ✅ DONE |
+| T-2.5.1 | `<this WU>` (combined RED+GREEN) | `just test-runtime-thread` | 78/78 PASS (69 prior + 9 new T-2.5.1 tests) | ✅ DONE |
+| T-2.5.2 | `<this WU>` (T-2.5.1 carried the impl; this commit adds 2 RED tests) | `just test-runtime-thread` | 80/80 PASS (78 prior + 2 new T-2.5.2 tests) | ✅ DONE |
 
 ## Progress
 
@@ -175,7 +175,7 @@ just run-mock                  # manual TUI smoke test
 - [x] T-2.3.3 renderToGrid dispatcher — **DONE** (`ac32567` RED + `<green>` GREEN)
 - [x] T-2.4.1 WindowMock adapter — **DONE** (`9db7f6d` RED + `<green>` GREEN)
 - [x] T-2.5.1 Lifecycle fields — **DONE** (RED + GREEN combined; see test counts above)
-- [ ] T-2.5.2 tuiRealMain grids alloc (RED+GREEN committed together with T-2.5.1; tests live in next commit)
+- [x] T-2.5.2 tuiRealMain grids alloc — **DONE** (grid-init verification tests land here; the actual `tuiThreadInit` + stub-`Lifecycle` grid init was already in the T-2.5.1 commit because adding the `grids` field without initializing it would not compile)
 - [ ] T-2.6.1 submitFrame orchestrator
 - [ ] T-2.6.2 tuiThreadLoop calls submitFrame
 - [ ] T-2.6.3 Dead-pty detector

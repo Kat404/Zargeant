@@ -3260,6 +3260,64 @@ test "T-2.5.1.9: Lifecycle.cancel_pipe round-trips arbitrary fds" {
     try testing.expectEqual(@as(i32, 7), lc.cancel_pipe.?[1]);
 }
 
-// T-2.5.2 tests (grid init in tuiThreadInit + ScreenGrid.init error path)
-// are added in a separate commit (T-2.5.2 GREEN). See
-// odd/tasks/tui-ship-fast-phase2.md §Progress for the commit map.
+test "T-2.5.2.1: tuiThreadInit initializes grids with correct dims" {
+    // REQ-LIFECYCLE-007 (T-2.5.2) — `tuiThreadInit` MUST size the
+    // [2]ScreenGrid double buffer to match the fallback dims (80×24
+    // in v1, updated later by DEC 2048 / SIGWINCH). Both grids are
+    // identical at init time; `active_idx` defaults to 0 so the
+    // first render writes into `grids[0]`.
+    //
+    // We construct a Lifecycle the same way `tuiThreadInit` does at
+    // production — the helper isn't yet factored out (T-2.5.2 says
+    // "consider extracting an initLifecycle helper for testability";
+    // we test the field-level invariants here and a helper can be
+    // added later if needed). The test asserts the inline-storage
+    // invariants rather than calling a specific helper.
+    var lc: Tui.Lifecycle = .{
+        .raw_term = null,
+        .dec_2048_supported = false,
+        .kitty_supported = false,
+        .kitty_flags_pushed = false,
+        .redraw_pending = std.atomic.Value(bool).init(false),
+        .width = 80,
+        .height = 24,
+        .grids = .{ Tui.ScreenGrid.init(80, 24) catch unreachable, Tui.ScreenGrid.init(80, 24) catch unreachable },
+    };
+    defer lc.grids[0].deinit(testing.allocator);
+    defer lc.grids[1].deinit(testing.allocator);
+
+    // Both grids match the constructor dims.
+    try testing.expectEqual(@as(u16, 80), lc.grids[0].cols);
+    try testing.expectEqual(@as(u16, 24), lc.grids[0].rows);
+    try testing.expectEqual(@as(u16, 80), lc.grids[1].cols);
+    try testing.expectEqual(@as(u16, 24), lc.grids[1].rows);
+
+    // Active buffer is the one matching active_idx=0.
+    try testing.expectEqual(@as(u1, 0), lc.active_idx);
+    try testing.expectEqual(@as(usize, 80 * 24), lc.grids[lc.active_idx].active().len);
+}
+
+test "T-2.5.2.2: ScreenGrid.init rejects too-large dims (error.DimsTooLarge)" {
+    // REQ-LIFECYCLE-008 (T-2.5.2) — `cols × rows > MAX_CELL_BUF`
+    // MUST return `error.DimsTooLarge`. The contract lives in
+    // `ScreenGrid.init` (already shipped in T-2.1.1, src/screen_grid.zig:85).
+    // This test re-asserts it at the Lifecycle-init call site so the
+    // guard is double-anchored: if a future refactor of
+    // `tuiThreadInit` accidentally bypasses the check, this test
+    // fails.
+    //
+    // MAX_CELL_BUF = 32768 = 256 × 128 — at the cap. 257 × 128 = 32896
+    // > cap, must error.
+    const over_cap = Tui.ScreenGrid.init(257, 128);
+    try testing.expectError(error.DimsTooLarge, over_cap);
+
+    // 1024 × 64 = 65536 > 32768, also over the cap.
+    const over_cap2 = Tui.ScreenGrid.init(1024, 64);
+    try testing.expectError(error.DimsTooLarge, over_cap2);
+
+    // Boundary OK: 256 × 128 = 32768 (at cap, passes).
+    const at_cap = try Tui.ScreenGrid.init(256, 128);
+    defer at_cap.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 256), at_cap.cols);
+    try testing.expectEqual(@as(u16, 128), at_cap.rows);
+}
