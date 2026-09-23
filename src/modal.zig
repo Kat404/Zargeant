@@ -1230,15 +1230,56 @@ fn runLoadWorker(ctx: *LoadCtx) void {
     defer ctx.alloc.free(ctx.path);
 
     // T-R5.3 (tui-ship-fast-phase2, PR3 R5 wiring — REQ-CHANNELS-003):
-    // Pre-call poll STUB. The full implementation lands in T-R5.3 GREEN.
-    // For now this is a no-op so the RED tests below fail when the pipe
-    // is readable (the worker proceeds to loadWithUnlock instead of
-    // bailing out early).
-    if (ctx.cancel_pipe != null) {
-        // STUB — poll(2) wiring lands in T-R5.3 GREEN.
-        // Without the poll, a Ctrl+C arriving during in-flight loadWithUnlock
-        // blocks the worker for ~2s (Argon2id m=64MiB t=3) before the reply
-        // fires — violating the 100ms REQ-NEW-006 invariant.
+    // Pre-call poll of cancel_pipe. If the writer (Ctrl+C key-event
+    // intercept at src/tui.zig:962) fired between the TUI thread's
+    // spawn and the worker's poll, the read fd is readable on entry.
+    // We short-circuit BEFORE the Argon2id KDF runs — closing the
+    // 100ms REQ-NEW-006 invariant for the unlock submit path. Without
+    // this check, the worker would block in api_auth.loadWithUnlock
+    // for ~2s (Argon2id m=64MiB t=3) even after a Ctrl+C.
+    //
+    // NOTE: this is the PRE-CALL poll only. Intra-KDF cancel requires
+    // a future Phase 3+ slice that threads cancel_pipe through
+    // api_auth.loadWithUnlock and the Argon2id call site — out of
+    // scope here (constraint: do not modify api_auth.loadWithUnlock
+    // signature).
+    //
+    // poll() with timeout=0 returns immediately (no block). readable>0
+    // means at least one fd has a POLL.IN event pending.
+    if (ctx.cancel_pipe) |fds| {
+        var pfds: [1]std.os.linux.pollfd = .{.{
+            .fd = fds[0],
+            .events = std.os.linux.POLL.IN,
+            .revents = 0,
+        }};
+        // poll() takes a many pointer to pollfd; coerce the
+        // single-element array pointer. Mirrors the cancel_e2e.zig
+        // @ptrCast pattern at tests/cancel_e2e.zig:223. std.os.linux.poll
+        // returns usize (no error union) — a 0 return means timeout
+        // (no readable fds within the 0ms wait).
+        const readable = std.os.linux.poll(@ptrCast(&pfds[0]), 1, 0);
+        if (readable > 0 and (pfds[0].revents & std.os.linux.POLL.IN) != 0) {
+            // Cancel signaled — post a Cancelled reply and exit without
+            // running the KDF. The TUI thread will drain via
+            // drainSubmitReply on the next 16ms tick and transition
+            // the state. The payload.err = "Cancelled" literal matches
+            // the cancel_e2e.zig convention so downstream drain code
+            // can detect it with a strcmp (consistency with
+            // validateViaApi's error.Cancelled return).
+            var cancelled: channels_mod.ValidateApiReplyPayload = .{
+                .success = false,
+                .last_four = .{0} ** 4,
+                .err = .{0} ** 128,
+                .err_len = 0,
+            };
+            const written = std.fmt.bufPrint(&cancelled.err, "Cancelled", .{}) catch blk: {
+                @memcpy(cancelled.err[0.."Cancelled".len], "Cancelled");
+                break :blk "Cancelled";
+            };
+            cancelled.err_len = written.len;
+            ctx.reply_ch.tryPut(ctx.io, .{ .ValidateApiReply = cancelled }) catch {};
+            return;
+        }
     }
 
     const result = api_auth.loadWithUnlock(ctx.io, ctx.path, ctx.passphrase);
