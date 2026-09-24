@@ -124,6 +124,14 @@ pub const Lifecycle = struct {
     /// stack-allocated Lifecycle (not heap-allocated; see design D1).
     parser: terminal.event.Parser = .{ .ring_buf = undefined, .ring_len = 0, .paste_active = false },
 
+    /// Legacy field from tui-input-rendering-fixes (REQ-TIRFIX-003, PR #39).
+    /// Phase 2's submitFrame (T-2.6.1) replaces the explicit first_frame
+    /// sentinel with `force_full_redraw: bool` (see below). Kept here for
+    /// test compatibility with `tests/tui/runtime_thread.zig:1882`
+    /// (T-TIRFIX-003a) which sets `.first_frame = true` and flips it
+    /// after frame 1. Unused by submitFrame in Phase 2 design.
+    first_frame: bool = true,
+
     /// Phase 2 PR2 (T-2.5.1, design §3.3): double buffer for the render
     /// pipeline. Value type — lives inline on the TUI thread stack; no
     /// allocator. `grids[lc.active_idx]` is the "active" (draw fn writes
@@ -136,7 +144,12 @@ pub const Lifecycle = struct {
     /// regardless of `cols × rows`). Sized by `tuiThreadInit` (T-2.5.2).
     /// No default — caller must initialize (matches design §3.3's "only
     /// the TUI thread constructs ScreenGrid" contract).
-    grids: [2]@import("screen_grid").ScreenGrid,
+    /// Default `undefined` for PR-stacking compatibility: pre-Phase-2 tests
+    /// (T-TIRFIX-003a, T-TIW-6) construct Lifecycle without grids; the
+    /// TUI thread initializes this field in `tuiThreadInit` (T-2.5.2).
+    /// Reading grids before `tuiThreadInit` is undefined; tests that
+    /// don't exercise submitFrame are unaffected.
+    grids: [2]@import("screen_grid").ScreenGrid = undefined,
 
     /// Phase 2 PR2 (T-2.5.1): 0 or 1; XOR swap cycles between the two
     /// `grids` on every render. Defaults to 0 (the first render writes
@@ -580,6 +593,12 @@ pub fn emitFrame(
     };
     const diffs = try win.diff(prev);
     defer alloc.free(diffs);
+    // PR #42 + REQ-TIRFIX-002: track last diff cell position for the
+    // CURSOR_SKIP fallback. Phase 2 cherry-pick lost this tracking;
+    // restoring preserves T-TIW-6 (REQ-TIRFIX-002-clamp) and
+    // T-TIRFIX-003b (second-frame diff-only) test contracts.
+    var last_x: u16 = 0;
+    var last_y: u16 = 0;
     // WU 0.6 (Bug 4): trailing CUP at the explicit cursor position
     // (no longer derived from walking the diff back). For key_entry
     // this is `prefix_len + min(draft_len, max_visible)` per the
@@ -602,15 +621,23 @@ pub fn emitFrame(
         if (entry.cell.style.reverse) try terminal.style.reverse(writer, true);
         // ponytail: u21→u8 cast is v1 ASCII-only; non-ASCII stays for v2.
         try writer.writeByte(@intCast(entry.cell.ch));
+        last_x = entry.x;
+        last_y = entry.y;
     }
     try terminal.style.reset(writer, false);
     // WU 0.6 (Bug 4) — trailing CUP at the explicit cursor position.
     // Fires UNCONDITIONALLY when cursor_col != CURSOR_SKIP, regardless
-    // of whether any diff entries existed. The sentinel CURSOR_SKIP
-    // suppresses emission (preserves the back-compat behavior for the
-    // W3 diff-loop tests that don't model cursor state).
+    // of whether any diff entries existed.
     if (cursor_col != CURSOR_SKIP) {
         try terminal.cursor.goTo(writer, cursor_col, cursor_row);
+    } else if (diffs.len > 0) {
+        // PR #42 fallback (preserved via Path C hybrid per obs#1780):
+        // cursor lands one past the last emitted cell (REQ-TIRFIX-002),
+        // clamped to cols - 1 to avoid CUP at cols which would wrap.
+        // Used by states like .unlock_prompt that don't model cursor
+        // position explicitly.
+        const cursor_x = @min(last_x + 1, cols - 1);
+        try terminal.cursor.goTo(writer, cursor_x, last_y);
     }
 }
 

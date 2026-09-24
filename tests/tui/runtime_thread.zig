@@ -1879,15 +1879,8 @@ test "T-TIRFIX-003a: first_frame emits full snapshot with 2J H preamble" {
         .height = H,
         .no_tty = false,
         .first_frame = true,
-        .prev_snapshot = null,
         .parser = .{ .ring_buf = undefined, .ring_len = 0, .paste_active = false },
     };
-
-    // Allocate prev_snapshot (zero-init per runtime.zig:407-409 pattern).
-    const n: usize = @as(usize, W) * @as(usize, H);
-    lc.prev_snapshot = try testing.allocator.alloc(M.Cell, n);
-    defer testing.allocator.free(lc.prev_snapshot.?);
-    @memset(lc.prev_snapshot.?, .{ .ch = ' ', .style = .{} });
 
     // Build a `current` snapshot with two non-space cells.
     var win = try M.WindowMock.init(testing.allocator, W, H);
