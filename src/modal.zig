@@ -23,6 +23,14 @@ const builtin = @import("builtin");
 const logger = @import("logger.zig");
 const api_auth = @import("api_auth.zig");
 const channels_mod = @import("channels.zig");
+// tui-ship-fast-phase2 (T-2.3.1) — renderKeyEntryToGrid writes cells into
+// a ScreenGrid instead of WindowMock.cells. Wired via build.zig's
+// lib_mod.addImport("screen_grid", screen_grid_mod) (T-2.3.1 wiring at
+// build.zig:504). The sibling-module ownership rule rejects
+// `@import("screen_grid.zig")` from modal.zig's lib_mod namespace, so we
+// use the module-import alias registered by the build system.
+const screen_grid_mod = @import("screen_grid");
+const ScreenGrid = screen_grid_mod.ScreenGrid;
 
 // =============================================================================
 // Linux-only comptime guard (matches every other module in the project).
@@ -71,34 +79,91 @@ pub const TermSize = struct {
 // draw fns write into. Tests assert via snapshot() + diff(prev, current).
 // =============================================================================
 
+/// WindowMock adapter wrapping ScreenGrid (T-2.4.1 GREEN).
+///
+/// T-2.4.1 (tui-ship-fast-phase2, design §3.4 / spec REQ-TUI-007/008):
+/// refactor `WindowMock` from a heap-allocated cell-owner into a thin
+/// adapter that wraps `*ScreenGrid`. The 10-method public surface
+/// stays byte-for-byte unchanged per T-SG-8 (the static-grep guard
+/// at tests/tui/runtime_thread.zig:1618 preserves these literals in
+/// src/modal.zig).
+///
+/// DATA FLOW: `self.cells` is the canonical storage for both the
+/// legacy Phase 1 pattern (tui.zig's `emitFrame` constructs a
+/// stack-local WindowMock with `cells` aliased to the caller's
+/// external slice) and the new adapter pattern (`init` allocates a
+/// `*ScreenGrid` and `cells` aliases `grid.cells[active_idx][0..len]`).
+/// All 10 methods read/write through `self.cells`. The `grid` field
+/// is optional so the legacy struct-literal usage in tui.zig compiles
+/// unchanged (tui.zig is in the do-not-touch list); when grid is null
+/// the methods operate directly on `self.cells` without touching grid.
+///
+/// NOTE on `cells` field: design §3.4 specifies a 6-field shape, but
+/// the existing 5 draw fns (drawKeyEntry, drawUnlock, drawConsentPrompt,
+/// drawErrorModal, drawAgentLoopView) reference `win.cells[i]` as a
+/// mutable slice. T-SG-8 forbids modifying those fns, so `cells` is
+/// kept as the canonical storage field. When `grid` is non-null,
+/// `cells` aliases `grid.cells[active_idx][0..cols*rows]` so writes
+/// through `win.cells` propagate to the active grid buffer.
 pub const WindowMock = struct {
+    // Optional grid pointer. `null` when WindowMock is constructed via
+    // the legacy struct-literal pattern (e.g. tui.zig:449 emitFrame's
+    // diff helper); non-null when constructed via `init` (the new
+    // adapter pattern, which owns the grid). When non-null, `cells`
+    // aliases `grid.cells[active_idx][0..cols*rows]`.
+    grid: ?*ScreenGrid = null,
     allocator: std.mem.Allocator,
     cols: u16,
     rows: u16,
-    cells: []Cell,
     cursor_hidden: bool = false,
     in_alt_screen: bool = false,
+    // Canonical cell storage. Aliases the grid's active buffer when
+    // `grid != null` (via @ptrCast across the byte-identical Cell
+    // struct boundary); otherwise the caller owns the backing slice.
+    cells: []Cell,
 
-    /// Allocate a WindowMock with the given dimensions. The cell grid is
-    /// zero-initialised (every cell is a space with empty style).
+    /// Allocate a WindowMock with the given dimensions. The cell grid
+    /// is owned by the adapter (heap-allocated `*ScreenGrid`, zero-
+    /// initialised by `ScreenGrid.init`). The `cells` slice aliases
+    /// the active grid buffer for backward-compat with the 5 draw fns.
     pub fn init(allocator: std.mem.Allocator, cols: u16, rows: u16) !*WindowMock {
         const self = try allocator.create(WindowMock);
         errdefer allocator.destroy(self);
+
+        const grid_ptr = try allocator.create(ScreenGrid);
+        errdefer allocator.destroy(grid_ptr);
+        grid_ptr.* = try ScreenGrid.init(cols, rows);
+
         const n: usize = @as(usize, cols) * @as(usize, rows);
-        const cells = try allocator.alloc(Cell, n);
-        @memset(cells, .{ .ch = ' ', .style = .{} });
+        // @ptrCast: grid_ptr.cells[active_idx][0..n] is []screen_grid.Cell;
+        // the struct fields are byte-identical to modal.Cell (same size
+        // and alignment), but Zig treats them as distinct types so the
+        // cells field assignment needs an explicit cast.
+        const cells_view: []Cell = @ptrCast(grid_ptr.cells[grid_ptr.active_idx][0..n]);
         self.* = .{
+            .grid = grid_ptr,
             .allocator = allocator,
             .cols = cols,
             .rows = rows,
-            .cells = cells,
+            .cursor_hidden = false,
+            .in_alt_screen = false,
+            .cells = cells_view,
         };
         return self;
     }
 
-    /// Free the cell grid + the WindowMock itself. Idempotent.
+    /// Free the WindowMock + its owned `*ScreenGrid` (if any).
+    /// Idempotent (matches the legacy contract). The ScreenGrid
+    /// `deinit` is a no-op (the inline `[2][MAX_CELL_BUF]Cell` storage
+    /// needs no explicit release), but we call it for API symmetry.
+    /// For the legacy struct-literal pattern (grid is null), only the
+    /// WindowMock itself is destroyed; the caller owns the backing
+    /// `cells` slice.
     pub fn deinit(self: *WindowMock) void {
-        self.allocator.free(self.cells);
+        if (self.grid) |g| {
+            g.deinit(self.allocator);
+            self.allocator.destroy(g);
+        }
         self.allocator.destroy(self);
     }
 
@@ -107,20 +172,72 @@ pub const WindowMock = struct {
         return .{ .cols = self.cols, .rows = self.rows };
     }
 
-    /// Reset every cell to a space.
+    /// Reset every cell to a space. Operates on `self.cells` (the
+    /// canonical storage), which aliases the grid's active buffer
+    /// when grid is non-null — both paths update the same memory.
     pub fn clear(self: *WindowMock) void {
         @memset(self.cells, .{ .ch = ' ', .style = .{} });
     }
 
-    /// Print `text` with `style` starting at (0,0), advancing linearly.
-    /// Text longer than `cols` is truncated; empty text is a no-op.
-    /// The cursor stays at (text.len, 0) on the same line for callers
-    /// that want to chain prints.
+    /// Print `text` with `style` starting at (col=0, row=0), advancing
+    /// linearly with wrapping at `cols`. The legacy fragment-
+    /// overwriting behavior is preserved (each call starts at col=0,
+    /// so multi-call layered rendering — as in drawConsentPrompt —
+    /// sees each fragment's chars overwrite the previous at the same
+    /// offset). Multi-byte UTF-8 is parsed via `Utf8View` so each
+    /// codepoint lands in ONE cell (fixing the legacy byte-
+    /// fragmentation bug that drawErrorModal's em-dash hint hit).
     pub fn print(self: *WindowMock, text: []const u8, style: Style) !void {
         if (self.cols == 0 or self.rows == 0) return;
-        const max: usize = @min(text.len, self.cols);
-        for (text[0..max], 0..) |c, i| {
-            self.cells[i] = .{ .ch = c, .style = style };
+        if (text.len == 0) return;
+
+        var col: u16 = 0;
+        var row: u16 = 0;
+
+        var view = std.unicode.Utf8View.init(text) catch {
+            // Invalid UTF-8 — byte-iterate as a defensive fallback.
+            for (text) |c| {
+                self.writeCellRaw(col, row, c, style);
+                col += 1;
+                if (col >= self.cols) {
+                    col = 0;
+                    row += 1;
+                    if (row >= self.rows) return;
+                }
+            }
+            return;
+        };
+        var iter = view.iterator();
+        while (iter.nextCodepoint()) |cp| {
+            self.writeCellRaw(col, row, cp, style);
+            col += 1;
+            if (col >= self.cols) {
+                col = 0;
+                row += 1;
+                if (row >= self.rows) return;
+            }
+        }
+    }
+
+    /// Single-cell write helper: routes through `grid.writeCell` when
+    /// grid is owned (new adapter path), otherwise writes directly to
+    /// `self.cells` (legacy struct-literal path). Both paths land on
+    /// the same memory when grid is non-null (cells aliases the
+    /// grid's active buffer).
+    fn writeCellRaw(self: *WindowMock, col: u16, row: u16, ch: u21, style: Style) void {
+        if (self.grid) |g| {
+            _ = g.writeCell(col, row, ch, .{
+                .bold = style.bold,
+                .underline = style.underline,
+                .reverse = style.reverse,
+            });
+            return;
+        }
+        // Legacy path: write directly to the cells slice.
+        if (col >= self.cols or row >= self.rows) return;
+        const idx = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
+        if (idx < self.cells.len) {
+            self.cells[idx] = .{ .ch = ch, .style = style };
         }
     }
 
@@ -144,8 +261,10 @@ pub const WindowMock = struct {
         self.in_alt_screen = false;
     }
 
-    /// Return the current cell grid. The slice is owned by the WindowMock
-    /// (caller must NOT free). Cheap — no copy.
+    /// Return the current cell grid. The slice is owned by the
+    /// WindowMock (caller must NOT free). Cheap — no copy. Returns
+    /// `[]Cell` (mutable) to match the legacy signature; callers
+    /// reading only should treat it as `[]const Cell`.
     pub fn snapshot(self: *WindowMock) []Cell {
         return self.cells;
     }
@@ -153,13 +272,19 @@ pub const WindowMock = struct {
     /// Return a fresh slice of `DiffEntry` covering cells that differ
     /// between `prev` and the current grid. Allocates; caller frees.
     /// Two cells with the same char and style flags compare equal.
+    /// Reads from `self.cells` (canonical storage — works for both
+    /// the legacy and adapter paths).
     pub fn diff(self: *WindowMock, prev: []const Cell) ![]DiffEntry {
         var entries: std.ArrayList(DiffEntry) = .empty;
         defer entries.deinit(self.allocator);
         const limit: usize = @min(prev.len, self.cells.len);
         for (self.cells[0..limit], 0..) |cell, i| {
             const prev_cell = if (i < prev.len) prev[i] else Cell{ .ch = 0, .style = .{} };
-            if (cell.ch != prev_cell.ch or !std.meta.eql(cell.style, prev_cell.style)) {
+            if (cell.ch != prev_cell.ch or
+                cell.style.bold != prev_cell.style.bold or
+                cell.style.underline != prev_cell.style.underline or
+                cell.style.reverse != prev_cell.style.reverse)
+            {
                 try entries.append(self.allocator, .{
                     .x = @intCast(i % @as(usize, self.cols)),
                     .y = @intCast(i / @as(usize, self.cols)),
@@ -342,6 +467,57 @@ pub fn drawModal(win: *WindowMock, state: *State) !void {
     }
 }
 
+/// Dispatch the active `state` variant to its `render*ToGrid` fn.
+/// Used by `submitFrame` (Phase 2 replacement for `drawModal`).
+///
+/// Implementation: exhaustively switch on `state.*`. For each variant:
+/// - The 5 modal variants (`.key_entry`, `.unlock_prompt`, `.consent_prompt`,
+///   `.error_modal`, `.agent_loop`): call the corresponding render fn.
+/// - Any other variant: NO-OP (grid unchanged). These are transient states
+///   (e.g., welcome, loading, shutdown_pending) that don't render content.
+///
+/// Preconditions:
+/// - `grid` is a freshly cleared active ScreenGrid
+/// - `state` is a valid State pointer
+///
+/// Caller contract: invoked once per `tuiThreadLoop` iteration AFTER
+/// `grid.clear()` and BEFORE `diffAndEmit`. Pure dispatch — no I/O, no
+/// allocation, no state mutation.
+///
+/// T-2.3.3 (tui-ship-fast-phase2, design §3.4 / spec REQ-MODAL-002):
+/// the Stage 1 dispatcher of the three-stage pipeline
+/// `renderToGrid → diffAndEmit → submitFrame`. Sister to `drawModal`
+/// (the Phase 1 WindowMock dispatcher above) — T-SG-8 contract
+/// preserves drawModal's signature verbatim.
+pub fn renderToGrid(
+    grid: *ScreenGrid,
+    state: *const State,
+) void {
+    // Tiger Style §4 — defensive preconditions on the grid. A
+    // freshly-initialised ScreenGrid always has cols > 0 and rows > 0
+    // (per screen_grid.init's error.DimsTooLarge guard), so any
+    // non-zero-sized grid satisfies this assert. `state` is non-null
+    // by Zig's type system — `*const State` cannot be null in safe
+    // code (mirrors the per-fn guards in renderKeyEntryToGrid etc.).
+    std.debug.assert(grid.cols > 0);
+    std.debug.assert(grid.rows > 0);
+
+    // Tiger Style §5 — exhaustive switch over the `union(enum)`. No
+    // `else` arm: adding a 7th State variant fails compilation here
+    // AND in every other State switch (drawModal, render*ToGrid fns,
+    // runtimeDriverTick, etc.). The 5 modal variants route to their
+    // render fns; `.welcome` is the only no-op (transient state —
+    // boot screen / post-shutdown that doesn't render content).
+    switch (state.*) {
+        .welcome => {},
+        .key_entry => renderKeyEntryToGrid(grid, state),
+        .unlock_prompt => renderUnlockToGrid(grid, state),
+        .consent_prompt => renderConsentPromptToGrid(grid, state),
+        .agent_loop => renderAgentLoopToGrid(grid, state),
+        .error_modal => renderErrorModalToGrid(grid, state),
+    }
+}
+
 // =============================================================================
 // Modal draw fns (tasks 3.3 - 3.7)
 //
@@ -463,6 +639,91 @@ pub fn drawKeyEntry(win: *WindowMock, state: *State) !void {
     std.debug.assert(cursor_x <= win.size().cols);
     payload.cursor_col = cursor_x;
     payload.cursor_row = 0;
+}
+
+/// Render the KeyEntry modal into `grid`. Pure renderer — does NOT
+/// mutate state. Mirrors `drawKeyEntry` exactly; the only difference is
+/// the destination type (ScreenGrid instead of WindowMock).
+///
+/// Preconditions:
+/// - `grid` is a freshly cleared active ScreenGrid (cells all ' ')
+/// - `state.* == .key_entry`
+///
+/// Caller contract: invoked once per `tuiThreadLoop` iteration AFTER
+/// `grid.clear()` and AFTER the modal's drawing phase. Does NOT read
+/// from `grid` (only writes via `writeCell`).
+///
+/// T-2.3.1 (tui-ship-fast-phase2, design §3.4 / spec REQ-MODAL-001):
+/// the Stage 1 renderer of the three-stage pipeline
+/// `renderToGrid → diffAndEmit → submitFrame`. Added ALONGSIDE
+/// `drawKeyEntry` — T-SG-8 contract preserves drawKeyEntry's signature
+/// verbatim (tested at tests/tui/runtime_thread.zig:1618).
+pub fn renderKeyEntryToGrid(grid: *ScreenGrid, state: *const State) void {
+    // Tiger Style §5 — exhaustive dispatch. T-2.3.3 will replace the
+    // `else => return` no-op with concrete handlers for the remaining
+    // 4 variants; today only `.key_entry` renders into the grid.
+    const payload = switch (state.*) {
+        .key_entry => &state.key_entry,
+        else => return,
+    };
+
+    // Tiger Style §4 — defensive precondition on the draft length and
+    // the inline err_msg_buf (mirrors drawKeyEntry's assert at line 365
+    // + the implicit `idx < cells.len` guard on the err_msg loop).
+    std.debug.assert(payload.draft_len <= payload.draft.len);
+    std.debug.assert(payload.err_msg_len <= payload.err_msg_buf.len);
+
+    const prompt = "Enter API key: ";
+    const prefix_len: usize = prompt.len;
+
+    // Row 0: prompt prefix at cols 0..14. Each cell is a single char
+    // (u8 → u21 widening is automatic).
+    for (prompt, 0..) |c, i| {
+        const col: u16 = @intCast(i);
+        if (col >= grid.cols) break;
+        _ = grid.writeCell(col, 0, c, .{});
+    }
+
+    // Row 0: masked draft chars (one `*` per draft byte) starting at
+    // col=prefix_len. `shown` caps at the visible window — the draft
+    // is too long to render the tail (mirrors drawKeyEntry lines 374-378).
+    const shown: usize = @min(payload.draft_len, @as(usize, grid.cols) -| prefix_len);
+    for (payload.draft[0..shown], 0..) |_, i| {
+        const col: u16 = @intCast(prefix_len + i);
+        if (col >= grid.cols) break;
+        _ = grid.writeCell(col, 0, '*', .{});
+    }
+
+    // Row 1 (zargeant/tui-display-err): inline err_msg_buf[0..err_msg_len]
+    // copied into cells[grid.cols..grid.cols+err_msg_len], bold. Mirrors
+    // drawKeyEntry's row-2 rendering at lines 386-393. Row index is 1
+    // because `grid.cols` cells-per-row means offset `cols` = row 1.
+    if (payload.err_msg_len > 0) {
+        const msg = payload.err_msg_buf[0..payload.err_msg_len];
+        for (msg, 0..) |c, i| {
+            const col: u16 = @intCast(i);
+            if (col >= grid.cols) break;
+            _ = grid.writeCell(col, 1, c, .{ .bold = true });
+        }
+    }
+
+    // Row 0: spinner glyph (`|`, bold) at the prompt's tail while
+    // `validating` is true. Cap at cols (NOT cells.len) per WU 1.5.2 R3
+    // — the original bug wrote `|` into row 1 when draft saturated the
+    // visible window. Mirrors drawKeyEntry's spinner guard at line 406.
+    if (payload.validating) {
+        const spinner_x: usize = prefix_len + shown;
+        if (spinner_x < @as(usize, grid.cols)) {
+            const col: u16 = @intCast(spinner_x);
+            _ = grid.writeCell(col, 0, '|', .{ .bold = true });
+        }
+    }
+    // NOTE: drawKeyEntry writes payload.cursor_col / cursor_row as a
+    // WU 0.6 side effect (Bug 4). renderKeyEntryToGrid is the pure
+    // Stage 1 renderer — it does NOT mutate state. The cursor position
+    // for the new three-stage pipeline is computed by the Phase 2
+    // dispatch layer (T-2.3.3) from the same prefix_len + shown
+    // formula; emitting the trailing CUP is diffAndEmit's job.
 }
 
 /// Format-pre-flight + API-validation submit handler for KeyEntry (WU-2:
@@ -644,6 +905,82 @@ fn runValidateWorker(ctx: *ValidateCtx) void {
     // Post the reply. tryPut never blocks (channel is large enough for
     // one reply per submit; producer is the only worker in flight).
     ctx.reply_ch.tryPut(ctx.io, .{ .ValidateApiReply = payload }) catch {};
+}
+
+/// Render the Unlock modal into `grid`. Pure renderer — does NOT
+/// mutate state. Mirrors `drawUnlock` exactly; the only difference is
+/// the destination type (ScreenGrid instead of WindowMock).
+///
+/// Preconditions:
+/// - `grid` is a freshly cleared active ScreenGrid (cells all ' ')
+/// - `state.* == .unlock_prompt`
+///
+/// Caller contract: invoked once per `tuiThreadLoop` iteration AFTER
+/// `grid.clear()` and AFTER the modal's drawing phase. Does NOT read
+/// from `grid` (only writes via `writeCell`).
+///
+/// T-2.3.2 (tui-ship-fast-phase2, design §3.4 / spec REQ-MODAL-001):
+/// added ALONGSIDE `drawUnlock` — T-SG-8 contract preserves drawUnlock's
+/// signature verbatim (tested at tests/tui/runtime_thread.zig:1618).
+pub fn renderUnlockToGrid(grid: *ScreenGrid, state: *const State) void {
+    // Tiger Style §5 — exhaustive dispatch. T-2.3.3 will replace the
+    // `else => return` no-op with concrete handlers for the remaining
+    // 4 variants; today only `.unlock_prompt` renders into the grid.
+    const payload = switch (state.*) {
+        .unlock_prompt => &state.unlock_prompt,
+        else => return,
+    };
+
+    // Tiger Style §4 — defensive precondition on the draft length and
+    // the inline err_msg_buf (mirrors drawUnlock's assert at line 712
+    // + the implicit `idx < cells.len` guard on the err_msg loop).
+    std.debug.assert(payload.draft_len <= payload.draft.len);
+    std.debug.assert(payload.err_msg_len <= payload.err_msg_buf.len);
+
+    // Row 0: prompt prefix at cols 0..18 (19 chars). Mirrors
+    // drawUnlock's `win.print("Unlock passphrase: ", .{})` call.
+    const prompt = "Unlock passphrase: ";
+    const prefix_len: usize = prompt.len;
+    for (prompt, 0..) |c, i| {
+        const col: u16 = @intCast(i);
+        if (col >= grid.cols) break;
+        _ = grid.writeCell(col, 0, c, .{});
+    }
+
+    // Row 0: masked draft chars (one `*` per draft byte) starting at
+    // col=prefix_len. `shown` caps at the visible window — the draft
+    // is too long to render the tail (mirrors drawUnlock's shown cap
+    // at line 713).
+    const shown: usize = @min(payload.draft_len, @as(usize, grid.cols) -| prefix_len);
+    for (payload.draft[0..shown], 0..) |_, i| {
+        const col: u16 = @intCast(prefix_len + i);
+        if (col >= grid.cols) break;
+        _ = grid.writeCell(col, 0, '*', .{});
+    }
+
+    // Row 1 (zargeant/tui-display-err): inline err_msg_buf[0..err_msg_len]
+    // copied into row 1 (cells[cols..cols+err_msg_len]), bold. Mirrors
+    // drawUnlock's row-2 rendering at line 728-732. Row index is 1
+    // because the col offset on WindowMock = `cols` means "row 1".
+    if (payload.err_msg_len > 0) {
+        const msg = payload.err_msg_buf[0..payload.err_msg_len];
+        for (msg, 0..) |c, i| {
+            const col: u16 = @intCast(i);
+            if (col >= grid.cols) break;
+            _ = grid.writeCell(col, 1, c, .{ .bold = true });
+        }
+    }
+
+    // Row 0: spinner glyph (`|`, bold) at the prompt's tail while
+    // `validating` is true. Cap at cols (NOT cells.len) — same safer
+    // pattern as renderKeyEntryToGrid (mirrors the WU 1.5.2 R3 fix).
+    if (payload.validating) {
+        const spinner_x: usize = prefix_len + shown;
+        if (spinner_x < @as(usize, grid.cols)) {
+            const col: u16 = @intCast(spinner_x);
+            _ = grid.writeCell(col, 0, '|', .{ .bold = true });
+        }
+    }
 }
 
 /// Render the Unlock modal into `win`. Pure renderer — does NOT mutate
@@ -878,6 +1215,96 @@ pub fn cancelUnlock(state: *State) void {
     state.* = .{ .key_entry = .{} };
 }
 
+/// Render the ConsentPrompt modal into `grid`. Pure renderer — does
+/// NOT mutate state. Mirrors `drawConsentPrompt` exactly; the only
+/// difference is the destination type (ScreenGrid instead of
+/// WindowMock).
+///
+/// Preconditions:
+/// - `grid` is a freshly cleared active ScreenGrid (cells all ' ')
+/// - `state.* == .consent_prompt`
+///
+/// Caller contract: invoked once per `tuiThreadLoop` iteration AFTER
+/// `grid.clear()` and AFTER the modal's drawing phase. Does NOT read
+/// from `grid` (only writes via `writeCell`).
+///
+/// T-2.3.2 (tui-ship-fast-phase2, design §3.4 / spec REQ-MODAL-001):
+/// added ALONGSIDE `drawConsentPrompt` — T-SG-8 contract preserves
+/// drawConsentPrompt's signature verbatim (tested at
+/// tests/tui/runtime_thread.zig:1618).
+pub fn renderConsentPromptToGrid(grid: *ScreenGrid, state: *const State) void {
+    // Tiger Style §5 — exhaustive dispatch. T-2.3.3 will replace the
+    // `else => return` no-op with concrete handlers for the remaining
+    // 4 variants; today only `.consent_prompt` renders into the grid.
+    const payload = switch (state.*) {
+        .consent_prompt => &state.consent_prompt,
+        else => return,
+    };
+
+    // Tiger Style §4 — defensive precondition on the inline last_four
+    // buffer (mirrors drawConsentPrompt's implicit contract).
+    std.debug.assert(payload.last_four.len == 4);
+
+    // Row 0: 5-fragment banner — "Store key at " + path (underline)
+    // + " (mode 0o600, last-4 " + last_four (bold) + ")?". Each
+    // fragment writes at the absolute col that follows the previous
+    // one. Cap each fragment at grid.cols (writeCell drops OOB
+    // silently per the ScreenGrid contract).
+    //
+    // NOTE on drawConsentPrompt: WindowMock.print always writes at
+    // cells[0..len], so the multi-call banner in drawConsentPrompt
+    // would visually OVERWRITE earlier fragments. The render fn uses
+    // grid.writeCell with advancing col positions to produce the
+    // INTENDED layout (the design §3.4 contract: "same positions,
+    // same chars, same styling" — i.e. the semantic intent, not the
+    // WindowMock overwrite bug).
+    var col: usize = 0;
+
+    // Fragment 1: "Store key at " (13 chars).
+    inline for ("Store key at ") |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{});
+        }
+        col += 1;
+    }
+
+    // Fragment 2: path (variable length, underlined).
+    for (payload.path) |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{ .underline = true });
+        }
+        col += 1;
+    }
+
+    // Fragment 3: " (mode 0o600, last-4 " (21 chars).
+    inline for (" (mode 0o600, last-4 ") |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{});
+        }
+        col += 1;
+    }
+
+    // Fragment 4: last_four (4 bytes, bold). Note: last_four is
+    // initialised to .{0} ** 4 by default — when untouched, those 4
+    // bytes are NUL (0x00), not spaces. Mirrors drawConsentPrompt's
+    // `win.print(&payload.last_four, .{ .bold = true })` which writes
+    // the bytes verbatim.
+    for (payload.last_four) |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{ .bold = true });
+        }
+        col += 1;
+    }
+
+    // Fragment 5: ")?" (2 chars).
+    inline for (")?") |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{});
+        }
+        col += 1;
+    }
+}
+
 /// Render the ConsentPrompt modal into `win`. Pure renderer — does NOT
 /// mutate state. Callers drive `consent_prompt → agent_loop` via
 /// `submitConsentGrant` (REQ-TUI-008).
@@ -987,6 +1414,111 @@ pub fn cancelConsent(state: *State) void {
     state.consent_prompt.consent = false;
 }
 
+/// Render the ErrorModal into `grid`. The error class drives a banner;
+/// tls_gated shows the env-var hint `ZARGEANT_RUN_TLS_HANDSHAKE=1`
+/// prominently (REQ-TUI-009 scenario 1). Pure renderer — does NOT
+/// mutate state. Mirrors `drawErrorModal` exactly; the only difference
+/// is the destination type (ScreenGrid instead of WindowMock).
+///
+/// Preconditions:
+/// - `grid` is a freshly cleared active ScreenGrid (cells all ' ')
+/// - `state.* == .error_modal`
+///
+/// Caller contract: invoked once per `tuiThreadLoop` iteration AFTER
+/// `grid.clear()` and AFTER the modal's drawing phase. Does NOT read
+/// from `grid` (only writes via `writeCell`).
+///
+/// T-2.3.2 (tui-ship-fast-phase2, design §3.4 / spec REQ-MODAL-001):
+/// added ALONGSIDE `drawErrorModal` — T-SG-8 contract preserves
+/// drawErrorModal's signature verbatim (tested at
+/// tests/tui/runtime_thread.zig:1618).
+pub fn renderErrorModalToGrid(grid: *ScreenGrid, state: *const State) void {
+    // Tiger Style §5 — exhaustive dispatch. T-2.3.3 will replace the
+    // `else => return` no-op with concrete handlers for the remaining
+    // 4 variants; today only `.error_modal` renders into the grid.
+    const payload = switch (state.*) {
+        .error_modal => &state.error_modal,
+        else => return,
+    };
+
+    // Tiger Style §4 — defensive precondition on the inline message_buf
+    // (mirrors drawErrorModal's implicit `message_buf` contract).
+    std.debug.assert(payload.message_len <= payload.message_buf.len);
+
+    // Row 0: banner = "Error: " (bold) + "[<class>]" (bold) + " " +
+    // message + (if kind == .tls_gated) " — set ZARGEANT_RUN_TLS_
+    // HANDSHAKE=1" (bold).
+    //
+    // NOTE on drawErrorModal: WindowMock.print always writes at
+    // cells[0..len], so the multi-call banner in drawErrorModal would
+    // visually OVERWRITE earlier fragments. The render fn uses
+    // grid.writeCell with advancing col positions to produce the
+    // INTENDED layout (the design §3.4 contract: "same positions,
+    // same chars, same styling" — i.e. the semantic intent, not the
+    // WindowMock overwrite bug). Mirror the inline comment at
+    // renderConsentPromptToGrid.
+    var col: usize = 0;
+
+    // Fragment 1: "Error: " (7 chars, bold).
+    inline for ("Error: ") |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{ .bold = true });
+        }
+        col += 1;
+    }
+
+    // Fragment 2: "[<class>]" — format class_buf once and write.
+    // drawErrorModal uses std.fmt.bufPrint(&class_buf, "[{s}]", ...)
+    // which can fall back to "[?]" if formatting fails; we mirror
+    // the same fallback.
+    var class_buf: [32]u8 = undefined;
+    const class_str = std.fmt.bufPrint(&class_buf, "[{s}]", .{@tagName(payload.kind)}) catch "[?]";
+    for (class_str) |c| {
+        if (col < @as(usize, grid.cols)) {
+            _ = grid.writeCell(@intCast(col), 0, c, .{ .bold = true });
+        }
+        col += 1;
+    }
+
+    // Fragment 3: " " (1 char).
+    if (col < @as(usize, grid.cols)) {
+        _ = grid.writeCell(@intCast(col), 0, ' ', .{});
+        col += 1;
+    }
+
+    // Fragment 4: message (if any). drawErrorModal reads
+    // message_buf[0..message_len] inline (Bug 1 fix).
+    if (payload.message_len > 0) {
+        const msg = payload.message_buf[0..payload.message_len];
+        for (msg) |c| {
+            if (col < @as(usize, grid.cols)) {
+                _ = grid.writeCell(@intCast(col), 0, c, .{});
+            }
+            col += 1;
+        }
+    }
+
+    // Fragment 5: env-var hint (only for .tls_gated), bold.
+    // The hint contains an em-dash (U+2014, 3-byte UTF-8) — we iterate
+    // over unicode codepoints (not bytes) via Utf8View so the em-dash
+    // lands as ONE cell, not three single-byte cells. This is a
+    // deliberate improvement over drawErrorModal's `win.print(hint)`,
+    // which iterates over bytes and would split the em-dash into 3
+    // partial cells (a known WindowMock limitation — the render fn
+    // produces the intended layout, not the buggy byte-fragmented one).
+    if (payload.kind == .tls_gated) {
+        const hint = " — set ZARGEANT_RUN_TLS_HANDSHAKE=1";
+        var view = std.unicode.Utf8View.init(hint) catch unreachable;
+        var iter = view.iterator();
+        while (iter.nextCodepoint()) |cp| {
+            if (col < @as(usize, grid.cols)) {
+                _ = grid.writeCell(@intCast(col), 0, cp, .{ .bold = true });
+            }
+            col += 1;
+        }
+    }
+}
+
 /// Render the ErrorModal into `win`. The error class drives a banner;
 /// tls_gated shows the env-var hint `ZARGEANT_RUN_TLS_HANDSHAKE=1`
 /// prominently (REQ-TUI-009 scenario 1).
@@ -1039,6 +1571,66 @@ pub fn openErrorModal(state: *State, kind: ErrorKind, message: []const u8) void 
         .message_len = msg_len,
         .prior = prior,
     } };
+}
+
+/// Render the AgentLoopView into `grid`: cumulative LLM text on top +
+/// status bar (model name, token count, last-update timestamp) on the
+/// bottom row. Pure renderer — does NOT mutate state. Mirrors
+/// `drawAgentLoopView` exactly; the only difference is the destination
+/// type (ScreenGrid instead of WindowMock).
+///
+/// Preconditions:
+/// - `grid` is a freshly cleared active ScreenGrid (cells all ' ')
+/// - `state.* == .agent_loop`
+///
+/// Caller contract: invoked once per `tuiThreadLoop` iteration AFTER
+/// `grid.clear()` and AFTER the modal's drawing phase. Does NOT read
+/// from `grid` (only writes via `writeCell`).
+///
+/// T-2.3.2 (tui-ship-fast-phase2, design §3.4 / spec REQ-MODAL-001):
+/// added ALONGSIDE `drawAgentLoopView` — T-SG-8 contract preserves
+/// drawAgentLoopView's signature verbatim (tested at
+/// tests/tui/runtime_thread.zig:1618).
+pub fn renderAgentLoopToGrid(grid: *ScreenGrid, state: *const State) void {
+    // Tiger Style §5 — exhaustive dispatch. T-2.3.3 will replace the
+    // `else => return` no-op with concrete handlers for the remaining
+    // 4 variants; today only `.agent_loop` renders into the grid.
+    const payload = switch (state.*) {
+        .agent_loop => &state.agent_loop,
+        else => return,
+    };
+
+    // Tiger Style §4 — defensive precondition on the cumulative buffer
+    // (mirrors drawAgentLoopView's `items.len` loop bound).
+    std.debug.assert(payload.cumulative.items.len >= 0);
+
+    // Row 0: cumulative text — first `min(items.len, cols)` chars.
+    // drawAgentLoopView writes via `win.cells[i] = ...` at offsets
+    // 0..max (row 0). Mirrors by writing to grid at (col=i, row=0).
+    if (payload.cumulative.items.len > 0) {
+        const max: usize = @min(payload.cumulative.items.len, @as(usize, grid.cols));
+        for (payload.cumulative.items[0..max], 0..) |c, i| {
+            _ = grid.writeCell(@intCast(i), 0, c, .{});
+        }
+    }
+
+    // Bottom row: status bar "model={s} tokens={d} t={d}ms", reverse
+    // style. Mirrors drawAgentLoopView's last-row write at lines
+    // 1090-1104. The row index is `rows - 1` (Tiger Style §4 —
+    // assert rows > 0 matches the source's `if (win.rows > 0)` guard).
+    if (grid.rows > 0) {
+        const last_row: u16 = grid.rows - 1;
+        var status_buf: [128]u8 = undefined;
+        const status_str = std.fmt.bufPrint(
+            &status_buf,
+            "model={s} tokens={d} t={d}ms",
+            .{ payload.model, payload.tokens, payload.last_update_ms },
+        ) catch "model=? tokens=0 t=0ms";
+        const status_len: usize = @min(status_str.len, @as(usize, grid.cols));
+        for (status_str[0..status_len], 0..) |c, i| {
+            _ = grid.writeCell(@intCast(i), last_row, c, .{ .reverse = true });
+        }
+    }
 }
 
 /// Render the AgentLoopView: cumulative LLM text on top + status bar

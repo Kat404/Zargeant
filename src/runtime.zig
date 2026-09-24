@@ -367,11 +367,23 @@ fn tuiRealMain(args: *const ThreadArgs) void {
         stdin_file.handle,
         writer,
         args.io,
-    ) catch .{
+    ) catch blk: {
         // tuiThreadInit can fail when the handle is not a real TTY or
         // the writer cannot allocate. Build a stub Lifecycle with
         // no_tty=true so the loop falls through to logger-only mode.
-        .{
+        // Phase 2 PR2 (T-2.5.1): the stub also carries the new
+        // [2]ScreenGrid field — sized to the same fallback dims
+        // (80×24) used by tuiThreadInit so callers that read
+        // `lc.grids[0].cols / .rows` see a consistent shape regardless
+        // of which branch returned the value.
+        //
+        // Build the stub field-by-field because Zig 0.16's struct
+        // literal syntax doesn't support array init for `[2]ScreenGrid`
+        // (the element type itself contains `[2][MAX_CELL_BUF]Cell`,
+        // an inline struct too large to literal-init in-place).
+        // `grids` has a default of `undefined`, so we omit it from
+        // the struct literal and populate each cell after.
+        var stub: tui_thread_mod.Lifecycle = .{
             .raw_term = null,
             .dec_2048_supported = false,
             .kitty_supported = false,
@@ -380,7 +392,11 @@ fn tuiRealMain(args: *const ThreadArgs) void {
             .width = 80,
             .height = 24,
             .no_tty = true,
-        }};
+        };
+        stub.grids[0] = tui_thread_mod.ScreenGrid.init(80, 24) catch unreachable;
+        stub.grids[1] = tui_thread_mod.ScreenGrid.init(80, 24) catch unreachable;
+        break :blk stub;
+    };
 
     // REQ-RW-001: seed the first frame after init returns and we have a
     // real TTY. The no_tty path keeps redraw_pending=false so the loop
@@ -389,28 +405,15 @@ fn tuiRealMain(args: *const ThreadArgs) void {
         lc.redraw_pending.store(true, .seq_cst);
     }
 
-    // REQ-RW-002: allocate `prev_snapshot` for `emitFrame` diff. Owned by
-    // Lifecycle for the lifetime of the loop; freed before shutdown.
-    // OOM is tolerated by leaving prev_snapshot null — `emitFrame` falls
-    // back to a full-frame emit (current as both prev and current).
-    if (!lc.no_tty) {
-        const n: usize = @as(usize, lc.width) * @as(usize, lc.height);
-        lc.prev_snapshot = args.allocator.alloc(
-            @import("modal.zig").Cell,
-            n,
-        ) catch null;
-        // REQ-BUGFIX1-004: zero-init the prev_snapshot buffer. Without
-        // this, alloc returns undefined memory and the first frame's diff
-        // compares against garbage, triggering a full-frame emit of
-        // ~38 KB that stalls slow terminals for ~2 s on the first 2
-        // keystrokes (see explore obs#1378 §Bug 3).
-        if (lc.prev_snapshot != null) {
-            @memset(lc.prev_snapshot.?, .{ .ch = ' ', .style = .{} });
-        }
-    }
-
     // Stage 2: per-frame loop. Real TTY: tuiThreadLoop brackets renders
     // + dispatches events. no-TTY: skip rendering, just drain shutdown.
+    //
+    // Phase 2 PR2 (T-2.6.2) — the prev_snapshot alloc/free is gone:
+    // submitFrame owns its own double-buffer storage via
+    // (T-2.5.1 + T-2.6.1). The previous
+    // + zero-init (REQ-BUGFIX1-004) is no longer required — the
+    //  is value-typed inline storage on Lifecycle,
+    // pre-cleared by .
     if (!lc.no_tty) {
         while (!args.shutdown.load(.seq_cst)) {
             tui_thread_mod.tuiThreadLoop(
@@ -428,9 +431,7 @@ fn tuiRealMain(args: *const ThreadArgs) void {
     }
 
     // Stage 3: restore terminal (alternatescreen / raw mode / kitty).
-    // REQ-RW-002: free prev_snapshot before raw mode teardown.
-    if (lc.prev_snapshot) |p| args.allocator.free(p);
-    lc.prev_snapshot = null;
+    // REQ-RW-002 (legacy prev_snapshot free) — removed in T-2.6.2.
     tui_thread_mod.tuiThreadShutdown(&lc, writer);
 }
 
