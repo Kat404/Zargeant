@@ -489,5 +489,47 @@ pub fn build(b: *std.Build) void {
     zig_build_release_fast.step.dependOn(&zig_test_release_safe.step);
     zig_test_release_fast.step.dependOn(&zig_build_release_fast.step);
 
+    // tui-ship-fast-phase2 (T-2.1.1) — ScreenGrid value type module +
+    // dedicated test step. Module root is src/screen_grid.zig (NEW file,
+    // added in the same commit as the test step wiring per TDD convention).
+    // Test module imports `screen_grid` directly so the test file can
+    // reference ScreenGrid, MAX_CELL_BUF, Cell without a namespace prefix.
+    // Wired as a separate step (mirrors test-terminal / test-tui pattern)
+    // so the test count delta is observable per PR.
+    const screen_grid_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/screen_grid.zig"),
+    });
+    // tui-ship-fast-phase2 (T-2.2.1) — DiffEntry + diffAndEmit pure renderer.
+    // Module root is src/diff_emit.zig (NEW file). The module imports
+    // `screen_grid` to consume Cell + CURSOR_SKIP; this import is wired
+    // explicitly because Zig 0.16's sibling-module-root ownership rule
+    // rejects `@import("screen_grid.zig")` from a sibling root. Tests in
+    // tests/tui/screen_grid.zig access diff_emit via the `diff_emit` import
+    // alias (wired below).
+    const diff_emit_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/diff_emit.zig"),
+        .imports = &.{
+            .{ .name = "screen_grid", .module = screen_grid_mod },
+        },
+    });
+    const screen_grid_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/tui/screen_grid.zig"),
+        .imports = &.{
+            .{ .name = "screen_grid", .module = screen_grid_mod },
+            .{ .name = "diff_emit", .module = diff_emit_mod },
+        },
+    });
+    const screen_grid_test_step = b.addTest(.{ .root_module = screen_grid_test_mod });
+    const run_screen_grid_test = b.addRunArtifact(screen_grid_test_step);
+    const screen_grid_test_decl = b.step("test-tui-screen-grid", "Run tests/tui/screen_grid.zig (T-2.1.1 ScreenGrid value type)");
+    screen_grid_test_decl.dependOn(&run_screen_grid_test.step);
+    test_decl.dependOn(&run_screen_grid_test.step);
+
     if (qa_helgrind_opt) verify_step.dependOn(&helgrind_cmd.step);
 }
