@@ -522,6 +522,25 @@ pub fn build(b: *std.Build) void {
             .{ .name = "screen_grid", .module = screen_grid_mod },
         },
     });
+    // tui-ship-fast-phase2 (T-2.6.1) — `submitFrame` in src/tui.zig calls
+    // `diffAndEmit` directly. Without this addImport, tui.zig (a member
+    // of lib_mod) cannot reach diff_emit_mod via the sibling-module
+    // import rule. Mirrors the screen_grid addImport at line 509.
+    lib_mod.addImport("diff_emit", diff_emit_mod);
+    // Phase 2 fix (build-mod-wiring): mirror the lib_mod wiring above
+    // into exe_mod AND test_mod so both the production binary AND the
+    // umbrella test step compile. PR #44 (slice 1) registered
+    // `screen_grid` + `diff_emit` in lib_mod for the individual
+    // test-* targets but missed both exe_mod and test_mod, causing
+    // both `just build` and `just verify` to fail with
+    // `no module named 'screen_grid' available within module 'root'`
+    // at src/tui.zig:152 and src/modal.zig:33 (via root.zig chain).
+    // test_mod's `imports = &.{...}` array at line 157 has only
+    // `terminal`; we add screen_grid + diff_emit here via addImport.
+    exe_mod.addImport("screen_grid", screen_grid_mod);
+    exe_mod.addImport("diff_emit", diff_emit_mod);
+    test_mod.addImport("screen_grid", screen_grid_mod);
+    test_mod.addImport("diff_emit", diff_emit_mod);
     const screen_grid_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
