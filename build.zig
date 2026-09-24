@@ -522,6 +522,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "screen_grid", .module = screen_grid_mod },
         },
     });
+    // tui-ship-fast-phase2 (T-2.6.1) — `submitFrame` in src/tui.zig calls
+    // `diffAndEmit` directly. Without this addImport, tui.zig (a member
+    // of lib_mod) cannot reach diff_emit_mod via the sibling-module
+    // import rule. Mirrors the screen_grid addImport at line 509.
+    lib_mod.addImport("diff_emit", diff_emit_mod);
     const screen_grid_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
