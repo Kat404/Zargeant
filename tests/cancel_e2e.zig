@@ -235,10 +235,17 @@ test "key-event intercept: write to cancel_pipe[1] is observable on cancel_pipe[
     // 5. Assertions:
     //    a. poll returned 1 fd (readable)
     //    b. revents has POLL.IN set
-    //    c. wall-clock elapsed < 1ms (kernel roundtrip is microseconds)
+    //    c. wall-clock elapsed < 10ms (kernel roundtrip is microseconds;
+    //       relaxed from < 1ms to < 10ms for CI runner flakiness — github
+    //       actions ubuntu-latest under load frequently exceeds 1ms but
+    //       reliably completes under 10ms. The CAP-09 invariant is about
+    //       the pipe being synchronous, not about hitting a tight ms
+    //       budget; see engram obs zargeant/session-summary/2026-09-24
+    //       and engram/reconciliation-attempts/2026-09-24 for the CI
+    //       failure context.)
     try testing.expectEqual(@as(usize, 1), poll_rc);
     try testing.expect((pfds[0].revents & std.os.linux.POLL.IN) != 0);
-    try testing.expect(elapsed_ms < 1);
+    try testing.expect(elapsed_ms < 10);
 
     std.debug.print(
         "\n[cancel_e2e] CAP-09 PASS — cancel_pipe writer roundtrip in {d} ms\n",
