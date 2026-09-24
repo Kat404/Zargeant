@@ -490,6 +490,7 @@ pub fn cursorIntentFromState(state: *const State) struct { col: u16, row: u16 } 
     };
 }
 
+
 /// Dispatch the active `state` variant to its `render*ToGrid` fn.
 /// Used by `submitFrame` (Phase 2 replacement for `drawModal`).
 ///
