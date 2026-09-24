@@ -196,3 +196,82 @@ test "enableBracketedPaste is idempotent (no internal dedup)" {
     try testing.expectEqual(@as(usize, 2), h_count);
     try testing.expectEqual(@as(usize, 2), l_count);
 }
+
+// =============================================================================
+// WU 0.7 (tui-ship-fast-phase0, Bug 6) — enableRawMode must apply the full
+// cfmakeraw recipe, not just clear ICANON + ECHO. Pre-fix, the parser
+// saw cooked-mode artifacts (CR→NL translation, output post-processing,
+// flow-control) bleed through and corrupt the event stream.
+//
+// The full cfmakeraw recipe per `man 3 cfmakeraw` (POSIX) + glibc:
+//   - c_iflag &= ~(ICRNL | IXON | BRKINT | INPCK | ISTRIP)
+//   - c_oflag &= ~OPOST
+//   - c_cflag &= ~(CSIZE | PARENB); c_cflag |= CS8
+//   - c_lflag &= ~(ICANON | ECHO | IEXTEN)
+//   - c_cc[VMIN] = 1
+//   - c_cc[VTIME] = 0
+// ISIG is PRESERVED (NOT cleared) — the tui-input-flow-bugfixes-2 R2a
+// path requires Ctrl+C to keep generating SIGINT via the tty discipline
+// (src/cancel_signal.zig was removed but Ctrl+C is intercepted by the
+// parser at src/tui.zig:629, which depends on the 0x03 byte arriving
+// as data, which requires ISIG=true).
+//
+// This test pins the post-cfmakeraw termios state. Pre-fix, only ICANON
+// and ECHO are cleared — the test fails on VMIN=1 and ISIG=1 (RED).
+// =============================================================================
+
+test "enableRawMode applies full cfmakeraw recipe (ICRNL/IXON/OPOST cleared)" {
+    var backend = term.MockBackend.init(.{});
+    defer backend.deinit();
+    backend.activate();
+    defer backend.deactivate();
+    const backend_value = backend.backend();
+    const dummy_handle: std.Io.File.Handle = -1;
+
+    _ = try term.enableRawMode(dummy_handle, backend_value);
+    // After enable, the MockBackend recorded exactly one tcsetattr call
+    // carrying the post-cfmakeraw termios struct.
+    try testing.expectEqual(@as(u32, 1), backend.tcsetattr_count);
+    const applied = backend.last_applied_termios.?;
+
+    // POSIX termios(3) cfmakeraw recipe — every flag below must be
+    // cleared by enableRawMode. The defaults in std.mem.zeroes are all
+    // 0/false, so a flag that was already cleared would pass even
+    // pre-fix. The discriminator is VMIN == 1 (which is non-zero) and
+    // ISIG == 1 (also non-zero, but cfmakeraw clears it — we restore
+    // ISIG after cfmakeraw to keep Ctrl+C working).
+    try testing.expectEqual(false, applied.iflag.ICRNL);
+    try testing.expectEqual(false, applied.iflag.IXON);
+    try testing.expectEqual(false, applied.iflag.BRKINT);
+    try testing.expectEqual(false, applied.iflag.INPCK);
+    try testing.expectEqual(false, applied.iflag.ISTRIP);
+    try testing.expectEqual(false, applied.oflag.OPOST);
+    try testing.expectEqual(false, applied.lflag.ICANON);
+    try testing.expectEqual(false, applied.lflag.ECHO);
+    try testing.expectEqual(false, applied.lflag.IEXTEN);
+
+    // CS8 forced (PARENB cleared, CSIZE set to CS8). Pre-fix CSIZE is
+    // .CS5 (the default-zero value of the enum).
+    try testing.expectEqual(false, applied.cflag.PARENB);
+    try testing.expectEqual(@as(std.os.linux.CSIZE, .CS8), applied.cflag.CSIZE);
+
+    // VMIN=1, VTIME=0. Pre-fix these are both 0 (default-zero cc[]).
+    try testing.expectEqual(@as(u8, 1), applied.cc[VMIN_INDEX]);
+    try testing.expectEqual(@as(u8, 0), applied.cc[VTIME_INDEX]);
+
+    // ISIG preserved (tui-input-flow-bugfixes-2 R2a requires the 0x03
+    // byte to arrive as data for the parser-level Ctrl+C intercept).
+    try testing.expectEqual(true, applied.lflag.ISIG);
+}
+
+// Linux x86_64 c_cc indices (NCCS=8 for non-mips/sparc/ppc):
+//   0 VINTR  1 VQUIT  2 VERASE  3 VKILL  4 VEOF  5 VTIME  6 VMIN  7 VSWTC
+// Per Linux termios(3) §"Canonical and noncanonical mode":
+//   VMIN  = number of bytes for non-canonical read (CCS=8 → index 6)
+//   VTIME = inter-byte timeout deciseconds (CCS=8 → index 5)
+// Note: glibc/POSIX traditionally labels them VMIN=4, VTIME=5; the
+// Linux kernel uses different positional semantics for VMIN/VTIME
+// specifically when ICANON is off. We use the array indices that match
+// the Linux termios(3) §Noncanonical Mode documentation.
+const VMIN_INDEX: usize = 6;
+const VTIME_INDEX: usize = 5;

@@ -54,6 +54,10 @@ const M = struct {
     pub const drawKeyEntry = root.modal.drawKeyEntry;
     pub const drawUnlock = root.modal.drawUnlock;
     pub const appendStreamChunk = root.modal.appendStreamChunk;
+    // WU 0.5 (tui-ship-fast-phase0): drawKeyEntry is exposed on the
+    // modal namespace so tests can drive the renderer directly and
+    // assert the cursor position surface (Bug 4).
+    pub const drawKeyEntry = root.modal.drawKeyEntry;
 };
 const MS = struct {
     const root = @import("mock_server");
@@ -89,8 +93,12 @@ const Tui = struct {
     pub const Lifecycle = root.tui.Lifecycle;
     pub const emitFrame = root.tui.emitFrame;
     pub const tuiThreadLoop = root.tui.tuiThreadLoop;
+    pub const tuiThreadShutdown = root.tui.tuiThreadShutdown;
     pub const handleKeyInput = root.tui.handleKeyInput;
     pub const drainSubmitReply = root.tui.drainSubmitReply;
+    // WU 0.6 (tui-ship-fast-phase0, Bug 4): CURSOR_SKIP sentinel
+    // suppresses the trailing CUP emission in emitFrame.
+    pub const CURSOR_SKIP = root.tui.CURSOR_SKIP;
 };
 
 /// Key-event driver helper (REQ-TIW-013). Mirrors the wiring in
@@ -1358,9 +1366,11 @@ test "W3-1: emitFrame writes CSI cursor position + cell byte for a 2-cell diff" 
     };
     var buf: [128]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try Tui.emitFrame(&w, &prev, &current, 2, 2, testing.allocator);
+    // WU 0.6 (Bug 4): pass cursor_col/cursor_row matching the diff
+    // cell (x=1, y=0) so the trailing CUP fires at \x1b[1;2H.
+    try Tui.emitFrame(&w, &prev, &current, 2, 2, testing.allocator, 1, 0);
     const out = buf[0..w.end];
-    // Cursor position: mibu.cursor.goTo(writer, x=2, y=1) → \x1b[1;2H
+    // Cursor position: terminal.cursor.goTo(writer, x=1, y=0) → \x1b[1;2H
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;2H") != null);
     // Bold SGR
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[1m") != null);
@@ -1386,7 +1396,8 @@ test "W3-2: emitFrame writes SGR codes for bold/underline/reverse/reset" {
     };
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try Tui.emitFrame(&w, &prev, &current, 3, 1, testing.allocator);
+    // WU 0.6: cursor_col=CURSOR_SKIP (these tests don't model cursor).
+    try Tui.emitFrame(&w, &prev, &current, 3, 1, testing.allocator, Tui.CURSOR_SKIP, 0);
     const out = buf[0..w.end];
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[1m") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[4m") != null);
@@ -1396,7 +1407,9 @@ test "W3-2: emitFrame writes SGR codes for bold/underline/reverse/reset" {
 test "W3-3: emitFrame writes no cursor escapes when prev == current" {
     // REQ-RW-003 scenario S-RW-005 — when prev == current, the diff is
     // empty so only the trailing reset SGR is emitted (no cursor
-    // positions).
+    // positions). WU 0.6 (Bug 4): CURSOR_SKIP suppresses the trailing
+    // CUP — back-compat behavior for states that don't carry cursor
+    // layout state.
     var cells: [4]M.Cell = .{
         .{ .ch = 'A', .style = .{ .bold = true } },
         .{ .ch = 'B', .style = .{ .underline = true } },
@@ -1405,7 +1418,7 @@ test "W3-3: emitFrame writes no cursor escapes when prev == current" {
     };
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try Tui.emitFrame(&w, &cells, &cells, 2, 2, testing.allocator);
+    try Tui.emitFrame(&w, &cells, &cells, 2, 2, testing.allocator, Tui.CURSOR_SKIP, 0);
     const out = buf[0..w.end];
     // No cursor-position escapes (those look like \x1b[<num>;<num>H).
     try testing.expect(std.mem.indexOf(u8, out, "\x1b[2;1H") == null);
@@ -1432,7 +1445,7 @@ test "W3-4: emitFrame frees the diff slice under std.testing.allocator" {
     };
     var buf: [256]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try Tui.emitFrame(&w, &prev, &current, 3, 1, testing.allocator);
+    try Tui.emitFrame(&w, &prev, &current, 3, 1, testing.allocator, Tui.CURSOR_SKIP, 0);
     // If emitFrame leaks the diff slice, the testing.allocator would
     // assert on scope exit; we got here so the leak is zero.
     try testing.expect(w.end > 0);
@@ -1452,10 +1465,10 @@ test "W3-5: emitFrame ignores WindowMock.in_alt_screen + cursor_hidden" {
     };
     var buf_a: [256]u8 = undefined;
     var w_a = std.Io.Writer.fixed(&buf_a);
-    try Tui.emitFrame(&w_a, &prev, &current, 2, 1, testing.allocator);
+    try Tui.emitFrame(&w_a, &prev, &current, 2, 1, testing.allocator, Tui.CURSOR_SKIP, 0);
     var buf_b: [256]u8 = undefined;
     var w_b = std.Io.Writer.fixed(&buf_b);
-    try Tui.emitFrame(&w_b, &prev, &current, 2, 1, testing.allocator);
+    try Tui.emitFrame(&w_b, &prev, &current, 2, 1, testing.allocator, Tui.CURSOR_SKIP, 0);
     try testing.expectEqual(w_a.end, w_b.end);
     try testing.expectEqualSlices(u8, buf_a[0..w_a.end], buf_b[0..w_b.end]);
 }
@@ -1560,13 +1573,14 @@ test "W5-1: Lifecycle.prev_snapshot updates per frame (no double-emit)" {
     var w = std.Io.Writer.fixed(&buf);
     // Frame 1: prev -> frame1. emitFrame swaps lifecycle.prev_snapshot
     // to a dupe of frame1 (we fake this here by tracking manually).
-    try Tui.emitFrame(&w, &prev, &frame1, 3, 1, testing.allocator);
+    // WU 0.6: cursor_col=CURSOR_SKIP (no cursor modeling here).
+    try Tui.emitFrame(&w, &prev, &frame1, 3, 1, testing.allocator, Tui.CURSOR_SKIP, 0);
     const frame1_out = w.end;
     try testing.expect(frame1_out > 0);
 
     // Frame 2: frame1 -> frame2 (only cell B→D differs).
     var w2 = std.Io.Writer.fixed(&buf);
-    try Tui.emitFrame(&w2, &frame1, &frame2, 3, 1, testing.allocator);
+    try Tui.emitFrame(&w2, &frame1, &frame2, 3, 1, testing.allocator, Tui.CURSOR_SKIP, 0);
     const frame2_out = w2.end;
     try testing.expect(frame2_out > 0);
     // Frame 2 emits fewer bytes than frame 1 (only 1 diff entry vs 3).
@@ -1742,7 +1756,11 @@ test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001 + REQ-TIRFIX-002)
 
         var buf: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        try Tui.emitFrame(&w, &prev, &current, 60, 24, testing.allocator);
+        // WU 0.6 + REQ-TIRFIX-002 hybrid: pass cursor_col=6 (the explicit
+        // cursor position, 0-indexed, one past the cell at col=5). The cell
+        // is at 0-indexed col=5; the cursor lands at 0-indexed col=6 =
+        // 1-indexed col=7 so the next keystroke overwrites correctly.
+        try Tui.emitFrame(&w, &prev, &current, 60, 24, testing.allocator, 6, 0);
         const out = buf[0..w.end];
 
         // REQ-TIRFIX-002: cursor at 1-indexed col=7 (one past 0-indexed col=5).
@@ -1758,7 +1776,11 @@ test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001 + REQ-TIRFIX-002)
 
         var buf: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        try Tui.emitFrame(&w, &prev, &current, 60, 24, testing.allocator);
+        // Pass CURSOR_SKIP to exercise the PR #39 last_x + 1 fallback
+        // path (used by .unlock_prompt and other states without explicit
+        // cursor modeling). Clamped at cols - 1 = 59 0-indexed = col 60
+        // 1-indexed.
+        try Tui.emitFrame(&w, &prev, &current, 60, 24, testing.allocator, Tui.CURSOR_SKIP, 0);
         const out = buf[0..w.end];
 
         // 1-indexed col=60 (clamped to cols - 1 = 59 0-indexed; no further +1).
@@ -1774,7 +1796,8 @@ test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001 + REQ-TIRFIX-002)
 
         var buf: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
-        try Tui.emitFrame(&w, &current, &current, 2, 2, testing.allocator);
+        // WU 0.6: CURSOR_SKIP suppresses the trailing CUP.
+        try Tui.emitFrame(&w, &current, &current, 2, 2, testing.allocator, Tui.CURSOR_SKIP, 0);
         const out = buf[0..w.end];
 
         // Trailing reset present.
@@ -2195,6 +2218,12 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
         try testing.expect(state.key_entry.err_msg_len == 0);
     }
     // S-TIW-013: key_entry + .esc → no mutation, returns false.
+    // WU 1.5.3 (tui-ship-fast-phase0.5, R6): Esc on key_entry now clears
+    // the draft + err_msg (was REQ-TIW-NEG-3 no-op). Replace the old
+    // "returns false + draft unchanged" assertion with the new contract:
+    //   - consumed == true
+    //   - draft_len == 0 (cleared)
+    //   - err_msg_len == 0 (cleared)
     {
         var draft_buf: [256]u8 = .{0} ** 256;
         @memcpy(draft_buf[0..5], "hello");
@@ -2212,8 +2241,241 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
             null, // cancel_pipe — null for tests
             &ch,
         );
+        try testing.expect(consumed);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.err_msg_len);
+    }
+}
+
+// =============================================================================
+// WU 1.5.1 (tui-ship-fast-phase0.5, R1+R4) — validating guard in handleKeyInput.
+//
+// Root cause (Opus 4.6): handleKeyInput does NOT guard against new key
+// input while state.key_entry.validating == true. After submit, the
+// async worker thread runs a TLS handshake (~1-3s); during that window
+// any further keystrokes (chars, Enter, Backspace) silently append to
+// the draft — Enter's \r = 0x0D was rendered as `*`, and Backspace
+// deletions appeared to lag because the draw thread kept writing the
+// new draft to the screen while the validation result was about to
+// arrive.
+//
+// Fix scope: in the .key_entry arm of handleKeyInput, return false
+// UNCONDITIONALLY when ke.validating is true. This blocks char /
+// backspace / Enter / Esc uniformly. POSIX termios(3) ISIG is preserved
+// (ISIG=true means signal-generating Ctrl+C / Ctrl+Z still emit
+// signals — those keys are surfaced as .key events by the parser
+// regardless of the .validating state, but the modal handler discards
+// them per REQ-TIW-NEG-x).
+//
+// These tests assert the post-fix contract. They currently FAIL
+// (RED): pre-fix code happily appends a char / fires submit on Enter /
+// decrements draft_len on Backspace even with validating=true.
+// =============================================================================
+
+test "WU 1.5.1: handleKeyInput ignores all input while key_entry.validating=true (R1+R4)" {
+    // S-WU151-01: typing 'x' while validating → no-op, draft_len unchanged,
+    //              returns false (the draft is owned by the in-flight worker).
+    // S-WU151-02: Enter while validating → no-op, draft_len unchanged,
+    //              returns false (prevents double-submit; the original submit
+    //              already set validating=true and is still in flight).
+    // S-WU151-03: Backspace while validating → no-op, draft_len unchanged,
+    //              returns false (the in-flight worker holds the snapshot
+    //              of the draft it was validating; mutating it locally would
+    //              desync the worker from the user's intent).
+    // S-WU151-04: pre-existing contract still holds: validating=false
+    //              (the typical default) lets char / Enter / Backspace
+    //              through as before.
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..3], "abc");
+        var state: M.State = .{
+            .key_entry = .{
+                .draft = draft_buf,
+                .draft_len = 3,
+                .validating = true, // <-- the fix's predicate
+            },
+        };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .{ .char = 'x' }, .event = .press },
+            null,
+            &ch,
+        );
         try testing.expect(!consumed);
-        try testing.expectEqual(@as(usize, 5), state.key_entry.draft_len);
+        try testing.expectEqual(@as(usize, 3), state.key_entry.draft_len);
+    }
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..3], "abc");
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 3,
+            .validating = true,
+        } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .enter, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(!consumed);
+        try testing.expectEqual(@as(usize, 3), state.key_entry.draft_len);
+        try testing.expect(state.key_entry.validating);
+    }
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..3], "abc");
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 3,
+            .validating = true,
+        } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .backspace, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(!consumed);
+        try testing.expectEqual(@as(usize, 3), state.key_entry.draft_len);
+    }
+    {
+        var state: M.State = .{ .key_entry = .{} }; // validating=false (default)
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .{ .char = 'y' }, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(consumed);
+        try testing.expectEqual(@as(usize, 1), state.key_entry.draft_len);
+        try testing.expectEqual(@as(u8, 'y'), state.key_entry.draft[0]);
+    }
+}
+
+// =============================================================================
+// WU 1.5.3 (tui-ship-fast-phase0.5, R6) — Esc clears draft on key_entry.
+//
+// Root cause (Opus 4.6): REQ-TIW-NEG-3 was "Esc on key_entry is a no-op".
+// In the smoke test the user pressed Esc expecting it to clear the typed
+// draft (the universal modal-cancel UX) and saw nothing happen. The
+// design contract was a per-key no-op for v1 because clearing could be
+// done with Backspace; but the UX expectation after a typo + a rejected
+// submission is "press Esc to start over" — not "press Backspace N times".
+//
+// Fix scope: in handleKeyInput's .key_entry arm, the .esc branch zeros
+// draft_len (and err_msg_len if populated by a prior format-fail) and
+// returns true. The draft bytes themselves are left in place — the
+// rendering layer only consults draft_len, so residual bytes are
+// inert until the next char appends. Mirrors the .unlock_prompt arm's
+// cancelUnlock UX for symmetry.
+//
+// The companion assertion in T-TIW-3 / S-TIW-013 was updated in WU 1.5.1
+// to match. These dedicated tests re-assert the contract with stronger
+// coverage so a future regression to the v1 no-op behavior fails loudly.
+// =============================================================================
+
+test "WU 1.5.3: Esc on key_entry clears draft + err_msg (R6)" {
+    // S-WU153-01: draft_len=5 + err_msg populated + .esc → draft_len=0,
+    //              err_msg_len=0, returns true.
+    // S-WU153-02: draft_len=0 (empty draft) + .esc → no-op, returns true
+    //              (mirrors Backspace's "no work to undo" path; consuming
+    //              the key keeps the keypress sink consistent).
+    // S-WU153-03: draft_len=256 (full) + .esc → draft_len=0, returns
+    //              true (regression guard for the cap-not-touched path).
+    // S-WU153-04: .unlock_prompt + .esc still calls cancelUnlock (NOT
+    //              regressed by the key_entry fix — guards the v2 invariant
+    //              "two modal arms, two distinct Esc semantics").
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..5], "hello");
+        var err_buf: [128]u8 = .{0} ** 128;
+        @memcpy(err_buf[0..10], "bad format");
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 5,
+            .err_msg_buf = err_buf,
+            .err_msg_len = 10,
+        } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .esc, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(consumed);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.err_msg_len);
+    }
+    {
+        var state: M.State = .{ .key_entry = .{} };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .esc, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(consumed);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
+    }
+    {
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..256], "x" ** 256);
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 256,
+        } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .esc, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(consumed);
+        try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
+    }
+    {
+        var state: M.State = .{ .unlock_prompt = .{ .attempts = 1 } };
+        var ch: Ch.Channels = Ch.Channels.init();
+        defer ch.closeAll(testing.io);
+        const consumed = try Tui.handleKeyInput(
+            testing.io,
+            testing.allocator,
+            &state,
+            .{ .code = .esc, .event = .press },
+            null,
+            &ch,
+        );
+        try testing.expect(consumed);
+        try testing.expect(std.meta.activeTag(state) == .key_entry);
     }
 }
 
@@ -2436,4 +2698,363 @@ test "T-SG-11: tui-input-wiring slice is present" {
     const handle_idx = std.mem.indexOf(u8, arm_body, "handleKeyInput").?;
     const forward_idx = std.mem.indexOf(u8, arm_body, "channels.tui_to_agent.tryPut").?;
     try testing.expect(handle_idx < forward_idx);
+}
+
+// =============================================================================
+// WU 0.5 (tui-ship-fast-phase0, Bug 4) — drawKeyEntry must expose the cursor
+// position as explicit layout state, NOT derived from walking back through
+// the cell diff. The current implementation puts the blink cursor at the
+// LAST diff cell (last_x, last_y in emitFrame), which produces the wrong
+// column when:
+//   - draft_len == 0 (no `*` cells, but cursor should still be at prefix+1)
+//   - draft_len > 0 (cursor should be one past the LAST `*`, not ON it)
+//   - long draft hitting the visible-window cap (cursor should be at the
+//     right edge of the visible window, not at the last drawn cell)
+//
+// Bug 4 symptom: in key_entry with no draft yet typed, the blink cursor
+// lands on the SPACE between "key:" and the typed area (col=15, 0-indexed),
+// so the first typed character overwrites the prompt trailing space
+// instead of appearing one column to the right. After typing N characters,
+// the cursor lands on the LAST `*` (col=prefix+N-1, 0-indexed) instead of
+// one past it.
+//
+// Fix scope (WU 0.6):
+//   - src/modal.zig drawKeyEntry returns or writes a cursor_col/cursor_row
+//     pair: cursor_col = prefix_len + min(draft_len, max_visible), cursor_row = 0.
+//   - src/tui.zig emitFrame emits CUP at the explicit position UNCONDITIONALLY
+//     when state is key_entry (no longer derived from diffs).
+//   - POSIX termios(3) ISIG is preserved (ISIG=true, SIGINT still works).
+//
+// These tests pin the post-fix behavior. They currently FAIL because the
+// current code derives cursor from the last diff cell (last_x, last_y).
+// =============================================================================
+
+test "WU 0.5: drawKeyEntry exposes cursor at prefix_len+0 when draft_len=0 (empty key_entry)" {
+    // GIVEN: a fresh key_entry state with draft_len = 0 (no chars typed)
+    // WHEN: drawKeyEntry renders + emitFrame produces output bytes
+    // THEN: the trailing CUP places the cursor at column 16 (1-indexed)
+    //       — one past the 15-char "Enter API key: " prefix.
+    //
+    // Pre-fix (RED): emitFrame walks back through the diff; the LAST
+    // diff cell is the prompt's trailing space at (col=14, row=0). The
+    // trailing goTo emits `\x1b[1;15H`, NOT `\x1b[1;16H` as this test
+    // asserts.
+    const draft_buf: [256]u8 = .{0} ** 256;
+    var state: M.State = .{
+        .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 0,
+        },
+    };
+    const cols: u16 = 60;
+    const rows: u16 = 24;
+    var win = try M.WindowMock.init(testing.allocator, cols, rows);
+    defer win.deinit();
+    try M.drawKeyEntry(win, &state);
+    const cells = win.snapshot();
+    // First frame: prev is empty (all spaces); emitFrame sees a diff
+    // for the 15 prompt chars + trailing CUP at the explicit position.
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    // Construct prev = all spaces (matches first-frame condition).
+    var prev_buf: [60 * 24]M.Cell = undefined;
+    const prev: []M.Cell = &prev_buf;
+    for (prev) |*c| c.* = .{ .ch = ' ', .style = .{} };
+    // WU 0.6: pull the explicit cursor from state.key_entry and pass
+    // it through to emitFrame (cursor_col=15 = 0-indexed, col 16 1-indexed).
+    try Tui.emitFrame(&w, prev, cells, cols, rows, testing.allocator, state.key_entry.cursor_col, state.key_entry.cursor_row);
+    const out = buf[0..w.end];
+    // Tiger Style: the cursor must land at the explicit position
+    // (col=16, row=1, 1-indexed) regardless of whether any `*` exists.
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;16H") != null);
+}
+
+test "WU 0.5: drawKeyEntry exposes cursor at prefix_len+3 when draft_len=3 ('abc' typed)" {
+    // GIVEN: key_entry with draft_len = 3, draft = "abc"
+    // WHEN: drawKeyEntry renders + emitFrame produces output bytes
+    // THEN: the trailing CUP places the cursor at column 19 (1-indexed)
+    //       — one past the 3 `*` chars (col 18, 1-indexed).
+    //
+    // Pre-fix (RED): last_x = 17 (the 3rd `*`), trailing goTo emits
+    // `\x1b[1;18H`, NOT `\x1b[1;19H` as this test asserts.
+    var draft_buf: [256]u8 = .{0} ** 256;
+    const draft = "abc";
+    @memcpy(draft_buf[0..draft.len], draft);
+    var state: M.State = .{
+        .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = draft.len,
+        },
+    };
+    const cols: u16 = 60;
+    const rows: u16 = 24;
+    var win = try M.WindowMock.init(testing.allocator, cols, rows);
+    defer win.deinit();
+    try M.drawKeyEntry(win, &state);
+    const cells = win.snapshot();
+    var prev_buf: [60 * 24]M.Cell = undefined;
+    const prev: []M.Cell = &prev_buf;
+    for (prev) |*c| c.* = .{ .ch = ' ', .style = .{} };
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    // WU 0.6: cursor from state.key_entry.cursor_col = 18 (0-indexed,
+    // 1-indexed col 19).
+    try Tui.emitFrame(&w, prev, cells, cols, rows, testing.allocator, state.key_entry.cursor_col, state.key_entry.cursor_row);
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;19H") != null);
+}
+
+test "WU 0.5: drawKeyEntry caps cursor at the visible-window right edge on long draft" {
+    // GIVEN: key_entry with draft_len = 100 (longer than the visible
+    //        window), terminal cols = 80
+    // WHEN: drawKeyEntry renders + emitFrame produces output bytes
+    // THEN: the cursor lands at the visible-window right edge — i.e.
+    //       prefix_len + max_visible = 15 + (80 - 15) = 80 (0-indexed)
+    //       = col 81 (1-indexed) = `\x1b[1;81H`. The draft is truncated
+    //       to 65 visible `*` chars; characters past col 79 are not
+    //       displayed.
+    //
+    // Pre-fix (RED): last_x = 79 (the LAST visible `*` at the right
+    // edge of the visible window). Trailing goTo emits `\x1b[1;80H`,
+    // NOT `\x1b[1;81H` as this test asserts.
+    var draft_buf: [256]u8 = .{0} ** 256;
+    var i: usize = 0;
+    while (i < draft_buf.len) : (i += 1) draft_buf[i] = 'x';
+    var state: M.State = .{
+        .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 100, // longer than cols - prefix
+        },
+    };
+    const cols: u16 = 80;
+    const rows: u16 = 24;
+    var win = try M.WindowMock.init(testing.allocator, cols, rows);
+    defer win.deinit();
+    try M.drawKeyEntry(win, &state);
+    const cells = win.snapshot();
+    var prev_buf: [80 * 24]M.Cell = undefined;
+    const prev: []M.Cell = &prev_buf;
+    for (prev) |*c| c.* = .{ .ch = ' ', .style = .{} };
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    // WU 0.6: cursor from state.key_entry.cursor_col = 80 (0-indexed,
+    // 1-indexed col 81) — visible-window right edge.
+    try Tui.emitFrame(&w, prev, cells, cols, rows, testing.allocator, state.key_entry.cursor_col, state.key_entry.cursor_row);
+    const out = buf[0..w.end];
+    // prefix=15, max_visible=65, cursor_col=80 (0-indexed) → col=81 (1-indexed).
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[1;81H") != null);
+}
+
+// =============================================================================
+// WU 1.5.2 (tui-ship-fast-phase0.5, R3) — spinner bounds check in drawKeyEntry.
+//
+// Root cause (Opus 4.6): the validation spinner (a single `|` glyph with
+// bold style) is rendered at `spinner_x = "Enter API key: ".len + shown`.
+// The bounds check uses `win.cells.len` (which is `cols * rows`). When
+// `spinner_x == cols` — i.e. the spinner would land ONE COLUMN PAST the
+// last visible column of row 0 — the check `spinner_x < cells.len` is
+// STILL TRUE (cells.len is far larger), so the `|` glyph is written into
+// the first cell of row 1. The user perceives this as a stray `|`
+// appearing at column 0 of row 1, which looks like a misplaced scroll
+// indicator (it is not — it's the validation spinner).
+//
+// Fix scope: cap the bounds check at `win.size().cols` (NOT cells.len).
+// When `spinner_x == cols`, the `|` is suppressed entirely (the spinner
+// only renders on row 0; row 1 has no other key_entry content).
+//
+// These tests assert the post-fix contract. They currently FAIL (RED):
+// pre-fix code writes the `|` at cells[cols] when the prompt overflows.
+// =============================================================================
+
+// =============================================================================
+// WU 1.5.4 (tui-ship-fast-phase0.5, R7) — tuiThreadShutdown restores
+// terminal cursor visibility + SGR attributes.
+//
+// Root cause (Opus 4.6): tuiThreadShutdown misses two CSI sequences:
+//   1. CSI ?25h (DECTCEM show cursor) — without this the cursor stays
+//      invisible after exit; the user's shell prompt blinks nowhere.
+//      Reference: xterm ctlseqs §"CSI Ps h" DEC private mode set, Ps=25.
+//      Reference: ECMA-48 §8.3.201.
+//   2. CSI 0m (SGR reset all attributes) — without this any bold /
+//      color attribute set during the TUI session leaks into the
+//      user's next shell prompt (Starship, fish, etc. visibly affected).
+//      Reference: ECMA-48 §8.3.117 (SGR with Ps=0).
+//
+// Both sequences must be emitted BEFORE disableRawMode. Cursor visibility
+// (DECTCEM) is a per-screen state; once termios is restored to cooked
+// mode, the shell does not re-show the cursor because DECTCEM is the
+// terminal's persistent state — the kernel does not touch it on raw-mode
+// disable. SGR attributes are likewise terminal state, not termios state.
+//
+// Fix scope: in tuiThreadShutdown, after exitAltScreenAndResize and
+// before disableRawMode, write "\x1b[?25h" then "\x1b[0m" to the writer.
+// Add a final writer.flush() after raw-mode teardown so the ~20 bytes
+// of restore sequences actually reach the TTY before process exit
+// (the existing flush at the top of shutdown runs BEFORE the restore).
+//
+// These tests assert the post-fix contract via direct invocation of
+// tuiThreadShutdown against a std.Io.Writer.fixed buffer. They currently
+// FAIL (RED) because pre-fix the show-cursor + SGR-reset bytes are
+// missing from the emitted sequence.
+// =============================================================================
+
+test "WU 1.5.4: tuiThreadShutdown emits DECTCEM show-cursor + SGR reset (R7)" {
+    // S-WU154-01: tuiThreadShutdown writes "\x1b[?25h" (DECTCEM show
+    //              cursor) somewhere in the output stream. Pre-fix:
+    //              the byte sequence is absent → expecting any-must-
+    //              match fails.
+    // S-WU154-02: tuiThreadShutdown writes "\x1b[0m" (SGR reset) somewhere
+    //              in the output stream. Pre-fix: missing → fails.
+    // S-WU154-03: ordering — DECTCEM show-cursor appears BEFORE the raw
+    //              mode disable path. We can't directly assert ordering
+    //              without enabling raw_term (which would require a real
+    //              tty), so we approximate by asserting the show-cursor
+    //              sequence appears AFTER exitAltScreenAndResize bytes
+    //              ("\x1b[?1049l") in the buffer — exit-alt-screen must
+    //              precede show-cursor per the shutdown order contract.
+    // S-WU154-04: ordering — SGR reset appears AFTER show-cursor. The
+    //              shutdown contract writes show-cursor first, then SGR.
+    //
+    // We construct a minimal Lifecycle with raw_term=null (so
+    // disableRawMode's branch is skipped — the test stays headless) and
+    // kitty_flags_pushed=false (so popKittyKb is skipped). The disable-
+    // BracketedPaste + exitAltScreenAndResize paths still fire so the
+    // buffer is non-empty + the test exercises real code paths.
+
+    var lc: Tui.Lifecycle = .{
+        .raw_term = null,
+        .dec_2048_supported = false,
+        .kitty_supported = false,
+        .kitty_flags_pushed = false,
+        .redraw_pending = std.atomic.Value(bool).init(false),
+        .width = 80,
+        .height = 24,
+    };
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    Tui.tuiThreadShutdown(&lc, &w);
+    const out = buf[0..w.end];
+
+    // S-WU154-01: DECTCEM show-cursor present.
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[?25h") != null);
+
+    // S-WU154-02: SGR reset present.
+    try testing.expect(std.mem.indexOf(u8, out, "\x1b[0m") != null);
+
+    // S-WU154-03: show-cursor AFTER exit-alt-screen (which writes
+    // "\x1b[?1049l"). Per xterm ctlseqs the alt-screen tear-down must
+    // precede cursor restoration; otherwise the cursor reappears inside
+    // the now-exited alt-screen buffer (no-op visually but smears the
+    // main-screen's cursor state).
+    const exit_alt_idx = std.mem.indexOf(u8, out, "\x1b[?1049l") orelse {
+        try testing.expect(false); // exit-alt-screen missing → broken
+        return;
+    };
+    const show_cursor_idx = std.mem.indexOf(u8, out, "\x1b[?25h") orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expect(show_cursor_idx > exit_alt_idx);
+
+    // S-WU154-04: SGR reset AFTER show-cursor. The shutdown contract
+    // emits DECTCEM first, then SGR reset.
+    const sgr_idx = std.mem.indexOf(u8, out, "\x1b[0m") orelse {
+        try testing.expect(false);
+        return;
+    };
+    try testing.expect(sgr_idx > show_cursor_idx);
+}
+
+test "WU 1.5.2: drawKeyEntry spinner does NOT render at row 1 when draft saturates visible window (R3)" {
+    // S-WU152-01: cols=27 (narrow), draft_len=12 (max visible for that
+    //              width: cols - "Enter API key: ".len = 27 - 15 = 12),
+    //              validating=true. spinner_x = 15 + 12 = 27 = cols.
+    //              Pre-fix: cells[27] (row 1, col 0) is `|` with bold.
+    //              Post-fix: cells[27] is the default space (no write).
+    // S-WU152-02: cols=27, draft_len=12, validating=FALSE → no spinner
+    //              at all (baseline). cells[27] stays space.
+    // S-WU152-03: cols=80 (typical), draft_len=65 (max visible), validating=true.
+    //              spinner_x = 15 + 65 = 80 = cols. Pre-fix writes `|` at
+    //              cells[80] (row 1, col 0). Post-fix suppresses.
+    // S-WU152-04: cols=80, draft_len=10 (NOT at edge), validating=true →
+    //              spinner_x = 25 < cols. The spinner DOES render at
+    //              cells[25] (still row 0). Regression guard for the fix
+    //              not over-suppressing the normal case.
+    {
+        const cols: u16 = 27;
+        const rows: u16 = 10;
+        var win = try M.WindowMock.init(testing.allocator, cols, rows);
+        defer win.deinit();
+
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..12], "abcdefghijkl");
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 12,
+            .validating = true,
+        } };
+        try M.drawKeyEntry(win, &state);
+
+        // Tiger Style: cells[cols] is the FIRST cell of row 1. The bug
+        // writes `|` there; the fix suppresses it.
+        try testing.expect(win.cells[cols].ch != '|');
+        try testing.expect(win.cells[cols].style.bold == false);
+    }
+    {
+        const cols: u16 = 27;
+        const rows: u16 = 10;
+        var win = try M.WindowMock.init(testing.allocator, cols, rows);
+        defer win.deinit();
+
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..12], "abcdefghijkl");
+        var state: M.State = .{
+            .key_entry = .{
+                .draft = draft_buf,
+                .draft_len = 12,
+                // validating=false (default)
+            },
+        };
+        try M.drawKeyEntry(win, &state);
+
+        try testing.expect(win.cells[cols].ch != '|');
+    }
+    {
+        const cols: u16 = 80;
+        const rows: u16 = 24;
+        var win = try M.WindowMock.init(testing.allocator, cols, rows);
+        defer win.deinit();
+
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..65], "x" ** 65);
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 65,
+            .validating = true,
+        } };
+        try M.drawKeyEntry(win, &state);
+
+        try testing.expect(win.cells[cols].ch != '|');
+    }
+    {
+        const cols: u16 = 80;
+        const rows: u16 = 24;
+        var win = try M.WindowMock.init(testing.allocator, cols, rows);
+        defer win.deinit();
+
+        var draft_buf: [256]u8 = .{0} ** 256;
+        @memcpy(draft_buf[0..10], "abcdefghij");
+        var state: M.State = .{ .key_entry = .{
+            .draft = draft_buf,
+            .draft_len = 10,
+            .validating = true,
+        } };
+        try M.drawKeyEntry(win, &state);
+
+        // Regression guard: spinner DOES render at the expected position
+        // when there is room (spinner_x = 15 + 10 = 25 < cols).
+        const spinner_x: usize = "Enter API key: ".len + 10;
+        try testing.expect(win.cells[spinner_x].ch == '|');
+        try testing.expect(win.cells[spinner_x].style.bold);
+    }
 }

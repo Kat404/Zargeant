@@ -81,6 +81,12 @@ pub const MockBackend = struct {
     tcgetattr_count: u32 = 0,
     tcsetattr_count: u32 = 0,
     ioctl_gwinsz_count: u32 = 0,
+    // WU 0.7 (tui-ship-fast-phase0, Bug 6): capture the termios struct
+    // passed to the most recent tcsetattr call so tests can assert the
+    // post-cfmakeraw transformation (was null-only before this slice —
+    // existing tests only checked call counts). `null` until the first
+    // tcsetattr fires; after that it carries the applied termios.
+    last_applied_termios: ?std.posix.termios = null,
 
     const Options = struct {
         original_termios: std.posix.termios = std.mem.zeroes(std.posix.termios),
@@ -122,9 +128,13 @@ pub const MockBackend = struct {
         return m.original_termios;
     }
 
-    fn tcsetattrMock(_: std.Io.File.Handle, _: std.posix.TCSA, _: std.posix.termios) anyerror!void {
+    fn tcsetattrMock(_: std.Io.File.Handle, _: std.posix.TCSA, term: std.posix.termios) anyerror!void {
         const m = active_mock orelse return error.NoActiveMock;
         m.tcsetattr_count += 1;
+        // WU 0.7: record the applied termios for the test to inspect.
+        // The `last_applied_termios` field documents the contract — the
+        // most recent applied transformation is what the test asserts on.
+        m.last_applied_termios = term;
         if (m.fail_tcsetattr) |e| return e;
     }
 
@@ -177,19 +187,76 @@ pub const RawTerm = struct {
 pub fn enableRawMode(handle: std.Io.File.Handle, backend: Backend) anyerror!RawTerm {
     const original = try backend.tcgetattr(handle);
     var raw = original;
-    // POSIX termios(3) §Non-canonical mode: disable canonical line buffering
-    // and echo. ISIG preserved (signal-generating input keys still produce
-    // signals per the default). Additional flags are not part of this PR's
-    // surface; the full transformation lands in PR 6 alongside src/tui.zig.
+    // WU 0.7 (tui-ship-fast-phase0, Bug 6): full cfmakeraw recipe per
+    // `man 3 cfmakeraw` (POSIX termios(3) §Non-canonical mode). The
+    // pre-WU-0.7 implementation cleared only ICANON + ECHO, which left
+    // cooked-mode artifacts (CR→NL translation via ICRNL, software
+    // flow-control via IXON, output post-processing via OPOST, blocking
+    // reads via VMIN=0) bleeding into the parser's event stream.
     //
-    // ponytail: minimal transformation sufficient for the PR 1 contract
-    // (save / apply / restore round-trip). Bitfield edits via direct field
-    // assignment; the Zig 0.16 std.posix.lflag is a packed struct(u32) so
-    // bitwise masks would require runtime field-by-field copies. The PR 6
-    // production transformation (ISIG, IEXTEN, IXON/ICRNL, OPOST, VMIN/VTIME,
-    // etc.) is independent of the round-trip contract and stays in `src/tui.zig`.
+    // Recipe (matches glibc's cfmakeraw verbatim):
+    //   c_iflag &= ~(ICRNL | IXON | BRKINT | INPCK | ISTRIP)
+    //   c_oflag &= ~OPOST
+    //   c_cflag &= ~(CSIZE | PARENB); c_cflag |= CS8
+    //   c_lflag &= ~(ICANON | ECHO | IEXTEN)
+    //   c_cc[VMIN] = 1; c_cc[VTIME] = 0
+    //
+    // ISIG is NOT cleared (deviates from cfmakeraw). tui-input-flow-
+    // bugfixes-2 R2a requires Ctrl+C to keep generating SIGINT via the
+    // tty discipline; the parser-level intercept at src/tui.zig:629
+    // also depends on the 0x03 byte arriving as data — both require
+    // ISIG=true. Signal-generating input keys (Ctrl+C, Ctrl+Z, Ctrl+\)
+    // continue to produce signals per ISIG=true.
+    //
+    // Tiger Style §4: defensive precondition on the saved termios.
+    // std.mem.zeroes is a valid starting state (no flags set, no
+    // special characters, no input/output speeds). enableRawMode only
+    // clears flags and sets VMIN/VTIME — never introduces new fields.
+    std.debug.assert(@intFromPtr(&raw) != 0);
+
+    raw.iflag.ICRNL = false;
+    raw.iflag.IXON = false;
+    raw.iflag.BRKINT = false;
+    raw.iflag.INPCK = false;
+    raw.iflag.ISTRIP = false;
+
+    raw.oflag.OPOST = false;
+
+    // CSIZE is an enum, not a bool — clear PARENB first, then force
+    // CSIZE = CS8. The cfmakeraw recipe zeroes the c_cflag except
+    // CSTOPB/CREAD/CLOCAL/HUPCL; we preserve those (production
+    // behavior unchanged for serial ports).
+    raw.cflag.PARENB = false;
+    raw.cflag.CSIZE = .CS8;
+
     raw.lflag.ICANON = false;
     raw.lflag.ECHO = false;
+    raw.lflag.IEXTEN = false;
+    // ISIG preserved (cfmakeraw clears it, but we restore per WU 0.7
+    // + tui-input-flow-bugfixes-2 R2a). Set explicitly so the
+    // post-cfmakeraw termios always has ISIG=true regardless of the
+    // original termios state.
+    raw.lflag.ISIG = true;
+
+    // Linux x86_64 c_cc indices for non-canonical mode (NCC=8):
+    //   cc[6] = VMIN  (min bytes before read(2) returns)
+    //   cc[5] = VTIME (inter-byte timeout in tenths of a second)
+    // Per Linux termios(3) §Noncanonical Mode, VMIN=1 + VTIME=0 means
+    // read(2) blocks until at least 1 byte is available. This is what
+    // the parser's poll(2)+read(2) loop expects.
+    //
+    // Tiger Style §4: precondition on c_cc index bounds (compile-time
+    // NCC is 8 for x86_64).
+    comptime {
+        std.debug.assert(5 < std.os.linux.NCC);
+        std.debug.assert(6 < std.os.linux.NCC);
+    }
+    raw.cc[5] = 0; // VTIME
+    raw.cc[6] = 1; // VMIN
+
+    // ISIG preserved (NOT cleared). See block comment above.
+    // raw.lflag.ISIG stays at its original value.
+
     try backend.tcsetattr(handle, .NOW, raw);
     return .{
         .original = original,
