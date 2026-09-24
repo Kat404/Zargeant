@@ -74,6 +74,15 @@ pub const Lifecycle = struct {
     /// `enableRawMode` failed (no `/dev/tty`, CI). The TUI thread
     /// runs in degraded logger-only mode; renderers are skipped.
     no_tty: bool = false,
+    /// REQ-TIRFIX-003 (tui-input-rendering-fixes #1576): explicit sentinel
+    /// for the very first render frame. Replaces the dead `prev_snapshot
+    /// orelse current` fallback (which was unreachable given the
+    /// zero-init at `src/runtime.zig:396-410`). On the first frame the
+    /// render branch emits `\x1b[2J\x1b[H` (ED + CUP) followed by a
+    /// full snapshot re-emit of `current` (skipping space cells, which
+    /// are already spaces after the ED). On frame 2+ the existing diff
+    /// path runs with REQ-TIRFIX-002's corrected trailing cursor.
+    first_frame: bool = true,
     /// REQ-RW-002 (tui-render-wiring #1259): previous-frame cell snapshot
     /// for `emitFrame` diff. Allocated by `tuiRealMain` after init, freed
     /// in shutdown. `null` on the first frame → `emitFrame` receives
@@ -478,13 +487,22 @@ pub fn emitFrame(
         try writer.writeByte(@intCast(entry.cell.ch));
     }
     try terminal.style.reset(writer, false);
-    // WU 0.6 (Bug 4) — trailing CUP at the explicit cursor position.
-    // Fires UNCONDITIONALLY when cursor_col != CURSOR_SKIP, regardless
-    // of whether any diff entries existed. The sentinel CURSOR_SKIP
-    // suppresses emission (preserves the back-compat behavior for the
-    // W3 diff-loop tests that don't model cursor state).
+    // Trailing CUP — Phase 0 WU 0.6 explicit cursor with PR #39 REQ-TIRFIX-002
+    // fallback for states without explicit cursor modeling (e.g. unlock_prompt).
+    //
+    // Phase 0 path: when caller passes an explicit cursor_col (key_entry state
+    // via modalCursorFromState), use it directly — Phase 0 WU 0.6 design.
+    //
+    // PR #39 fallback: when caller passes CURSOR_SKIP (states without explicit
+    // cursor state like .unlock_prompt), fall back to the last_x + 1 heuristic
+    // from emitFrame v1 (Bug 2 fix). Clamped to cols - 1 to keep the cursor
+    // inside the field; a CUP to (cols, y) places the cursor in the wrap zone.
+    // ECMA-48 §8.3.21 (CSI CUP) — terminal.cursor.goTo adds +1 internally.
     if (cursor_col != CURSOR_SKIP) {
         try terminal.cursor.goTo(writer, cursor_col, cursor_row);
+    } else if (diffs.len > 0) {
+        const col: u16 = if (last_x + 1 > cols -| 1) cols -| 1 else last_x + 1;
+        try terminal.cursor.goTo(writer, col, last_y);
     }
 }
 
@@ -643,28 +661,57 @@ pub fn tuiThreadLoop(
             defer terminal.term.endSynchronizedUpdate(writer) catch {};
             try modal.drawModal(win, state);
             const current = win.snapshot();
-            // First frame: lifecycle.prev_snapshot is null → use current
-            // as both prev (full-frame emit per REQ-RW-003 S-RW-005).
-            const prev = lifecycle.prev_snapshot orelse current;
-            // WU 0.6 (tui-ship-fast-phase0, Bug 4): pull the explicit
-            // cursor position from modal state for key_entry. drawKeyEntry
-            // writes cursor_col = prefix_len + min(draft_len, max_visible);
-            // other states leave cursor_col at 0, which emitFrame treats
-            // as the CURSOR_SKIP sentinel (no trailing CUP) only when
-            // the caller wraps the lookup. Here we route through a
-            // small helper that returns the sentinel for non-key_entry
-            // states.
-            const cursor_pos = modalCursorFromState(state);
-            try emitFrame(
-                writer,
-                prev,
-                current,
-                lifecycle.width,
-                lifecycle.height,
-                alloc,
-                cursor_pos.col,
-                cursor_pos.row,
-            );
+            // Bug 3 fix (REQ-TIRFIX-003 from tui-input-rendering-fixes #1576)
+            // PRESERVED across the merge with Phase 0. Phase 0's
+            // `prev_snapshot orelse current` fallback at runtime.zig:733 is
+            // still dead code (prev_snapshot is preallocated + zero-init'd
+            // at runtime.zig:396-410 BEFORE the first redraw), so the
+            // explicit first_frame sentinel is still required for Bug 3.
+            //
+            // Frame 1: \x1b[2J\x1b[H (ED + CUP per ECMA-48 §8.3.39 + §8.3.21)
+            // + full snapshot re-emit skipping space cells. Phase 0's
+            // explicit cursor API (modalCursorFromState) is integrated for
+            // frame 2+ via emitFrame signature with cursor_col/cursor_row.
+            if (lifecycle.first_frame) {
+                try writer.writeAll("\x1b[2J\x1b[H");
+                var idx: usize = 0;
+                while (idx < current.len) : (idx += 1) {
+                    const cell = current[idx];
+                    // Space cells are already blank after ED; skip them.
+                    // Style-only deltas on spaces are visually no-ops.
+                    if (cell.ch == ' ') continue;
+                    const x: u16 = @intCast(idx % lifecycle.width);
+                    const y: u16 = @intCast(idx / lifecycle.width);
+                    try terminal.cursor.goTo(writer, x, y);
+                    try terminal.style.reset(writer, false);
+                    if (cell.style.bold) try terminal.style.bold(writer, true);
+                    if (cell.style.underline) try terminal.style.underline(writer, true);
+                    if (cell.style.reverse) try terminal.style.reverse(writer, true);
+                    // ponytail: u21→u8 cast is v1 ASCII-only; non-ASCII stays for v2.
+                    try writer.writeByte(@intCast(cell.ch));
+                }
+                try terminal.style.reset(writer, false);
+                lifecycle.first_frame = false;
+            } else {
+                // Frame 2+: diff path with Phase 0's explicit cursor API
+                // (modalCursorFromState → emitFrame cursor_col/cursor_row).
+                // For .key_entry, cursor_pos comes from state.cursor_col
+                // (Phase 0 WU 0.6). For .unlock_prompt and others, it returns
+                // CURSOR_SKIP and emitFrame falls back to the last_x + 1
+                // heuristic (Bug 2 fix).
+                const prev = lifecycle.prev_snapshot orelse current;
+                const cursor_pos = modalCursorFromState(state);
+                try emitFrame(
+                    writer,
+                    prev,
+                    current,
+                    lifecycle.width,
+                    lifecycle.height,
+                    alloc,
+                    cursor_pos.col,
+                    cursor_pos.row,
+                );
+            }
             // ponytail: 4 KiB stdout buffer auto-flushes only on overflow,
             // so frames + cursor CSI bytes sit there until the buffer fills
             // (~4 frames of busy typing). Flush per-frame so input and
@@ -798,6 +845,18 @@ pub fn handleKeyInput(
                     return true;
                 },
                 .backspace => {
+                    // REQ-TIW-005 + REQ-TIRFIX-005 (tui-input-rendering-fixes
+                    // #1576) — backspace UX contract: cursor visually retreats
+                    // one cell to the LEFT; rightmost `*` is blanked on the
+                    // next frame; no intermediate `*` appears. Contract holds
+                    // because REQ-TIRFIX-002 places the trailing cursor at
+                    // `last_x + 1` (PR #39 fallback) or at the explicit
+                    // `state.cursor_col` (Phase 0 WU 0.6) after each frame;
+                    // on backspace, `draft_len -= 1` makes the next frame's
+                    // cursor position one smaller, so the trailing CUP
+                    // retreats left. The "append-then-delete flash" was a
+                    // perceptual artifact of the old on-cell trailing cursor
+                    // (Bug 5).
                     if (ke.draft_len == 0) return false; // REQ-TIW-005 empty-draft no-op
                     ke.draft_len -= 1;
                     return true;
@@ -839,6 +898,10 @@ pub fn handleKeyInput(
                 return true;
             },
             .backspace => {
+                // REQ-TIW-005 + REQ-TIRFIX-005 (tui-input-rendering-fixes
+                // #1576) — mirror of key_entry's backspace handler. See
+                // the .key_entry backspace comment above for the full
+                // cursor-retreat UX contract.
                 if (up.draft_len == 0) return false;
                 up.draft_len -= 1;
                 return true;
@@ -1113,8 +1176,13 @@ test "Lifecycle struct exposes required fields" {
     // (#1259, REQ-RW-002) adds `prev_snapshot`; the count rises to 9.
     // WU-1 (tui-keyentry-rebuild, REQ-NEW-001) adds `parser: Parser`
     // for the persistent parser; the count rises to 10.
+    // tui-input-rendering-fixes (REQ-TIRFIX-003, #1576) adds
+    // `first_frame: bool = true` so the very first render frame emits
+    // \x1b[2J\x1b[H + a full snapshot, replacing the dead
+    // `prev_snapshot orelse current` sentinel at src/tui.zig:584.
+    // Count rises to 11.
     const fields = @typeInfo(Lifecycle).@"struct".fields;
-    try testing.expectEqual(@as(usize, 10), fields.len);
+    try testing.expectEqual(@as(usize, 11), fields.len);
 }
 
 test "redraw_pending is std.atomic.Value(bool) with seq_cst contract" {

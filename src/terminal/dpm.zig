@@ -31,8 +31,28 @@ pub fn enterAlternateScreen(writer: *std.Io.Writer) anyerror!void {
     try emitDecSetReset(writer, 1049, true);
 }
 
-/// Mode 1049 — alternate screen buffer (DECRST). Writes `ESC[?1049l`.
+/// Mode 1049 — alternate screen buffer (DECRST).
+/// Per ECMA-48 §8.3.39 (CSI ED, Pn=2) + ECMA-48 §8.3.21 (CSI CUP, default
+/// params `[1,1]`) + xterm ctlseqs §"Private Mode 1049" (alt-screen
+/// buffer scoping) — see REQ-TIRFIX-001.
+///
+/// Byte sequence emitted (verified byte-exact in `tests/terminal/dpm.zig`):
+///   \x1b[2J    — CSI ED Pn=2 — erase the entire active buffer (alt-screen
+///                buffer while mode 1049 is SET)
+///   \x1b[H     — CSI CUP with defaulted [1,1] — home cursor to (col=1,
+///                row=1) of the alt-screen buffer
+///   \x1b[?1049l — DECRST mode 1049 — swap to primary buffer (preserved)
+///
+/// Effect: the alt-screen buffer is erased AND the cursor homed before the
+/// mode swap; subsequent `enterAlternateScreen` calls find a clean
+/// alt-screen buffer. The primary buffer is untouched (Bug 1 user-visible
+/// symptom: "first `zig build run` clears the terminal, subsequent runs
+/// do NOT" — alt-screen buffer was accumulating content across runs).
+///
+/// ponytail: inlined bytes per Approach A YAGNI; no new `eraseDisplay`
+/// symbol, no `src/terminal/clear.zig` file, no grep-list appends.
 pub fn exitAlternateScreen(writer: *std.Io.Writer) anyerror!void {
+    try writer.writeAll("\x1b[2J\x1b[H");
     try emitDecSetReset(writer, 1049, false);
 }
 

@@ -367,14 +367,51 @@ pub fn drawKeyEntry(win: *WindowMock, state: *State) !void {
     win.clear();
     const payload = &state.key_entry;
     try win.print("Enter API key: ", .{});
-    const shown: usize = @min(payload.draft_len, win.size().cols - "Enter API key: ".len);
+    // REQ-TIRFIX-004 (tui-input-rendering-fixes #1576): input-field
+    // display offset. When `draft_len` exceeds the visible window
+    // (`max_visible = cols - prefix_len - 1`, reserving one cell for
+    // the trailing cursor per REQ-TIRFIX-002), shift the window to
+    // show the LAST `max_visible` chars and prepend a `<` indicator.
+    // Bug 4 user-visible symptom: long input wraps the prompt `:` below
+    // the `*` characters. The spinner position uses the `shown` total
+    // (1 indicator + N stars) so the spinner always sits AFTER the last
+    // visible char on row 0.
+    const prefix_len: usize = "Enter API key: ".len; // 15
+    const max_visible: usize = if (win.size().cols -| prefix_len > 1)
+        win.size().cols - prefix_len - 1
+    else
+        0;
+    const display_offset: usize = if (payload.draft_len > max_visible)
+        payload.draft_len - max_visible
+    else
+        0;
+    // `shown` is the total cells occupied by indicator + masked chars.
+    // In scroll mode: 1 (`<`) + visible_count stars. Otherwise: visible
+    // count of `*`s. The spinner (below) reads this to position itself
+    // AFTER the last visible char on row 0.
+    const visible_count: usize = if (display_offset > 0)
+        @min(max_visible, payload.draft_len - display_offset)
+    else
+        @min(payload.draft_len, max_visible);
+    const shown: usize = if (display_offset > 0) 1 + visible_count else visible_count;
     if (shown > 0) {
-        // Append draft characters (masked with `*`) on the first row.
-        const start_x: usize = "Enter API key: ".len;
-        const max: usize = @min(start_x + shown, win.cells.len);
-        for (payload.draft[0..shown], 0..) |_, i| {
-            if (start_x + i >= max) break;
-            win.cells[start_x + i] = .{ .ch = '*', .style = .{} };
+        const start_x: usize = prefix_len;
+        if (display_offset > 0) {
+            // Scroll indicator.
+            win.cells[start_x] = .{ .ch = '<', .style = .{} };
+            for (payload.draft[display_offset..][0..visible_count], 0..) |_, i| {
+                const x: usize = start_x + 1 + i;
+                if (x >= win.size().cols) break;
+                win.cells[x] = .{ .ch = '*', .style = .{} };
+            }
+        } else {
+            // Non-scroll: render `draft[0..visible_count]` as `*` at
+            // `cells[start_x..start_x + visible_count]`.
+            for (payload.draft[0..visible_count], 0..) |_, i| {
+                const x: usize = start_x + i;
+                if (x >= win.size().cols) break;
+                win.cells[x] = .{ .ch = '*', .style = .{} };
+            }
         }
     }
     if (payload.err_msg_len > 0) {
@@ -616,13 +653,36 @@ pub fn drawUnlock(win: *WindowMock, state: *State) !void {
     win.clear();
     const payload = &state.unlock_prompt;
     try win.print("Unlock passphrase: ", .{});
+    // REQ-TIRFIX-004 (tui-input-rendering-fixes #1576) — symmetric
+    // fix to drawKeyEntry. `prefix_len = "Unlock passphrase: ".len = 19`.
     const prefix_len: usize = "Unlock passphrase: ".len;
-    const shown: usize = @min(payload.draft_len, win.size().cols -| prefix_len);
+    const max_visible: usize = if (win.size().cols -| prefix_len > 1)
+        win.size().cols - prefix_len - 1
+    else
+        0;
+    const display_offset: usize = if (payload.draft_len > max_visible)
+        payload.draft_len - max_visible
+    else
+        0;
+    const visible_count: usize = if (display_offset > 0)
+        @min(max_visible, payload.draft_len - display_offset)
+    else
+        @min(payload.draft_len, max_visible);
+    const shown: usize = if (display_offset > 0) 1 + visible_count else visible_count;
     if (shown > 0) {
-        const max: usize = @min(prefix_len + shown, win.cells.len);
-        for (payload.draft[0..shown], 0..) |_, i| {
-            if (prefix_len + i >= max) break;
-            win.cells[prefix_len + i] = .{ .ch = '*', .style = .{} };
+        if (display_offset > 0) {
+            win.cells[prefix_len] = .{ .ch = '<', .style = .{} };
+            for (payload.draft[display_offset..][0..visible_count], 0..) |_, i| {
+                const x: usize = prefix_len + 1 + i;
+                if (x >= win.size().cols) break;
+                win.cells[x] = .{ .ch = '*', .style = .{} };
+            }
+        } else {
+            for (payload.draft[0..visible_count], 0..) |_, i| {
+                const x: usize = prefix_len + i;
+                if (x >= win.size().cols) break;
+                win.cells[x] = .{ .ch = '*', .style = .{} };
+            }
         }
     }
     if (payload.err_msg_len > 0) {
