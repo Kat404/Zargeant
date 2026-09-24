@@ -463,6 +463,14 @@ pub fn emitFrame(
     };
     const diffs = try win.diff(prev);
     defer alloc.free(diffs);
+    // Track the last emitted cell's (x, y) for the PR #39 REQ-TIRFIX-002
+    // fallback when caller passes CURSOR_SKIP. Phase 0's WU 0.6 removes
+    // the last-walk derivation (explicit cursor from state replaces it),
+    // but we keep the fallback for states without explicit cursor modeling
+    // (e.g. .unlock_prompt). last_x defaults to 0 so an empty diff safely
+    // yields the no-CUP path; the actual CUP only fires when diffs.len > 0.
+    var last_x: u16 = 0;
+    var last_y: u16 = 0;
     // WU 0.6 (Bug 4): trailing CUP at the explicit cursor position
     // (no longer derived from walking the diff back). For key_entry
     // this is `prefix_len + min(draft_len, max_visible)` per the
@@ -470,6 +478,8 @@ pub fn emitFrame(
     // CUP is emitted. The diff loop below is unchanged — per-cell
     // CUP+SGR+byte emission is still driven by the diff entries.
     for (diffs) |entry| {
+        last_x = entry.x;
+        last_y = entry.y;
         // PR 6 (terminal-control-lib-from-scratch, WU 6.3): in-tree
         // `terminal.cursor.goTo(x, y)` takes 0-indexed coords and adds
         // +1 internally (emits `CSI <y+1>;<x+1>H`). mibu took 1-indexed

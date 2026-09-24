@@ -54,10 +54,6 @@ const M = struct {
     pub const drawKeyEntry = root.modal.drawKeyEntry;
     pub const drawUnlock = root.modal.drawUnlock;
     pub const appendStreamChunk = root.modal.appendStreamChunk;
-    // WU 0.5 (tui-ship-fast-phase0): drawKeyEntry is exposed on the
-    // modal namespace so tests can drive the renderer directly and
-    // assert the cursor position surface (Bug 4).
-    pub const drawKeyEntry = root.modal.drawKeyEntry;
 };
 const MS = struct {
     const root = @import("mock_server");
@@ -1900,7 +1896,7 @@ test "T-TIRFIX-003b: second frame is diff only (no 2J preamble)" {
 
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try Tui.emitFrame(&w, &prev, &current, W, H, testing.allocator);
+    try Tui.emitFrame(&w, &prev, &current, W, H, testing.allocator, Tui.CURSOR_SKIP, 0);
     const out = buf[0..w.end];
 
     // Diff frame does NOT include the ED preamble.
