@@ -367,7 +367,7 @@ fn tuiRealMain(args: *const ThreadArgs) void {
         stdin_file.handle,
         writer,
         args.io,
-    ) catch .{
+    ) catch blk: {
         // tuiThreadInit can fail when the handle is not a real TTY or
         // the writer cannot allocate. Build a stub Lifecycle with
         // no_tty=true so the loop falls through to logger-only mode.
@@ -376,7 +376,14 @@ fn tuiRealMain(args: *const ThreadArgs) void {
         // (80×24) used by tuiThreadInit so callers that read
         // `lc.grids[0].cols / .rows` see a consistent shape regardless
         // of which branch returned the value.
-        .{
+        //
+        // Build the stub field-by-field because Zig 0.16's struct
+        // literal syntax doesn't support array init for `[2]ScreenGrid`
+        // (the element type itself contains `[2][MAX_CELL_BUF]Cell`,
+        // an inline struct too large to literal-init in-place).
+        // `grids` has a default of `undefined`, so we omit it from
+        // the struct literal and populate each cell after.
+        var stub: tui_thread_mod.Lifecycle = .{
             .raw_term = null,
             .dec_2048_supported = false,
             .kitty_supported = false,
@@ -385,11 +392,11 @@ fn tuiRealMain(args: *const ThreadArgs) void {
             .width = 80,
             .height = 24,
             .no_tty = true,
-            .grids = .{
-                tui_thread_mod.ScreenGrid.init(80, 24) catch unreachable,
-                tui_thread_mod.ScreenGrid.init(80, 24) catch unreachable,
-            },
-        }};
+        };
+        stub.grids[0] = tui_thread_mod.ScreenGrid.init(80, 24) catch unreachable;
+        stub.grids[1] = tui_thread_mod.ScreenGrid.init(80, 24) catch unreachable;
+        break :blk stub;
+    };
 
     // REQ-RW-001: seed the first frame after init returns and we have a
     // real TTY. The no_tty path keeps redraw_pending=false so the loop
