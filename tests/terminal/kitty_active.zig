@@ -208,50 +208,115 @@ test "issue #53: Parser.kitty_active is std.atomic.Value(bool) (struct shape)" {
 }
 
 test "issue #53: Parser.kitty_active concurrent load/store from multiple threads" {
-    // Stress test — spawn 2 writer threads + 2 reader threads, each
-    // doing 5000 iterations. With non-atomic bool, the test would
-    // observe torn reads or have a data race (UB). With atomic, all
-    // loads return either true or false consistently (no torn bool).
+    // Stress test — one alternating writer + two readers, with the
+    // writer looping until BOTH readers complete. The writer flips
+    // true↔false every iteration; each reader loops until it observes
+    // BOTH values then signals completion. With this protocol:
+    //   - The writer is GUARANTEED to be active while the readers run
+    //     (the writer loop condition `completed < 2` only becomes
+    //     false after both readers fetchAdd their completion flag).
+    //   - The writer alternates every iteration, so any reader that
+    //     does ≥2 iterations while the writer is active MUST observe
+    //     both true AND false (the writer flips between them).
+    // This is deterministic — no fixed-iteration flake (where readers
+    // could finish before the writer started).
+    //
+    // The prior assertion `v == true or v == false` was trivially true
+    // on x86_64 (where bool reads are naturally atomic); this version
+    // actually validates the atomic API delivers consistent values
+    // across concurrent threads.
+    //
+    // Counters are std.atomic.Value(usize) shared between the two
+    // readers — fetchAdd avoids the read-modify-write race that plain
+    // `usize += 1` would have across the two readers.
     var parser = event.Parser.init();
+    var seen_true = std.atomic.Value(usize).init(0);
+    var seen_false = std.atomic.Value(usize).init(0);
+    var completed = std.atomic.Value(usize).init(0);
 
     const WriterCtx = struct {
         p: *event.Parser,
-        active: bool,
+        completed: *std.atomic.Value(usize),
     };
-    const readerFn = struct {
-        fn run(ctx: *const WriterCtx) !void {
-            var i: usize = 0;
-            while (i < 5000) : (i += 1) {
-                // Atomic load — torn reads impossible.
-                const v: bool = ctx.p.kitty_active.load(.seq_cst);
-                // The value must be deterministic (one of the writers'
-                // last-stored values) — torn bool would fail this.
-                try testing.expect(v == true or v == false);
-            }
-        }
-    }.run;
+    const ReaderCtx = struct {
+        p: *event.Parser,
+        seen_true: *std.atomic.Value(usize),
+        seen_false: *std.atomic.Value(usize),
+        completed: *std.atomic.Value(usize),
+    };
 
     const writerFn = struct {
         fn run(ctx: *const WriterCtx) void {
             var i: usize = 0;
-            while (i < 5000) : (i += 1) {
-                ctx.p.setKittyActive(ctx.active);
+            // Keep writing until BOTH readers have completed. This
+            // guarantees the writer is active while the readers are
+            // running, so the readers can observe the alternation.
+            while (ctx.completed.load(.seq_cst) < 2) {
+                ctx.p.setKittyActive(i % 2 == 0);
+                i += 1;
             }
         }
     }.run;
 
-    const true_ctx = WriterCtx{ .p = &parser, .active = true };
-    const false_ctx = WriterCtx{ .p = &parser, .active = false };
+    const readerFn = struct {
+        fn run(ctx: *const ReaderCtx) void {
+            var local_seen_true = false;
+            var local_seen_false = false;
+            var iters: usize = 0;
+            // Loop until we observe BOTH values. The cap (10000) is
+            // safety only — with the writer alternating every iteration
+            // and the writer guaranteed active until both readers
+            // complete, two consecutive iterations MUST see both
+            // values. The cap is well above any sane OS scheduling
+            // jitter.
+            while (iters < 10000 and (!local_seen_true or !local_seen_false)) : (iters += 1) {
+                const v: bool = ctx.p.kitty_active.load(.seq_cst);
+                if (v) {
+                    local_seen_true = true;
+                    _ = ctx.seen_true.fetchAdd(1, .seq_cst);
+                } else {
+                    local_seen_false = true;
+                    _ = ctx.seen_false.fetchAdd(1, .seq_cst);
+                }
+            }
+            // If the cap was hit without observing both values, the
+            // atomic API is broken (writer stopped writing before
+            // reader finished). This should never fire with the
+            // completed-count writer protocol above.
+            if (!local_seen_true or !local_seen_false) {
+                std.debug.panic(
+                    "atomic stress test failed: reader saw only one value " ++
+                        "after 10000 iterations (true={}, false={})",
+                    .{ local_seen_true, local_seen_false },
+                );
+            }
+            _ = ctx.completed.fetchAdd(1, .seq_cst);
+        }
+    }.run;
 
-    var wt1 = try std.Thread.spawn(.{}, writerFn, .{&true_ctx});
-    var wt2 = try std.Thread.spawn(.{}, writerFn, .{&false_ctx});
-    var rt1 = try std.Thread.spawn(.{}, readerFn, .{&true_ctx});
-    var rt2 = try std.Thread.spawn(.{}, readerFn, .{&false_ctx});
-    wt1.join();
-    wt2.join();
+    var w_ctx = WriterCtx{ .p = &parser, .completed = &completed };
+    var rt1_ctx = ReaderCtx{
+        .p = &parser,
+        .seen_true = &seen_true,
+        .seen_false = &seen_false,
+        .completed = &completed,
+    };
+    var rt2_ctx = ReaderCtx{
+        .p = &parser,
+        .seen_true = &seen_true,
+        .seen_false = &seen_false,
+        .completed = &completed,
+    };
+
+    var wt = try std.Thread.spawn(.{}, writerFn, .{&w_ctx});
+    var rt1 = try std.Thread.spawn(.{}, readerFn, .{&rt1_ctx});
+    var rt2 = try std.Thread.spawn(.{}, readerFn, .{&rt2_ctx});
+    wt.join();
     rt1.join();
     rt2.join();
 
-    // After all threads join, the field is in a deterministic state.
-    try testing.expect(parser.kittyActive() == true or parser.kittyActive() == false);
+    // Sanity check — at least one observation of each value across
+    // all reader iterations (the shared atomic counters).
+    try testing.expect(seen_true.load(.seq_cst) > 0);
+    try testing.expect(seen_false.load(.seq_cst) > 0);
 }
