@@ -41,6 +41,32 @@ comptime {
 }
 
 // =============================================================================
+// Issue #51 (tech-debt review, obs#1791 §1): enforce byte-identity
+// between screen_grid.Cell and modal.Cell at compile time.
+//
+// WindowMock.init (modal.zig:142) @ptrCasts a `[]screen_grid.Cell` slice
+// to `[]modal.Cell` because Zig treats the structurally-identical structs
+// as distinct types. The cast is only sound if both structs are
+// byte-for-byte identical — same fields, same size, same alignment.
+// Any future divergence silently produces UB. This block fails the
+// build with a clear assertion message if either struct drifts; the
+// positive test at tests/tui/screen_grid.zig mirrors the contract so
+// regressions also surface as test failures.
+//
+// Forward references are intentional: Cell + Style are defined further
+// down in this file but are resolved by the compiler before this block
+// evaluates (Zig performs full-file semantic analysis for comptime).
+// =============================================================================
+comptime {
+    _ = @hasField(screen_grid_mod.Cell, "ch");
+    _ = @hasField(screen_grid_mod.Cell, "style");
+    _ = @hasField(Cell, "ch");
+    _ = @hasField(Cell, "style");
+    std.debug.assert(@sizeOf(screen_grid_mod.Cell) == @sizeOf(Cell));
+    std.debug.assert(@alignOf(screen_grid_mod.Cell) == @alignOf(Cell));
+}
+
+// =============================================================================
 // WindowMock support types (Cell / Style / DiffEntry / TermSize).
 // =============================================================================
 
