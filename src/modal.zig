@@ -58,12 +58,26 @@ comptime {
 // evaluates (Zig performs full-file semantic analysis for comptime).
 // =============================================================================
 comptime {
-    _ = @hasField(screen_grid_mod.Cell, "ch");
-    _ = @hasField(screen_grid_mod.Cell, "style");
-    _ = @hasField(Cell, "ch");
-    _ = @hasField(Cell, "style");
-    std.debug.assert(@sizeOf(screen_grid_mod.Cell) == @sizeOf(Cell));
-    std.debug.assert(@alignOf(screen_grid_mod.Cell) == @alignOf(Cell));
+    // Issue #51 R2 (4R follow-up): self-documenting error message via
+    // @compileError. The prior std.debug.assert produced an opaque
+    // "reached unreachable code at std/debug.zig:420" — developers had
+    // to trace back to the comptime assertion to understand what
+    // failed. @compileError names both structs + the @ptrCast site
+    // (modal.zig:142) that depends on byte-identity, so a divergence
+    // produces an actionable failure message on the first build.
+    const fields_ok =
+        @hasField(screen_grid_mod.Cell, "ch") and
+        @hasField(screen_grid_mod.Cell, "style") and
+        @hasField(Cell, "ch") and
+        @hasField(Cell, "style");
+    const size_ok = @sizeOf(screen_grid_mod.Cell) == @sizeOf(Cell);
+    const align_ok = @alignOf(screen_grid_mod.Cell) == @alignOf(Cell);
+
+    if (!fields_ok or !size_ok or !align_ok) {
+        @compileError("ScreenGrid.Cell and modal.Cell must be byte-identical for the " ++
+            "@ptrCast at src/modal.zig:142. Check field presence (ch, style), " ++
+            "size, and alignment of both structs.");
+    }
 }
 
 // =============================================================================
