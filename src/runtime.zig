@@ -627,6 +627,17 @@ pub const TOOLS_PROFILE = sandbox_profile.Profile{
     .allowed_net_endpoints = &[_]sandbox_profile.NetEndpoint{},
 };
 
+/// Return current monotonic time in milliseconds (Slice 7 / WU-4 timeout
+/// helper). Zig 0.16 std.time lacks `milliTimestamp` — go straight to
+/// `std.os.linux.clock_gettime` with CLOCK_MONOTONIC. Cheap (no syscall
+/// beyond the vDSO fast path on modern kernels) and monotonic (immune
+/// to wall-clock jumps — correct for deadline math).
+fn nowMs() i64 {
+    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * std.time.ms_per_s + @divFloor(ts.nsec, std.time.ns_per_ms);
+}
+
 fn toolsRealMain(args: *const ThreadArgs) void {
     while (!args.shutdown.load(.seq_cst)) {
         if (args.channels.tui_to_tools.tryGet(args.io)) |event| {
@@ -706,33 +717,82 @@ fn toolsRealMain(args: *const ThreadArgs) void {
                         continue;
                     };
 
-                    // Slice 7 / WU-2: read captured stdout from the pipe until
-                    // EOF (child exit). Linux pipe buffer is 64 KiB — for the
-                    // typical tool output (< 64 KiB) this fits in one read;
-                    // for larger outputs we loop. Blocking read is fine here
-                    // because the child will eventually exit and close the pipe.
+                    // Slice 7 / WU-2 + WU-4 + WU-5: read captured stdout from the
+                    // pipe until EOF (child exit) OR timeout (kill + ToolError)
+                    // OR cancel via cancel_pipe (kill + silent).
                     var captured: std.ArrayList(u8) = .empty;
                     defer captured.deinit(args.allocator);
                     var read_buf: [4096]u8 = undefined;
+                    // Slice 7 / WU-4: hardcoded 30s default timeout per call.
+                    // Per-call override (timeout_ms in DispatchToolRequest
+                    // payload) deferred — v1 uses global constant.
+                    const TOOL_TIMEOUT_MS: u64 = 30_000;
+                    const deadline_ms = nowMs() +% @as(i64, TOOL_TIMEOUT_MS);
+                    var timed_out = false;
                     while (true) {
-                        // Zig 0.16 std.os.linux.read returns usize; -1 on error
-                        // (with errno set). Per the project pattern in src/logger.zig
-                        // and src/mock_server.zig, detect EOF via n == 0 and
-                        // error via n > 0x7ffff000 (sign bit set in 32-bit ssize_t).
-                        const n_signed: isize = @bitCast(std.os.linux.read(
-                            sub.stdout_fd,
-                            &read_buf,
-                            read_buf.len,
-                        ));
-                        if (n_signed == 0) break; // EOF
-                        if (n_signed < 0) {
-                            logger.global().log(args.io, .warn, "stdout read failed") catch {};
+                        // Poll on stdout AND cancel_pipe (WU-5) with the
+                        // remaining timeout. Cancel detection fires within
+                        // the poll's timeout window.
+                        const remaining_ms = deadline_ms -% nowMs();
+                        if (remaining_ms <= 0) {
+                            timed_out = true;
                             break;
                         }
-                        captured.appendSlice(args.allocator, read_buf[0..@intCast(n_signed)]) catch {
-                            logger.global().log(args.io, .warn, "stdout capture OOM") catch {};
-                            break;
+                        var pollfd = [_]std.os.linux.pollfd{
+                            .{ .fd = sub.stdout_fd, .events = std.os.linux.POLL.IN, .revents = 0 },
+                            .{ .fd = args.cancel_pipe[0], .events = std.os.linux.POLL.IN, .revents = 0 },
                         };
+                        const poll_timeout = @as(i32, @intCast(@min(remaining_ms, 100)));
+                        _ = std.os.linux.poll(&pollfd, 1, poll_timeout);
+
+                        // Slice 7 / WU-5: cancel detected via cancel_pipe.
+                        // Write end was closed (parent closed on shutdown, or
+                        // Agent thread killed it via api-client cancel).
+                        // Kill in-flight subprocess and post no result
+                        // (cancel is silent — the cancel request itself is
+                        // the user-visible signal).
+                        if (pollfd[1].revents & std.os.linux.POLL.IN != 0) {
+                            _ = std.os.linux.kill(sub.pid, std.os.linux.SIG.KILL);
+                            _ = sub.wait() catch {};
+                            sub.deinit();
+                            // Silent — no ToolResult, no ToolError.
+                            // Per design: cancel is the user-visible signal.
+                            continue;
+                        }
+
+                        if (pollfd[0].revents & std.os.linux.POLL.IN != 0) {
+                            // Zig 0.16 std.os.linux.read returns usize; -1 on error.
+                            const n_signed: isize = @bitCast(std.os.linux.read(
+                                sub.stdout_fd,
+                                &read_buf,
+                                read_buf.len,
+                            ));
+                            if (n_signed == 0) break; // EOF
+                            if (n_signed < 0) {
+                                logger.global().log(args.io, .warn, "stdout read failed") catch {};
+                                break;
+                            }
+                            captured.appendSlice(args.allocator, read_buf[0..@intCast(n_signed)]) catch {
+                                logger.global().log(args.io, .warn, "stdout capture OOM") catch {};
+                                break;
+                            };
+                        }
+                    }
+
+                    // Slice 7 / WU-4: timeout — kill child, wait for reaper, post error.
+                    if (timed_out) {
+                        _ = std.os.linux.kill(sub.pid, std.os.linux.SIG.KILL);
+                        const kill_status = sub.wait() catch 0;
+                        sub.deinit();
+                        args.channels.tools_to_tui.tryPut(args.io, .{
+                            .ToolError = .{
+                                .id = d.id,
+                                .kind = .timeout,
+                                .message = "subprocess exceeded 30000ms timeout (SIGKILL sent)",
+                            },
+                        }) catch {};
+                        _ = kill_status;
+                        continue;
                     }
 
                     // Slice 7 / WU-3: inspect waitpid status. SIGSYS (= 31 on
