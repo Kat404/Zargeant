@@ -69,6 +69,22 @@ if [[ "${CLEAN}" -eq 1 ]]; then
   exit 0
 fi
 
+# ─── Pre-flight: kill orphan descendants of the CI image ─────────────────────
+# --rm only catches clean exits; a SIGKILL'd parent `podman run` (or a previous
+# `podman rmi -f` racing with a still-running container) leaves zombies that
+# re-running this script would detach from a freshly baked image. Clean them
+# before any rmi/build/run step.
+podman rm -f "$(podman ps -aq --filter "ancestor=${CI_IMAGE}" 2>/dev/null)" 2>/dev/null || true
+
+# ─── Graceful-interrupt trap ──────────────────────────────────────────────────
+# On Ctrl-C / SIGTERM, remove any descendant container we left behind so the
+# next run starts clean. SIGKILL is still untrappable, but the pre-flight
+# above covers that on the next invocation.
+cleanup() {
+  podman rm -f "$(podman ps -aq --filter "ancestor=${CI_IMAGE}" 2>/dev/null)" 2>/dev/null || true
+}
+trap cleanup INT TERM
+
 # ─── CI image bake ────────────────────────────────────────────────────────────
 NEEDS_BAKE=0
 if [[ "${REBUILD_IMAGE}" -eq 1 ]] || ! podman image exists "${CI_IMAGE}" 2>/dev/null; then
