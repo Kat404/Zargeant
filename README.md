@@ -15,7 +15,7 @@ Zargeant is a **terminal-native AI agent harness**: a TUI that lets you drive an
 - **Minimal binary.** Zig 0.16 + stdlib only; ~200 KB–1.5 MB stripped, cold start < 50 ms.
 - **Hardened by design.** Every tool subprocess runs in a sandboxed copy of the agent's profile: deny-by-default filesystem rules via Landlock, syscall allowlist via Seccomp-BPF, no `ptrace`, no `mount`, no `bpf`.
 - **Headless observability.** A mandatory `src/logger.zig` writes to `/tmp/ai-harness-debug.log` (mode `0600`). The TUI takes raw mode on the terminal; **no** writes to `stdout` or `stderr`.
-- **Strict TDD.** Every slice ships with tests written **before** implementation. 500 tests pass on Debug + ReleaseSafe + ReleaseFast as of the terminal-control-lib-from-scratch PR 6 merge (386 main + 114 in-tree terminal).
+- **Strict TDD.** Every slice ships with tests written **before** implementation. 500+ tests pass on Debug + ReleaseSafe + ReleaseFast as of slice 7 PR #56 + Phase 2 PR #50 merge (386 main + 114 in-tree terminal + Phase 2 additions).
 
 ## Architecture
 
@@ -49,20 +49,22 @@ Three threads:
 
 ## Status
 
-In development. Five of seven planned slices are shipped on `main`:
+In development. All seven planned slices shipped on `main`. Phase 2 Tiger Style retrofit (PRs [#44](https://github.com/Kat404/Zargeant/pull/44), [#49](https://github.com/Kat404/Zargeant/pull/49), [#50](https://github.com/Kat404/Zargeant/pull/50)) and slice 7 (tool subprocess pool, PR [#56](https://github.com/Kat404/Zargeant/pull/56)) are also complete. Tech debt tracked at issues [#51](https://github.com/Kat404/Zargeant/issues/51)–[#54](https://github.com/Kat404/Zargeant/issues/54).
 
-| Slice                                                       | Status         | Lines  | Tests   |
-| ----------------------------------------------------------- | -------------- | ------ | ------- |
-| Build toolchain (`build.zig` + `zig.zon`)                   | ✓ shipped      | 78     | 1 smoke |
-| Logger (`/tmp/ai-harness-debug.log`)                        | ✓ shipped      | 609    | 15      |
-| Sandbox Linux (Landlock + Seccomp-BPF)                      | ✓ shipped      | 1,615  | 25      |
-| API Client (MiniMax HTTP-SSE)                               | ✓ shipped      | ~900   | ~12     |
-| TLS handrolled                                              | ✓ shipped      | ~700   | ~8      |
-| TUI (in-tree `src/terminal/` + 3-thread orchestrator)       | 🚧 6-PR chain ready, awaiting merge | ~3,500 | 500   |
-| logger-macos-port                                           | 📋 follow-up   | —      | —       |
-| sandbox-macos                                               | 📋 follow-up   | —      | —       |
+| Slice                                                       | Status         | PR                                                                          | Lines    | Tests   |
+| ----------------------------------------------------------- | -------------- | --------------------------------------------------------------------------- | -------- | ------- |
+| Build toolchain (`build.zig` + `zig.zon`)                   | ✓ shipped      | —                                                                           | 78       | 1 smoke |
+| Logger (`/tmp/ai-harness-debug.log`)                        | ✓ shipped      | —                                                                           | 609      | 15      |
+| Sandbox Linux (Landlock + Seccomp-BPF)                      | ✓ shipped      | —                                                                           | 1,615    | 25      |
+| API Client (MiniMax HTTP-SSE)                               | ✓ shipped      | —                                                                           | ~900     | ~12     |
+| TLS handrolled                                              | ✓ shipped      | —                                                                           | ~700     | ~8      |
+| TUI (in-tree `src/terminal/` + 3-thread orchestrator)       | ✓ shipped      | [#31](https://github.com/Kat404/Zargeant/pull/31), [#32](https://github.com/Kat404/Zargeant/pull/32), [#34](https://github.com/Kat404/Zargeant/pull/34), [#35](https://github.com/Kat404/Zargeant/pull/35), [#36](https://github.com/Kat404/Zargeant/pull/36) (#33 superseded by Phase 2) | ~3,500 | 500 |
+| Tools subprocess pool (slice 7)                             | ✓ shipped      | [#56](https://github.com/Kat404/Zargeant/pull/56)                            | ~190     | 70      |
+| Phase 2 Tiger Style retrofit                                | ✓ shipped      | [#44](https://github.com/Kat404/Zargeant/pull/44), [#49](https://github.com/Kat404/Zargeant/pull/49), [#50](https://github.com/Kat404/Zargeant/pull/50) | ~5,375   | 132     |
+| logger-macos-port                                           | 📋 follow-up   | —                                                                           | —        | —       |
+| sandbox-macos                                               | 📋 follow-up   | —                                                                           | —        | —       |
 
-**Total**: 500 tests pass on `zig build test` (Debug + ReleaseSafe + ReleaseFast) as of the terminal-control-lib-from-scratch PR 6 merge. Slice 5 (TUI) is a 6-PR chained stack replacing the `mibu@636a36a` dependency with an in-tree `src/terminal/` module (per ADR 0001 §"Alternatives Considered" #2 + ADR 0003); see [Slice status — TUI](#slice-status--tui) below.
+**Total**: 500+ tests pass on `zig build test` (Debug + ReleaseSafe + ReleaseFast) as of slice 7 PR #56 + Phase 2 PR #50 merge. The TUI slice replaces the `mibu@636a36a` dependency with an in-tree `src/terminal/` module per ADR 0001 §"Alternatives Considered" #2 + ADR 0003; see [Slice status — TUI](#slice-status--tui) below.
 
 ## Requirements
 
@@ -89,20 +91,23 @@ To add a new third-party dep, write a new ADR under `docs/decisions/` first; see
 
 ## Slice status — TUI
 
-The TUI slice ships as a 6-PR chained stack on top of the `feat-tclib-tracker` branch (feature-branch-chain topology per `sdd/terminal-control-lib-from-scratch/tasks`). Each PR is its own PR against the previous PR branch; once all 6 land on `feat-tclib-tracker`, a final PR aggregates `feat-tclib-tracker` → `main`.
+The TUI slice shipped as a 6-PR chained stack on `main` via squash merges on 2026-09-11. Phase 2 (Tiger Style retrofit, PRs [#44](https://github.com/Kat404/Zargeant/pull/44) + [#49](https://github.com/Kat404/Zargeant/pull/49) + [#50](https://github.com/Kat404/Zargeant/pull/50)) superseded slice 6 (PR [#33](https://github.com/Kat404/Zargeant/pull/33)) by replacing the heap-allocated render pipeline with a value-type `ScreenGrid` + pure `diffAndEmit` renderer.
 
-| PR       | Theme                                                                             | Status                       | PR                                                                       | LoC    |
-| -------- | --------------------------------------------------------------------------------- | ---------------------------- | ------------------------------------------------------------------------ | ------ |
-| PR 1     | Foundation + termios (ADR 0002 + `mod.zig` + `term.zig` + MockBackend + 6 tests)  | ✅ OPEN, MERGEABLE           | [#31](https://github.com/Kat404/Zargeant/pull/31)                         | +694   |
-| PR 2     | Emit layer (cursor + style + dpm + kitty)                                        | ✅ OPEN, MERGEABLE           | [#32](https://github.com/Kat404/Zargeant/pull/32)                         | +935   |
-| PR 3     | Event parser part 1 (UTF-8 + base + in-band resize unconditional + EINTR-pending) | ✅ OPEN, MERGEABLE           | [#33](https://github.com/Kat404/Zargeant/pull/33)                         | +1,336 |
-| PR 4     | Event parser part 2 (kitty kb parser: CSI u + press/repeat/release + mods)        | ✅ OPEN, MERGEABLE           | [#34](https://github.com/Kat404/Zargeant/pull/34)                         | +358   |
-| PR 5     | Probe response lexer (DECRPM reply + `Mode.supported()` + 4 failure modes per C14) | ✅ OPEN, MERGEABLE           | [#35](https://github.com/Kat404/Zargeant/pull/35)                         | +608   |
-| PR 6     | Atomic swap + drop mibu (atomic `mibu → terminal` rename + ADR 0003)              | ✅ OPEN, MERGEABLE (FINAL)   | [#36](https://github.com/Kat404/Zargeant/pull/36)                         | +110   |
+| PR          | Theme                                                                             | Status                                  | PR                                                                       | LoC     |
+| ----------- | --------------------------------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------ | ------- |
+| PR 1        | Foundation + termios (ADR 0002 + `mod.zig` + `term.zig` + MockBackend + 6 tests)  | ✅ MERGED 2026-09-11                    | [#31](https://github.com/Kat404/Zargeant/pull/31)                         | +694    |
+| PR 2        | Emit layer (cursor + style + dpm + kitty)                                        | ✅ MERGED 2026-09-11                    | [#32](https://github.com/Kat404/Zargeant/pull/32)                         | +935    |
+| PR 3        | Event parser part 1 (UTF-8 + base + in-band resize unconditional + EINTR-pending) | ⚠️ CLOSED 2026-09-11 (superseded by Phase 2) | [#33](https://github.com/Kat404/Zargeant/pull/33)                  | +1,336  |
+| PR 4        | Event parser part 2 (kitty kb parser: CSI u + press/repeat/release + mods)        | ✅ MERGED 2026-09-11                    | [#34](https://github.com/Kat404/Zargeant/pull/34)                         | +358    |
+| PR 5        | Probe response lexer (DECRPM reply + `Mode.supported()` + 4 failure modes per C14) | ✅ MERGED 2026-09-11                   | [#35](https://github.com/Kat404/Zargeant/pull/35)                         | +608    |
+| PR 6        | Atomic swap + drop mibu (atomic `mibu → terminal` rename + ADR 0003)              | ✅ MERGED 2026-09-11                    | [#36](https://github.com/Kat404/Zargeant/pull/36)                         | +110    |
+| Phase 2 PR1 | ScreenGrid + DiffEntry + diffAndEmit pure renderer                               | ✅ MERGED 2026-09-24                    | [#44](https://github.com/Kat404/Zargeant/pull/44)                         | +1,150  |
+| Phase 2 PR2 | `render*ToGrid` + WindowMock + build blocker fix                                 | ✅ MERGED 2026-09-24                    | [#49](https://github.com/Kat404/Zargeant/pull/49)                         | +1,869  |
+| Phase 2 PR4 | `kitty_active` + `cancel_pipe` + AGENTS.md §10 Pre-Merge QA Gate Ordering        | ✅ MERGED 2026-09-26                    | [#50](https://github.com/Kat404/Zargeant/pull/50)                         | +2,356  |
 
-**What's next:** User merges PRs #31 → #32 → #33 → #34 → #35 → #36 in order to `feat-tclib-tracker`, then merges `feat-tclib-tracker` → `main`. The change is `sdd-verify PASS` + `sdd-archive OK` (cycle closed; see engram obs#1521 + obs#1522).
+> **Note**: PR #33 (slice 6, event parser part 1) was closed without merge on 2026-09-11 because Phase 2 superseded the heap-allocated render pipeline it targeted. The work it contained was rolled into the Phase 2 Tiger Style retrofit (PRs #44 + #49 + #50).
 
-The full task breakdown (20 WUs across 6 PRs) lives in `sdd/terminal-control-lib-from-scratch/tasks` (obs#1514). The TUI design is in `sdd/terminal-control-lib-from-scratch/design` (obs#1512) and the spec in `sdd/terminal-control-lib-from-scratch/spec` (obs#1510). The libvaxis → mibu → in-tree decision chain: [ADR 0001](docs/decisions/0001-libvaxis-to-mibu.md) → [ADR 0002](docs/decisions/0002-clean-room.md) → [ADR 0003](docs/decisions/0003-clean-room-impl.md).
+The slice's full task breakdown (20 WUs across 6 PRs) lives in engram obs#1514. The TUI design is in engram obs#1512 and the spec in obs#1510. The libvaxis → mibu → in-tree decision chain: [ADR 0001](docs/decisions/0001-libvaxis-to-mibu.md) → [ADR 0002](docs/decisions/0002-clean-room.md) → [ADR 0003](docs/decisions/0003-clean-room-impl.md).
 
 ### Clean-room constraints (CONTRIBUTING.md:41 + ADR 0003 §Negative)
 
@@ -238,19 +243,19 @@ Long-form documentation lives in `docs/`:
 
 ## Road to v1.0
 
-1. **TUI merge** — merge the 6-PR terminal-control-lib-from-scratch chain into `feat-tclib-tracker` (PRs #31 → #32 → #33 → #34 → #35 → #36 in order); merge `feat-tclib-tracker` → `main` to close slice 5.
+1. **Tech debt** — close open issues [#51](https://github.com/Kat404/Zargeant/issues/51)–[#54](https://github.com/Kat404/Zargeant/issues/54) (~50 LoC total, all non-blocking, ~1 day of work).
 2. **Cross-platform** — macOS (amd64 + arm64) port for logger + sandbox. Linux arm64.
-3. **Release automation** — GitHub Actions release pipeline; signed binaries.
+3. **Release automation** — GitHub Actions release pipeline; signed binaries; first v1.0.0 tag.
 
 ## Development workflow
 
-This project uses **SDD (Spec-Driven Development)** with the following cycle:
+This project uses **ODD (Organic Driven Development)** with **strict TDD** (RED before GREEN) and **RDD (Receipt-Driven Development)** for review authority, as of 2026-09-26:
 
 ```
-explore → propose → spec → design → tasks → apply → verify → archive
+explore → feature doc → work units (RED → GREEN) → review → archive
 ```
 
-Each slice is its own SDD cycle, persisted in Engram. Strict TDD is enforced: tests are written before implementation, and the cycle doesn't ship until `zig build test` exits 0 on all three optimization modes.
+Each slice is its own ODD cycle, persisted in `odd/tasks/<feature>.md` (filesystem) + mirrored to Engram (cross-session recovery). Strict TDD is enforced: tests are written before implementation, and the cycle doesn't ship until `zig build test` exits 0 on all three optimization modes (Debug + ReleaseSafe + ReleaseFast).
 
 ## Conventions
 
