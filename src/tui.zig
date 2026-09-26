@@ -124,14 +124,6 @@ pub const Lifecycle = struct {
     /// stack-allocated Lifecycle (not heap-allocated; see design D1).
     parser: terminal.event.Parser = .{ .ring_buf = undefined, .ring_len = 0, .paste_active = false },
 
-    /// Legacy field from tui-input-rendering-fixes (REQ-TIRFIX-003, PR #39).
-    /// Phase 2's submitFrame (T-2.6.1) replaces the explicit first_frame
-    /// sentinel with `force_full_redraw: bool` (see below). Kept here for
-    /// test compatibility with `tests/tui/runtime_thread.zig:1882`
-    /// (T-TIRFIX-003a) which sets `.first_frame = true` and flips it
-    /// after frame 1. Unused by submitFrame in Phase 2 design.
-    first_frame: bool = true,
-
     /// Phase 2 PR2 (T-2.5.1, design §3.3): double buffer for the render
     /// pipeline. Value type — lives inline on the TUI thread stack; no
     /// allocator. `grids[lc.active_idx]` is the "active" (draw fn writes
