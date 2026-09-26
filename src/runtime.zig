@@ -638,7 +638,36 @@ fn nowMs() i64 {
     return @as(i64, ts.sec) * std.time.ms_per_s + @divFloor(ts.nsec, std.time.ns_per_ms);
 }
 
+/// Slice 7 / WU-6: tools worker thread body. Pulls events from
+/// `tui_to_tools` channel and dispatches them (DispatchToolRequest spawns
+/// subprocess + captures stdout + timeout/cancel/exit classification).
+/// Multiple workers may run concurrently to dispatch multiple tool
+/// requests in parallel; bounded by the channel capacity + N.
+/// Slice 7 / WU-6: tools thread orchestrator. Spawns a pool of
+/// `TOOLS_POOL_SIZE` workers (each running `toolsWorkerMain`) + joins
+/// them on shutdown. Workers share `ThreadArgs` (channels + shutdown
+/// atomic + cancel_pipe) by pointer; each pulls events from
+/// `tui_to_tools` concurrently. The pool size is a hardcoded constant
+/// (v1); per-runtime config deferred.
 fn toolsRealMain(args: *const ThreadArgs) void {
+    const TOOLS_POOL_SIZE: u32 = 4;
+    var workers: [TOOLS_POOL_SIZE]std.Thread = undefined;
+    for (&workers) |*w| {
+        w.* = std.Thread.spawn(.{ .allocator = args.allocator }, toolsWorkerMain, .{args}) catch {
+            logger.global().log(args.io, .err, "tools worker spawn failed") catch {};
+            // Spawn failure: shut down other workers via the atomic
+            // flag and continue. The still-pending shutdown flag will
+            // cause the main Runtime to clean up.
+            args.shutdown.store(true, .seq_cst);
+            break;
+        };
+    }
+    for (workers) |w| {
+        w.join();
+    }
+}
+
+fn toolsWorkerMain(args: *const ThreadArgs) void {
     while (!args.shutdown.load(.seq_cst)) {
         if (args.channels.tui_to_tools.tryGet(args.io)) |event| {
             switch (event) {
