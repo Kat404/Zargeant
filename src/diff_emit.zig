@@ -55,12 +55,20 @@ pub const DiffEntry = struct {
 /// + UTF-8 bytes of `cell.ch` + SGR reset `\x1b[0m`. Coordinates are
 /// 0-indexed in (x, y), translated to terminal's 1-indexed CUP form.
 ///
-/// SGR handling (REQ-DE-002, minimal viable for PR1b):
-/// - `style.bold == true`  → emit `\x1b[1m` then UTF-8 then `\x1b[0m`
-/// - no style flags set     → emit `\x1b[0m` then UTF-8 then `\x1b[0m`
-///   (underline/reverse support deferred to T-2.4 if a real draw fn needs
-///   it; this is the smallest SGR surface that proves the bold path
-///   end-to-end, byte-exact asserted in tests/tui/screen_grid.zig.)
+/// SGR handling (issue #54 — tech-debt review, obs#1791 §3): the full
+/// Style surface is emitted via ECMA-48 SGR parameters (the byte-exact
+/// mapping is owned by `src/terminal/style.zig:reset/bold/underline/reverse`
+/// which we mirror inline to keep `diff_emit.zig` build-graph isolated
+/// from `terminal_mod` — adding `terminal` to `diff_emit_mod`'s imports
+/// would violate the PR-1b sibling-module ownership rule). For each cell:
+///   - always emit `\x1b[0m` first (clears any carry-over from prior cell
+///     so each renders correctly regardless of terminal SGR state)
+///   - then emit per-flag SGR: bold → `\x1b[1m`, underline → `\x1b[4m`,
+///     reverse → `\x1b[7m`
+///   - then UTF-8 bytes of `cell.ch`
+///   - then trailing `\x1b[0m` reset
+/// Up to 19 bytes of SGR per cell (4 reset + 3×5 set flags) + UTF-8 +
+/// trailing 4 bytes reset.
 ///
 /// Preconditions (Tiger Style §4 — defensive precondition on system input):
 /// - `cols > 0 && rows > 0`
@@ -93,13 +101,15 @@ pub fn emitDiffEntry(
     }
 
     // ── SGR (leading) ──────────────────────────────────────────────────────
-    if (entry.cell.style.bold) {
-        try writer.writeAll("\x1b[1m");
-    } else {
-        // Defensive reset — clears any leftover bold/underline/reverse
-        // from the previous entry so each cell renders independently.
-        try writer.writeAll("\x1b[0m");
-    }
+    // Always reset first, then conditionally set each flag. ECMA-48 §SGR
+    // defines cumulative state — the terminal maintains each attribute
+    // independently until SGR 0 (reset-all) is received. Without the
+    // leading reset, a cell that sets only `underline` after a previous
+    // cell that set `bold` would render as bold+underline (incorrect).
+    try writer.writeAll("\x1b[0m");
+    if (entry.cell.style.bold) try writer.writeAll("\x1b[1m");
+    if (entry.cell.style.underline) try writer.writeAll("\x1b[4m");
+    if (entry.cell.style.reverse) try writer.writeAll("\x1b[7m");
 
     // ── UTF-8 (atomically committed or zero bytes per cell) ───────────────
     // Compose the full UTF-8 sequence in a stack buffer, then `writeAll`

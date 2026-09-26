@@ -311,7 +311,12 @@ test "diffAndEmit two adjacent changes emit two entries" {
 }
 
 test "diffAndEmit bold style emits bold SGR (\\x1b[1m) and reset (\\x1b[0m)" {
-    // style.bold=true → output contains "\x1b[1m" and ends with "\x1b[0m".
+    // style.bold=true → output starts with CUP, then a leading SGR reset
+    // (\x1b[0m — clears carry-over from prior cells), then the bold SGR
+    // (\x1b[1m), then the char, then the trailing reset (\x1b[0m). The
+    // leading reset is required for cumulative SGR correctness across
+    // cells (issue #54 — without it, a cell setting underline after a
+    // previous cell that set bold would render as bold+underline).
     var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
     var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
     current[0] = .{ .ch = 'B', .style = .{ .bold = true } };
@@ -325,10 +330,82 @@ test "diffAndEmit bold style emits bold SGR (\\x1b[1m) and reset (\\x1b[0m)" {
     try testing.expect(std.mem.indexOf(u8, actual, "\x1b[1m") != null);
     // Each entry ends with SGR reset.
     try testing.expect(std.mem.endsWith(u8, actual, "\x1b[0m"));
-    // Byte-exact: CUP "\x1b[1;1H" + bold "\x1b[1m" + "B" + reset "\x1b[0m"
+    // Byte-exact: CUP "\x1b[1;1H" + reset "\x1b[0m" + bold "\x1b[1m"
+    // + "B" + reset "\x1b[0m".
     try testing.expectEqualStrings(
-        "\x1b[1;1H\x1b[1m\x42\x1b[0m",
+        "\x1b[1;1H\x1b[0m\x1b[1m\x42\x1b[0m",
         actual,
+    );
+}
+
+test "diffAndEmit underline style emits SGR 4" {
+    // style.underline=true → leading reset + SGR 4 (\x1b[4m) + char + trailing reset.
+    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    current[0] = .{ .ch = 'U', .style = .{ .underline = true } };
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try diffAndEmit(&w, &prev, &current, 4, 1, CURSOR_SKIP, 0);
+
+    try testing.expectEqualStrings(
+        "\x1b[1;1H\x1b[0m\x1b[4m\x55\x1b[0m",
+        buf[0..w.end],
+    );
+}
+
+test "diffAndEmit reverse style emits SGR 7" {
+    // style.reverse=true → leading reset + SGR 7 (\x1b[7m) + char + trailing reset.
+    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    current[0] = .{ .ch = 'R', .style = .{ .reverse = true } };
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try diffAndEmit(&w, &prev, &current, 4, 1, CURSOR_SKIP, 0);
+
+    try testing.expectEqualStrings(
+        "\x1b[1;1H\x1b[0m\x1b[7m\x52\x1b[0m",
+        buf[0..w.end],
+    );
+}
+
+test "diffAndEmit combined bold + underline + reverse emits all three SGRs" {
+    // style.{bold, underline, reverse} all true → reset + SGR 1 + SGR 4 + SGR 7
+    // (sequential, terminal accumulates per ECMA-48 §SGR). Verifies the
+    // full Style surface emission order is stable.
+    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    current[0] = .{ .ch = 'X', .style = .{ .bold = true, .underline = true, .reverse = true } };
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try diffAndEmit(&w, &prev, &current, 4, 1, CURSOR_SKIP, 0);
+
+    try testing.expectEqualStrings(
+        "\x1b[1;1H\x1b[0m\x1b[1m\x1b[4m\x1b[7m\x58\x1b[0m",
+        buf[0..w.end],
+    );
+}
+
+test "diffAndEmit zero flags emits only the reset (no set SGRs)" {
+    // style={} → only leading reset + char + trailing reset (no flag SGRs).
+    // This is the most common case for body text cells.
+    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    current[0] = .{ .ch = 'z', .style = .{} };
+
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+
+    try diffAndEmit(&w, &prev, &current, 4, 1, CURSOR_SKIP, 0);
+
+    try testing.expectEqualStrings(
+        "\x1b[1;1H\x1b[0m\x7a\x1b[0m",
+        buf[0..w.end],
     );
 }
 
