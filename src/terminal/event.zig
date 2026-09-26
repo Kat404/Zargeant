@@ -209,14 +209,23 @@ pub const Parser = struct {
     /// successful `pushKittyKb` (mirrors `Lifecycle.kitty_flags_pushed`).
     /// T-R2.2 wires the actual dispatch gate; T-R2.3 wires the
     /// `setKittyActive` call from `tuiThreadInit`.
-    kitty_active: bool = false,
+    ///
+    /// Issue #53 (tech-debt review, obs#1791 §4): `std.atomic.Value(bool)`
+    /// instead of plain `bool` so the field is safe under concurrent
+    /// access if Parser is ever shared with a non-TUI thread (e.g. an
+    /// orchestrator-side ring buffer reader). Currently TUI-thread-only
+    /// (Lifecycle.parser is constructed in tuiThreadInit and consumed by
+    /// the TUI poll loop); the atomic is forward-looking defense in
+    /// depth. Mirrors the `Lifecycle.redraw_pending` pattern
+    /// (src/tui.zig:110) where the same reasoning applied.
+    kitty_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init() Parser {
         return .{
             .ring_buf = undefined,
             .ring_len = 0,
             .paste_active = false,
-            .kitty_active = false,
+            .kitty_active = std.atomic.Value(bool).init(false),
         };
     }
 
@@ -226,16 +235,22 @@ pub const Parser = struct {
     /// callers (the orchestrator) and tests both use this setter
     /// symmetrically — tests bypass the orchestrator and call
     /// `setKittyActive(true)` directly on their per-test Parser.
+    ///
+    /// Issue #53: `.store(.seq_cst)` instead of plain assignment — the
+    /// atomic field requires the explicit memory ordering.
     pub fn setKittyActive(self: *Parser, active: bool) void {
-        self.kitty_active = active;
+        self.kitty_active.store(active, .seq_cst);
     }
 
     /// R2 fix (T-R2.1, PR3): read the kitty-active gate. Returns the
     /// current value of `kitty_active`. The dispatcher's `final == 'u'`
     /// branch reads this BEFORE calling `parseKittyKb` so kitty kb
     /// events only surface when the terminal opted in.
+    ///
+    /// Issue #53: `.load(.seq_cst)` instead of plain read — the atomic
+    /// field requires the explicit memory ordering.
     pub fn kittyActive(self: *const Parser) bool {
-        return self.kitty_active;
+        return self.kitty_active.load(.seq_cst);
     }
 
     /// Refill the ring buffer by reading from `file` (non-blocking). Returns
@@ -654,7 +669,8 @@ pub const Parser = struct {
         // input), control falls through to the existing dispatch
         // logic which returns `.invalid`.
         if (final == 'u' and params.len > 0) {
-            if (!self.kitty_active) return .invalid;
+            // Issue #53: `.load(.seq_cst)` — field is std.atomic.Value(bool).
+            if (!self.kitty_active.load(.seq_cst)) return .invalid;
             if (parseKittyKb(params)) |key| {
                 return .{ .key = key };
             }
