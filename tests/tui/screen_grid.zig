@@ -1496,6 +1496,31 @@ test "WindowMock adapter forwards 10 methods (T-2.4.1)" {
     try testing.expect(@hasDecl(WindowMock, "init"));
 }
 
+// Issue #51 (tech-debt review, obs#1791 §1): byte-identity contract
+// between ScreenGrid.Cell and modal.Cell.
+//
+// WindowMock.init (src/modal.zig:142) @ptrCasts a `[]screen_grid.Cell`
+// slice to `[]modal.Cell` because Zig treats the structurally-identical
+// structs as distinct types. The cast is only sound if both structs are
+// byte-for-byte identical — same fields, same size, same alignment.
+// Any future divergence silently produces UB. The comptime block in
+// src/modal.zig enforces the invariant at compile time; this test
+// mirrors the assertion as a documented runtime contract so regressions
+// surface as test failures (the comptime block alone would only fail
+// modal.zig's compilation, not the test runner).
+test "issue #51: screen_grid.Cell and modal.Cell are byte-identical" {
+    // Field presence — both structs must expose `ch` and `style`.
+    try testing.expect(@hasField(Cell, "ch"));
+    try testing.expect(@hasField(Cell, "style"));
+    try testing.expect(@hasField(ModalCell, "ch"));
+    try testing.expect(@hasField(ModalCell, "style"));
+
+    // Byte-identity — the @ptrCast is only safe if size AND alignment
+    // match exactly. Drift in either field breaks the aliasing contract.
+    try testing.expectEqual(@sizeOf(Cell), @sizeOf(ModalCell));
+    try testing.expectEqual(@alignOf(Cell), @alignOf(ModalCell));
+}
+
 // Local helper: copy a literal into the inline message/err buffer.
 // Mirrors the shape of modal.copyInline but lives here so the test file
 // doesn't need to expose a pub fn for it.
