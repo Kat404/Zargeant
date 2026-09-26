@@ -735,7 +735,49 @@ fn toolsRealMain(args: *const ThreadArgs) void {
                         };
                     }
 
-                    _ = sub.wait() catch {};
+                    // Slice 7 / WU-3: inspect waitpid status. SIGSYS (= 31 on
+                    // Linux x86_64) is the signal seccomp uses to kill a
+                    // process that violated the BPF filter (REQ-TUI-012).
+                    // Distinguish sandbox violation from generic kill
+                    // (segfault, killed-by-signal, etc.) so the modal can
+                    // surface the right error kind.
+                    const wait_status = sub.wait() catch 0;
+                    if (classifySignal(wait_status) == .sigsys_sandbox) {
+                        args.channels.tools_to_tui.tryPut(args.io, .{
+                            .ToolError = .{
+                                .id = d.id,
+                                .kind = .sandbox_violation,
+                                .message = "subprocess killed by seccomp SIGSYS (BPF filter rejected a syscall)",
+                            },
+                        }) catch {};
+                    } else if ((wait_status & 0x7f) != 0) {
+                        // Generic signal kill (SIGSEGV, SIGKILL, etc.) —
+                        // surface as nonzero_exit with the signal number
+                        // for diagnostic purposes.
+                        const sig = wait_status & 0x7f;
+                        var sig_buf: [32]u8 = undefined;
+                        const sig_msg = std.fmt.bufPrint(&sig_buf, "subprocess killed by signal {d}", .{sig}) catch "subprocess killed by signal";
+                        args.channels.tools_to_tui.tryPut(args.io, .{
+                            .ToolError = .{
+                                .id = d.id,
+                                .kind = .nonzero_exit,
+                                .message = sig_msg,
+                            },
+                        }) catch {};
+                    } else if (((wait_status >> 8) & 0xff) != 0) {
+                        // Normal exit but with nonzero status — surface
+                        // so the modal can show the failure to the user.
+                        const code: u8 = @intCast((wait_status >> 8) & 0xff);
+                        var code_buf: [32]u8 = undefined;
+                        const code_msg = std.fmt.bufPrint(&code_buf, "subprocess exited with code {d}", .{code}) catch "subprocess exited nonzero";
+                        args.channels.tools_to_tui.tryPut(args.io, .{
+                            .ToolError = .{
+                                .id = d.id,
+                                .kind = .nonzero_exit,
+                                .message = code_msg,
+                            },
+                        }) catch {};
+                    }
                     sub.deinit();
 
                     args.channels.tools_to_tui.tryPut(args.io, .{
@@ -783,6 +825,36 @@ fn toolsRealMain(args: *const ThreadArgs) void {
 ///   parse_argv(allocator, "echo hello world") => ["echo", "hello", "world"]
 ///   parse_argv(allocator, "  tool  arg  ") => ["tool", "arg"]
 ///   parse_argv(allocator, "") => []
+/// Classify a raw `waitpid` status word into one of the categories the
+/// tools thread uses to decide what `ToolError.kind` (if any) to post.
+/// Slice 7 / WU-3 — sandbox_violation detection via SIGSYS classification.
+///
+/// The kernel encodes `waitpid` status as:
+///   - low 7 bits: signal that killed the child (0 if exited normally)
+///   - bits 8..15: exit code (only meaningful if low 7 bits == 0)
+///
+/// SIGSYS (= 31 on Linux x86_64) is the signal seccomp uses to kill a
+/// process that attempted a syscall rejected by the BPF filter — the
+/// canonical "sandbox violation" signal per REQ-TUI-012. Distinct from
+/// `SIGSEGV` (segfault, also in seccomp-allowed list) or `SIGKILL`
+/// (generic kill, not sandbox-related).
+const SubprocessExit = enum {
+    /// Child called `_exit()` (normal exit; check exit code via
+    /// `(status >> 8) & 0xff`).
+    exited,
+    /// Child killed by signal other than SIGSYS.
+    signaled_other,
+    /// Child killed by SIGSYS — sandbox violation.
+    sigsys_sandbox,
+};
+
+fn classifySignal(status: u32) SubprocessExit {
+    const sig = status & 0x7f;
+    if (sig == 0) return .exited;
+    if (sig == 31) return .sigsys_sandbox;
+    return .signaled_other;
+}
+
 fn parse_argv(allocator: std.mem.Allocator, args: []const u8) ![]const []const u8 {
     // Upper bound: every char + tool name could be its own arg + 1 for safety.
     var argv_storage = try allocator.alloc([]const u8, args.len + 1);
@@ -1118,4 +1190,40 @@ test "parse_argv: all-whitespace input returns empty slice" {
     const result = try parse_argv(testing.allocator, "    \t  \n  ");
     defer testing.allocator.free(result);
     try testing.expectEqual(@as(usize, 0), result.len);
+}
+
+// =============================================================================
+// Subprocess exit classification (Slice 7 / WU-3)
+// =============================================================================
+
+test "classifySignal: zero status (normal _exit(0)) is exited" {
+    // waitpid(2) sets low 7 bits = 0 when child called _exit().
+    // Exit code 0 is in bits 8..15.
+    const status: u32 = 0;
+    try testing.expectEqual(SubprocessExit.exited, SubprocessExit.classifySignal(status));
+}
+
+test "classifySignal: nonzero exit status is still exited" {
+    // _exit(42) → status = (42 << 8) = 0x2A00 = 10752. Low 7 bits == 0 → exited.
+    const status: u32 = @as(u32, 42) << 8;
+    try testing.expectEqual(SubprocessExit.exited, SubprocessExit.classifySignal(status));
+}
+
+test "classifySignal: SIGSYS (31) is sigsys_sandbox" {
+    // seccomp kills with SIGSYS when BPF filter rejects a syscall.
+    // SIGSYS == 31 on Linux x86_64. WTERMSIG = status & 0x7f.
+    const status: u32 = 31;
+    try testing.expectEqual(SubprocessExit.sigsys_sandbox, SubprocessExit.classifySignal(status));
+}
+
+test "classifySignal: SIGSEGV (11) is signaled_other (not sandbox)" {
+    // SIGSEGV == 11. Segfault ≠ seccomp violation → signaled_other.
+    const status: u32 = 11;
+    try testing.expectEqual(SubprocessExit.signaled_other, SubprocessExit.classifySignal(status));
+}
+
+test "classifySignal: SIGKILL (9) is signaled_other" {
+    // SIGKILL == 9. Generic kill, not sandbox-related.
+    const status: u32 = 9;
+    try testing.expectEqual(SubprocessExit.signaled_other, SubprocessExit.classifySignal(status));
 }
