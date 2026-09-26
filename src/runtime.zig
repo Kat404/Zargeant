@@ -685,6 +685,45 @@ fn toolsRealMain(args: *const ThreadArgs) void {
     }
 }
 
+/// Parse a command-line string into argv-style slice of null-terminated
+/// string slices. Caller owns the returned memory: must free each
+/// element via `allocator.free(elem)` AND the outer slice via
+/// `allocator.free(argv)`.
+///
+/// Whitespace split (matches shells without quoting). Empty input
+/// returns an empty slice. Quoted args are NOT supported in v1 (matches
+/// the v1 toolsRealMain contract per slice 7 ODD plan).
+///
+/// Used by `toolsRealMain` to build `argv` for `spawnToolSubprocess`.
+/// TDD source (WU-1 / slice 7 PR1): the tests live below in the file's
+/// test section.
+///
+/// Examples:
+///   parse_argv(allocator, "echo") => ["echo"]
+///   parse_argv(allocator, "echo hello world") => ["echo", "hello", "world"]
+///   parse_argv(allocator, "  tool  arg  ") => ["tool", "arg"]
+///   parse_argv(allocator, "") => []
+fn parse_argv(allocator: std.mem.Allocator, args: []const u8) ![]const []const u8 {
+    // Upper bound: every char + tool name could be its own arg + 1 for safety.
+    var argv_storage = try allocator.alloc([]const u8, args.len + 1);
+    var argc: usize = 0;
+    var i: usize = 0;
+    while (i < args.len) {
+        // Skip leading whitespace
+        while (i < args.len and (args[i] == ' ' or args[i] == '\t' or args[i] == '\n')) : (i += 1) {}
+        if (i >= args.len) break;
+        const start = i;
+        while (i < args.len and args[i] != ' ' and args[i] != '\t' and args[i] != '\n') : (i += 1) {}
+        const end = i;
+        // Tiger Style §6: explicit allocation; failure modes are
+        // `OutOfMemory` propagated via `?` to the caller (which can
+        // post ToolError.spawn_failed).
+        argv_storage[argc] = try allocator.dupe(u8, args[start..end]);
+        argc += 1;
+    }
+    return argv_storage[0..argc];
+}
+
 // =============================================================================
 // Tests (R-PR 1 baseline + R-PR 4 additions)
 // =============================================================================
@@ -937,4 +976,66 @@ test "cancel_pipe wakes poll() when write end closes" {
     const events = std.os.linux.poll(&pollfd, 1, 100);
     try testing.expect(events > 0);
     try testing.expect((pollfd[0].revents & std.os.linux.POLL.IN) != 0);
+}
+
+// =============================================================================
+// Tool subprocess pool tests (Slice 7 / WU-1)
+// =============================================================================
+
+test "parse_argv: single token returns single-element slice" {
+    const result = try parse_argv(testing.allocator, "tool");
+    defer {
+        for (result) |arg| testing.allocator.free(arg);
+        testing.allocator.free(result);
+    }
+    try testing.expectEqual(@as(usize, 1), result.len);
+    try testing.expectEqualSlices(u8, "tool", result[0]);
+}
+
+test "parse_argv: multiple tokens split on whitespace" {
+    const result = try parse_argv(testing.allocator, "tool arg1 arg2 arg3");
+    defer {
+        for (result) |arg| testing.allocator.free(arg);
+        testing.allocator.free(result);
+    }
+    try testing.expectEqual(@as(usize, 4), result.len);
+    try testing.expectEqualSlices(u8, "tool", result[0]);
+    try testing.expectEqualSlices(u8, "arg1", result[1]);
+    try testing.expectEqualSlices(u8, "arg2", result[2]);
+    try testing.expectEqualSlices(u8, "arg3", result[3]);
+}
+
+test "parse_argv: leading and trailing whitespace skipped" {
+    const result = try parse_argv(testing.allocator, "  tool  arg  ");
+    defer {
+        for (result) |arg| testing.allocator.free(arg);
+        testing.allocator.free(result);
+    }
+    try testing.expectEqual(@as(usize, 2), result.len);
+    try testing.expectEqualSlices(u8, "tool", result[0]);
+    try testing.expectEqualSlices(u8, "arg", result[1]);
+}
+
+test "parse_argv: tabs and newlines also count as whitespace" {
+    const result = try parse_argv(testing.allocator, "tool\targ1\narg2");
+    defer {
+        for (result) |arg| testing.allocator.free(arg);
+        testing.allocator.free(result);
+    }
+    try testing.expectEqual(@as(usize, 3), result.len);
+    try testing.expectEqualSlices(u8, "tool", result[0]);
+    try testing.expectEqualSlices(u8, "arg1", result[1]);
+    try testing.expectEqualSlices(u8, "arg2", result[2]);
+}
+
+test "parse_argv: empty input returns empty slice" {
+    const result = try parse_argv(testing.allocator, "");
+    defer testing.allocator.free(result);
+    try testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "parse_argv: all-whitespace input returns empty slice" {
+    const result = try parse_argv(testing.allocator, "    \t  \n  ");
+    defer testing.allocator.free(result);
+    try testing.expectEqual(@as(usize, 0), result.len);
 }
