@@ -243,3 +243,31 @@ The `ci*` recipes wrap [`tools/local-ci.sh`](./tools/local-ci.sh), which orchest
 
 Prefer a new recipe in [`justfile`](./justfile) over memorizing a long raw command. Keep the recipe name + one-line description as the discoverable surface; if a recipe has non-obvious behavior (timeouts, env vars, workarounds), add a short comment block immediately above it.
 
+---
+
+## 10. Pre-Merge QA Gate Ordering (Learn from history)
+
+**Rule**: Run QA gates in this order before any merge to `main` or release:
+
+1. **Builds** — `just build` + `just build-safe` + `just build-fast` (must all succeed)
+2. **Check** — `just check` (QA 0..5 static guards: fmt, syscalls, TDD, co-author)
+3. **test-all** — `just test-all` (umbrella test targets + embedded workaround)
+4. **verify** — `just verify` (3-mode compile + comprehensive QA gamut)
+5. **ci** — `just ci` (independent Podman Alpine + Zig 0.16.0 verification)
+
+**Rationale (learned the hard way — see obs#1788 session closure + Phase 2 blocker)**:
+
+- **Builds FIRST**: A green test suite + clean static guards + passing CI means nothing if the production binary doesn't compile. Without a buildable binary there is no software to ship. Tests build into separate `test-*` targets with their own module wiring; they do **not** validate the production binary's module graph. The build gate is the only one that proves the artifact exists and runs.
+- **Check second**: Cheap (~1 sec), no compile, runs after build to catch style/architecture issues on already-compiled artifacts. Independent of test results.
+- **test-all third**: Exercises the built binary's behavior on the host. Depends on build artifacts being present in `.zig-cache`.
+- **verify fourth**: 3-mode compile + comprehensive QA gamut. Includes its own test runs, so placing it after `test-all` gives a fail-fast signal before paying the 3-mode compile cost.
+- **ci LAST**: Independent verification via Podman container (different env, clean cache). Slowest (~5–7 min) but most authoritative — only env-isolated check.
+
+**Forbidden shortcuts**:
+
+- ❌ **Skip builds and rely on tests passing** — tests build into separate `test-*` targets with isolated module wiring. A bug like `exe_mod` missing an `addImport` for a new module passes every test target yet the production binary fails to compile. Phase 2 (slices 1–4) shipped with this exact gap; the bug was caught only because the user asked for a pre-merge `just build` gate.
+- ❌ **Skip ci and merge based on local Podman only** — `just ci` is the only independent verification (different container, different cache state, different mount). Local results do not prove the artifact builds in a clean environment.
+- ❌ **Skip verify because ci already passed** — `verify` includes 3-mode compile (Debug + ReleaseSafe + ReleaseFast). Optimization-specific bugs only surface in `ReleaseSafe`/`ReleaseFast`. `ci` skips these (see `tools/local-ci.sh` `--skip-build` flag).
+
+**Embedded tests caveat**: Per §9.2, `just test-embedded` is best-effort due to Zig 0.16 `std.zig.Server` `--listen=-` IPC hang. Embedded test results may be incomplete on local runs; defer to GitHub Actions when CI minutes return.
+

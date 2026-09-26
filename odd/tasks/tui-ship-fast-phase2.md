@@ -162,6 +162,12 @@ just run-mock                  # manual TUI smoke test
 | T-2.3.2 | `93a85ec` (RED) + `bca7639` (GREEN) | `just test-tui-screen-grid` | 27/27 PASS | ✅ DONE |
 | T-2.3.3 | `ac32567` (RED) + `<green>` (this WU) | `just test-tui-screen-grid` | 28/28 PASS | ✅ DONE |
 | T-2.4.1 | `9db7f6d` (RED) + `<green>` (this WU) | `just test-tui-screen-grid` + `just test-runtime-thread` | 29/29 + 69/69 PASS | ✅ DONE |
+| T-2.5.1 | `<this WU>` (combined RED+GREEN) | `just test-runtime-thread` | 78/78 PASS (69 prior + 9 new T-2.5.1 tests) | ✅ DONE |
+| T-2.5.2 | `<this WU>` (T-2.5.1 carried the impl; this commit adds 2 RED tests) | `just test-runtime-thread` | 80/80 PASS (78 prior + 2 new T-2.5.2 tests) | ✅ DONE |
+| T-R5.1 | `897ec08` (RED) + `43f684a` (GREEN) | `zig ast-check src/modal.zig` + standalone test | 2/2 T-R5.1 tests PASS | ✅ DONE |
+| T-R5.2 | `ed6b663` (RED) + `2f43847` (GREEN) | `test-tui-runtime-thread` + `test-cancel-path` | 98/98 + 4/4 PASS + 2/2 new T-R5.2 tests | ✅ DONE |
+| T-R5.3 | `bd973fd` (RED) + `9620fbd` (GREEN) | standalone `test_green.zig` simulation | 2/2 T-R5.3 tests PASS + pre-call poll observable | ✅ DONE |
+| T-R5.4 | `6c08608` (RED) + `<this WU>` (GREEN) | `test-cancel-path` + `test-cancel-e2e` | 6/6 (4 prior + 2 new) + 3/3 (2 prior + 1 new) PASS | ✅ DONE |
 
 ## Progress
 
@@ -172,15 +178,15 @@ just run-mock                  # manual TUI smoke test
 - [x] T-2.3.2 render*ToGrid (4 more) — **DONE** (`93a85ec` RED + `bca7639` GREEN)
 - [x] T-2.3.3 renderToGrid dispatcher — **DONE** (`ac32567` RED + `<green>` GREEN)
 - [x] T-2.4.1 WindowMock adapter — **DONE** (`9db7f6d` RED + `<green>` GREEN)
-- [ ] T-2.5.1 Lifecycle fields
-- [ ] T-2.5.2 tuiRealMain grids alloc
-- [ ] T-2.6.1 submitFrame orchestrator
-- [ ] T-2.6.2 tuiThreadLoop calls submitFrame
-- [ ] T-2.6.3 Dead-pty detector
-- [ ] T-R2.1 Parser.kitty_active field
-- [ ] T-R2.2 parseKittyKb gate
-- [ ] T-R2.3 tuiThreadInit wires setKittyActive
-- [ ] T-R5.1 LoadCtx.cancel_pipe field
-- [ ] T-R5.2 submitUnlockAsync takes cancel_pipe
-- [ ] T-R5.3 runLoadWorker polls cancel_pipe
-- [ ] T-R5.4 handleKeyInput threads cancel_pipe
+- [x] T-2.5.1 Lifecycle fields — **DONE** (RED + GREEN combined; see test counts above)
+- [x] T-2.5.2 tuiRealMain grids alloc — **DONE** (grid-init verification tests land here; the actual `tuiThreadInit` + stub-`Lifecycle` grid init was already in the T-2.5.1 commit because adding the `grids` field without initializing it would not compile)
+- [x] T-2.6.1 submitFrame orchestrator — **DONE** (`0b07620` RED + `2ad1eb9` GREEN; `modal.cursorIntentFromState` pub fn + `tui.submitFrame` orchestrator; 9 new tests in `tests/tui/runtime_thread.zig`; `lib_mod.addImport("diff_emit", diff_emit_mod)` wired at `build.zig`)
+- [x] T-2.6.2 tuiThreadLoop calls submitFrame — **DONE** (`bab6c5a` RED + `d977370` GREEN; inline render+emit block replaced with `submitFrame(...)` + `catch continue` per D1-a; `Lifecycle.prev_snapshot` removed (T-2.5.1 deprecation completes); `tuiRealMain` no longer allocates/frees the prev frame; W4-1 + W1-2/W1-3 + T-SG-7 tests updated)
+- [x] T-2.6.3 Dead-pty detector — **DONE** (`eaaa628` RED + `5112b24` GREEN; `writer.flush()` probe at top of `tuiThreadShutdown`; `if (pty_alive)` guard around the teardown writes; `setCurrentParser(null)` runs unconditionally)
+- [x] T-R2.1 Parser.kitty_active field — **DONE** (`45ef4ab` RED + `324fed9` GREEN; `Parser.kitty_active: bool = false` field + `setKittyActive` + `kittyActive` accessors in src/terminal/event.zig; 3 RED tests in tests/terminal/kitty_active.zig)
+- [x] T-R2.2 parseKittyKb gate — **DONE** (`db9d2aa` RED + `b65c92c` GREEN; `if (!self.kitty_active) return .invalid` guard in dispatchCsi before parseKittyKb call; 6 gate-truth-table RED tests in tests/terminal/kitty_active.zig; 15 existing event_kitty tests patched to call `parser.setKittyActive(true)`)
+- [x] T-R2.3 tuiThreadInit wires setKittyActive — **DONE** (`cd85833` RED + `38cd8a3` GREEN; `lc.kitty_active = lc.kitty_flags_pushed; lc.parser.setKittyActive(lc.kitty_active); lc.cancel_pipe = null;` added at end of tuiThreadInit; 3 static-grep RED tests in tests/tui/runtime_thread.zig)
+- [x] T-R5.1 LoadCtx.cancel_pipe field — **DONE** (`897ec08` RED + `43f684a` GREEN; `cancel_pipe: ?[2]i32 = null` field added to LoadCtx at src/modal.zig:843 mirroring ValidateCtx shape; 2 RED tests at src/modal.zig:2589+2610 use `@hasField` + comptime `typeInfo` reflection (Zig 0.16 rejects `@TypeOf(Ctx.field)` on default-value fields))
+- [x] T-R5.2 submitUnlockAsync takes cancel_pipe — **DONE** (`ed6b663` RED + `2f43847` GREEN; signature gains `cancel_pipe: ?[2]i32` as 4th arg; src/modal.zig:1119 populates `LoadCtx.cancel_pipe`; 3 callers updated — src/tui.zig:1097 (handleKeyInput), src/modal.zig:2468 (CAP-04 test), src/modal.zig:2512 (CAP-08 test); 2 RED tests at src/modal.zig:2628+2685 assert null + non-null both compile)
+- [x] T-R5.3 runLoadWorker polls cancel_pipe — **DONE** (`bd973fd` RED + `9620fbd` GREEN; `poll(@ptrCast(&pfds[0]), 1, 0)` pre-call check inside runLoadWorker at src/modal.zig:1186-1218; readable & POLL.IN set → post `ValidateApiReply{success=false, err="Cancelled"}` + early return; 2 RED tests at src/modal.zig:2740+2854 hermetic with std.os.linux.pipe)
+- [x] T-R5.4 handleKeyInput threads cancel_pipe — **DONE** (`6c08608` RED + `<this WU>` GREEN; threading completed in T-R5.2 GREEN (src/tui.zig:1097); static-grep guards added to tests/tui/cancel_path.zig:163+261 — verifies the .unlock_prompt + .enter branch calls submitUnlockAsync with the `cancel_pipe` identifier (not null) and the parameter declaration is BEFORE the call site; behavioral extension at tests/cancel_e2e.zig:255 — env-gated 100ms pre-call poll observability (REQ-NEW-006 invariant))

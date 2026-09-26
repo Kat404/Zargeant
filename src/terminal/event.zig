@@ -198,12 +198,44 @@ pub const Parser = struct {
     /// paste-active short-circuit and dispatchCsi branches.
     paste_active: bool = false,
 
+    /// R2 fix (T-R2.1, PR3): when true, the dispatcher routes
+    /// `CSI ... u` sequences through `parseKittyKb`. When false, the
+    /// same bytes return `.invalid` (the terminal did not push kitty kb
+    /// flags, so any `u`-terminated CSI is not a kitty kb event — likely
+    /// a literal shift+u or a non-kitty terminal extension).
+    ///
+    /// The field defaults to false so the dispatcher stays conservative
+    /// for untrusted terminals. `tuiThreadInit` flips it to true after a
+    /// successful `pushKittyKb` (mirrors `Lifecycle.kitty_flags_pushed`).
+    /// T-R2.2 wires the actual dispatch gate; T-R2.3 wires the
+    /// `setKittyActive` call from `tuiThreadInit`.
+    kitty_active: bool = false,
+
     pub fn init() Parser {
         return .{
             .ring_buf = undefined,
             .ring_len = 0,
             .paste_active = false,
+            .kitty_active = false,
         };
+    }
+
+    /// R2 fix (T-R2.1, PR3): set the kitty-active gate. Called by
+    /// `tuiThreadInit` after `pushKittyKb` succeeds; the gate stays
+    /// false for terminals that did not opt in to kitty kb. Production
+    /// callers (the orchestrator) and tests both use this setter
+    /// symmetrically — tests bypass the orchestrator and call
+    /// `setKittyActive(true)` directly on their per-test Parser.
+    pub fn setKittyActive(self: *Parser, active: bool) void {
+        self.kitty_active = active;
+    }
+
+    /// R2 fix (T-R2.1, PR3): read the kitty-active gate. Returns the
+    /// current value of `kitty_active`. The dispatcher's `final == 'u'`
+    /// branch reads this BEFORE calling `parseKittyKb` so kitty kb
+    /// events only surface when the terminal opted in.
+    pub fn kittyActive(self: *const Parser) bool {
+        return self.kitty_active;
     }
 
     /// Refill the ring buffer by reading from `file` (non-blocking). Returns
@@ -601,13 +633,28 @@ pub const Parser = struct {
         // emits a CSI ... u sequence, parse it as a modified key event with
         // press/repeat/release distinction + shift/alt/ctrl/super modifiers.
         //
-        // For PR 4 we assume kitty kb mode is ACTIVE for every `u` sequence
-        // (the caller-side `lifecycle.kitty_flags_pushed` gate lands in PR 6
-        // per the apply prompt's PR 6 caller check). The push format
-        // `CSI > N u` is rejected inside parseKittyKb (params[0] == '>').
-        // If parseKittyKb returns null (malformed input), control falls
-        // through to the existing dispatch logic which returns `.invalid`.
+        // PR3 R2 fix (T-R2.2): gate the kitty kb parse on
+        // `self.kitty_active`. The terminal only opts in to kitty kb
+        // events after a successful `CSI > 1 u` push
+        // (Lifecycle.kitty_flags_pushed mirrors this). Without the
+        // gate, any terminal emitting `CSI ... u` for non-kitty
+        // reasons (literal shift+u bindings, non-kitty CSI extensions)
+        // would surface a phantom kitty kb event. With the gate, the
+        // same bytes return `.invalid` so downstream consumers don't
+        // see a fake `.key` event.
+        //
+        // The gate sits BEFORE `parseKittyKb` (not inside it) so the
+        // Phase 0.4 functional-codepoint mapping (9→tab, 13→enter,
+        // 27→esc, 127→backspace) is preserved when the gate is open.
+        // Per ODD risk §4: gate placement inside parseKittyKb would
+        // regress the codepoint mapping. See T-R2.2.4 RED test.
+        //
+        // The push format `CSI > N u` is rejected inside parseKittyKb
+        // (params[0] == '>'). If parseKittyKb returns null (malformed
+        // input), control falls through to the existing dispatch
+        // logic which returns `.invalid`.
         if (final == 'u' and params.len > 0) {
+            if (!self.kitty_active) return .invalid;
             if (parseKittyKb(params)) |key| {
                 return .{ .key = key };
             }

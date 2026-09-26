@@ -25,6 +25,17 @@
 //!
 //! Strict TDD (CONTRIBUTING.md:7): tests authored alongside the WU 4.1 parser
 //! additions in src/terminal/event.zig in the same commit.
+//!
+//! PR3 R2 fix (T-R2.2): every test that exercises a `u`-terminated CSI
+//! sequence calls `parser.setKittyActive(true)` after `Parser.init()` so
+//! the dispatcher's gate (added in T-R2.2 RED) routes the bytes through
+//! `parseKittyKb`. Without the gate, the bytes return `.invalid` —
+//! the conservative behavior for untrusted terminals that didn't push
+//! kitty kb. The 2 tests that exercise non-kitty `u` sequences (CSI
+//! 97;1v returning .invalid + CSI > 1 u push format returning .invalid)
+//! also call setKittyActive(true) for symmetry — neither test depends
+//! on the gate (the `v` test hits a different dispatch branch; the
+//! `>1u` push is rejected inside parseKittyKb itself).
 
 const std = @import("std");
 const testing = std.testing;
@@ -40,6 +51,7 @@ const event = @import("event");
 
 test "kitty kb: CSI 97;1u decodes to .key press with shift modifier" {
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     // CSI 97 ; 1 u  (plain 'a' press with shift held)
     parser.feedBytes("\x1b[97;1u");
     const ev = parser.decode();
@@ -60,6 +72,7 @@ test "kitty kb: CSI 97;1u decodes to .key press with shift modifier" {
 
 test "kitty kb: CSI 97;1:u decodes to .key repeat with shift modifier" {
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[97;1:u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
@@ -78,6 +91,7 @@ test "kitty kb: CSI 97;1:u decodes to .key repeat with shift modifier" {
 
 test "kitty kb: CSI 97;1:;u decodes to .key release with shift modifier" {
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[97;1:;u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
@@ -96,6 +110,7 @@ test "kitty kb: CSI 97;1:;u decodes to .key release with shift modifier" {
 
 test "kitty kb: CSI 65;5u decodes shift+ctrl modifier bitmask" {
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[65;5u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
@@ -116,6 +131,7 @@ test "kitty kb: CSI 65;5u decodes shift+ctrl modifier bitmask" {
 
 test "kitty kb: CSI 99:67;4u uses base codepoint (not shifted variant)" {
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[99:67;4u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
@@ -133,6 +149,7 @@ test "kitty kb: CSI 99:67;4u uses base codepoint (not shifted variant)" {
 
 test "kitty kb: CSI 97;1v returns .invalid (not a kitty kb final byte)" {
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[97;1v");
     const ev = parser.decode();
     try testing.expect(ev == .invalid);
@@ -148,6 +165,7 @@ test "kitty kb: CSI 97;1v returns .invalid (not a kitty kb final byte)" {
 
 test "kitty kb: CSI > 1 u (push format) returns .invalid" {
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[>1u");
     const ev = parser.decode();
     try testing.expect(ev == .invalid);
@@ -162,6 +180,7 @@ test "kitty kb: CSI > 1 u (push format) returns .invalid" {
 
 test "kitty kb: CSI 97;0u decodes to .key press with no modifiers" {
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[97;0u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
@@ -182,6 +201,7 @@ test "kitty kb: CSI 97;0u decodes to .key press with no modifiers" {
 
 test "kitty kb: CSI 97;4u decodes ctrl-only modifier (bit 4)" {
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[97;4u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
@@ -201,6 +221,7 @@ test "kitty kb: CSI 97;4u decodes ctrl-only modifier (bit 4)" {
 
 test "kitty kb: CSI 97;8u decodes super-only modifier (bit 8)" {
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[97;8u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
@@ -241,6 +262,7 @@ test "parseKittyKb: CSI 13 u maps 13 (CR) to .enter (Bugs 2, 5)" {
     // ASCII CR byte (0x0D = 13). Pre-fix this returned `.char(13)`; after
     // fix it returns `Key{ .code = .enter }`.
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[13u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
@@ -255,6 +277,7 @@ test "parseKittyKb: CSI 127 u maps 127 (DEL) to .backspace (Bugs 2, 5)" {
     // ASCII DEL byte (0x7F = 127). Pre-fix this returned `.char(127)`;
     // after fix it returns `Key{ .code = .backspace }`.
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[127u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
@@ -274,6 +297,7 @@ test "parseKittyKb: CSI 127;1: u maps 127 + shift + repeat to .backspace (Bugs 2
     // the modifier segment (not `:2` — that's the explicit form, out
     // of scope for PR 4).
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[127;1:u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
@@ -291,6 +315,7 @@ test "parseKittyKb: CSI 13;1 u maps 13 + no real modifier to .enter with no mods
     // confirm the modifier bitmask=1 case still surfaces .enter without
     // applying shift to the .enter key).
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[13;1u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
@@ -303,6 +328,7 @@ test "parseKittyKb: CSI 27 u maps 27 (ESC) to .esc (Bugs 2, 5)" {
     // ESC byte (0x1B = 27). Pre-fix this returned `.char(27)`; after fix
     // it returns `Key{ .code = .esc }`.
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[27u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
@@ -315,6 +341,7 @@ test "parseKittyKb: CSI 9 u maps 9 (TAB) to .tab (Bugs 2, 5)" {
     // byte (0x09 = 9). Pre-fix this returned `.char(9)`; after fix it
     // returns `Key{ .code = .tab }`.
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[9u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
@@ -328,6 +355,7 @@ test "parseKittyKb: printable codepoint stays .char (regression guard)" {
     // `Key{ .code = .char(97) }` — only the four functional codepoints
     // (9, 13, 27, 127) are mapped; everything else stays as .char.
     var parser = event.Parser.init();
+    parser.setKittyActive(true);
     parser.feedBytes("\x1b[97u");
     const ev = parser.decode();
     try testing.expect(ev == .key);
