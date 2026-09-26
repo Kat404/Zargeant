@@ -632,21 +632,64 @@ fn toolsRealMain(args: *const ThreadArgs) void {
         if (args.channels.tui_to_tools.tryGet(args.io)) |event| {
             switch (event) {
                 .DispatchToolRequest => |d| {
-                    // d.args is a single command-line string (per
-                    // channels.zig UserToolArgs) — not a slice. We
-                    // pass only the tool name as argv[0] for v1; the
-                    // Agent thread will eventually supply proper argv
-                    // splitting (R-PR 5 follow-up).
-                    const argv = [_][]const u8{d.name};
+                    // Slice 7 / WU-1: parse the full command line (name + args)
+                    // into argv via parse_argv. Caller owns argv + each element.
+                    // Allocations are fallible; on failure we post a
+                    // spawn_failed ToolError and skip (same pattern as the
+                    // existing spawn failure path below).
+                    const command_line = if (d.args.len > 0)
+                        std.fmt.allocPrint(args.allocator, "{s} {s}", .{ d.name, d.args }) catch |err| {
+                            var buf: [64]u8 = undefined;
+                            const msg = std.fmt.bufPrint(&buf, "args alloc failed: {s}", .{@errorName(err)}) catch "args alloc failed";
+                            args.channels.tools_to_tui.tryPut(args.io, .{
+                                .ToolError = .{
+                                    .id = d.id,
+                                    .kind = .spawn_failed,
+                                    .message = msg,
+                                },
+                            }) catch {};
+                            continue;
+                        }
+                    else
+                        args.allocator.dupe(u8, d.name) catch |err| {
+                            var buf: [64]u8 = undefined;
+                            const msg = std.fmt.bufPrint(&buf, "name alloc failed: {s}", .{@errorName(err)}) catch "name alloc failed";
+                            args.channels.tools_to_tui.tryPut(args.io, .{
+                                .ToolError = .{
+                                    .id = d.id,
+                                    .kind = .spawn_failed,
+                                    .message = msg,
+                                },
+                            }) catch {};
+                            continue;
+                        };
+                    defer args.allocator.free(command_line);
+
+                    const argv = parse_argv(args.allocator, command_line) catch |err| {
+                        var buf: [64]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&buf, "argv parse failed: {s}", .{@errorName(err)}) catch "argv parse failed";
+                        args.channels.tools_to_tui.tryPut(args.io, .{
+                            .ToolError = .{
+                                .id = d.id,
+                                .kind = .spawn_failed,
+                                .message = msg,
+                            },
+                        }) catch {};
+                        continue;
+                    };
+                    defer {
+                        for (argv) |arg| args.allocator.free(arg);
+                        args.allocator.free(argv);
+                    }
 
                     // envp: empty slice — child receives NO environment
                     // (REQ-TUI-011 scenario 1).
                     const envp = &[_][*:0]const u8{};
 
                     var sub = sandbox.Sandbox.spawnToolSubprocess(
-                        std.heap.page_allocator,
+                        args.allocator,
                         TOOLS_PROFILE,
-                        &argv,
+                        argv,
                         envp,
                         null,
                     ) catch |err| {
@@ -662,8 +705,45 @@ fn toolsRealMain(args: *const ThreadArgs) void {
                         }) catch {};
                         continue;
                     };
+
+                    // Slice 7 / WU-2: read captured stdout from the pipe until
+                    // EOF (child exit). Linux pipe buffer is 64 KiB — for the
+                    // typical tool output (< 64 KiB) this fits in one read;
+                    // for larger outputs we loop. Blocking read is fine here
+                    // because the child will eventually exit and close the pipe.
+                    var captured: std.ArrayList(u8) = .empty;
+                    defer captured.deinit(args.allocator);
+                    var read_buf: [4096]u8 = undefined;
+                    while (true) {
+                        // Zig 0.16 std.os.linux.read returns usize; -1 on error
+                        // (with errno set). Per the project pattern in src/logger.zig
+                        // and src/mock_server.zig, detect EOF via n == 0 and
+                        // error via n > 0x7ffff000 (sign bit set in 32-bit ssize_t).
+                        const n_signed: isize = @bitCast(std.os.linux.read(
+                            sub.stdout_fd,
+                            &read_buf,
+                            read_buf.len,
+                        ));
+                        if (n_signed == 0) break; // EOF
+                        if (n_signed < 0) {
+                            logger.global().log(args.io, .warn, "stdout read failed") catch {};
+                            break;
+                        }
+                        captured.appendSlice(args.allocator, read_buf[0..@intCast(n_signed)]) catch {
+                            logger.global().log(args.io, .warn, "stdout capture OOM") catch {};
+                            break;
+                        };
+                    }
+
                     _ = sub.wait() catch {};
                     sub.deinit();
+
+                    args.channels.tools_to_tui.tryPut(args.io, .{
+                        .ToolResult = .{
+                            .id = d.id,
+                            .output = captured.items,
+                        },
+                    }) catch {};
                 },
                 .CancelTool => |id| {
                     // Cancellation arrives via the shared cancel_pipe —

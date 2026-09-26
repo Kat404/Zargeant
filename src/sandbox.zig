@@ -618,12 +618,22 @@ const tool_bpf_prog = blk: {
 pub const ToolSubprocess = struct {
     pid: i32,
     landlock_fd: i32,
+    /// Read end of a `pipe(2)` that captures the child's stdout. Parent
+    /// reads from this fd until EOF (child exit). `-1` if stdout capture
+    /// was not requested / not available (legacy callers that ignore
+    /// capture will see `-1`). WU-2 slice 7: always pipe stdout so
+    /// `toolsRealMain` can post captured output in `ToolResult.output`.
+    stdout_fd: i32 = -1,
 
-    /// Close the inherited landlock fd. Idempotent.
+    /// Close the inherited landlock fd + stdout pipe read end. Idempotent.
     pub fn deinit(self: *ToolSubprocess) void {
         if (self.landlock_fd >= 0) {
             _ = std.os.linux.close(self.landlock_fd);
             self.landlock_fd = -1;
+        }
+        if (self.stdout_fd >= 0) {
+            _ = std.os.linux.close(self.stdout_fd);
+            self.stdout_fd = -1;
         }
     }
 
@@ -691,6 +701,20 @@ pub const Sandbox = struct {
     ) !ToolSubprocess {
         _ = cwd;
 
+        // WU-2 slice 7: pipe stdout so the parent can capture the
+        // child's output for `ToolResult`. `pipe(2)` returns
+        // [read_end, write_end]. Parent keeps the read end; child gets
+        // the write end dup2'd to fd 1 before execve.
+        var stdout_pipe: [2]i32 = .{ -1, -1 };
+        if (std.os.linux.pipe(&stdout_pipe) != 0) {
+            return error.PipeFailed;
+        }
+        errdefer {
+            // Fork hasn't happened yet on the failure path; close both.
+            if (stdout_pipe[0] >= 0) _ = std.os.linux.close(stdout_pipe[0]);
+            if (stdout_pipe[1] >= 0) _ = std.os.linux.close(stdout_pipe[1]);
+        }
+
         // Fork FIRST. Landlock rulesets can only be applied by the thread
         // that created them (landlock_restrict_self returns EPERM otherwise);
         // building the ruleset in the parent and inheriting via fork()
@@ -703,6 +727,16 @@ pub const Sandbox = struct {
 
         if (pid == 0) {
             // CHILD: build ruleset, apply Landlock, apply Seccomp, exec.
+
+            // 0. Redirect stdout to the pipe (WU-2 slice 7). Must happen
+            //    BEFORE close_range so we don't close the pipe write end
+            //    (it's still in fd 3 since pipe() returns the lowest free
+            //    fds). dup2 replaces fd 1 (stdout); close the original
+            //    write end (parent closes its copy via the returned struct).
+            //    Keep stdin (fd 0) and stderr (fd 2) untouched.
+            _ = std.os.linux.dup2(stdout_pipe[1], 1);
+            _ = std.os.linux.close(stdout_pipe[1]);
+            _ = std.os.linux.close(stdout_pipe[0]);
 
             // 1. Build Landlock ruleset in this thread (must be same thread
             //    as the restrict_self call — see landlock_restrict_self(2)
@@ -779,9 +813,13 @@ pub const Sandbox = struct {
         }
 
         // PARENT: child built and applied its own ruleset; no cleanup here.
+        // Close our copy of the stdout pipe write end; the child inherited
+        // its own via fork(). We keep the read end to capture child output.
+        _ = std.os.linux.close(stdout_pipe[1]);
         return ToolSubprocess{
             .pid = @as(i32, @intCast(pid)),
             .landlock_fd = -1,
+            .stdout_fd = stdout_pipe[0],
         };
     }
 };
