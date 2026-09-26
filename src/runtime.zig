@@ -504,6 +504,17 @@ fn agentThreadLoop(args: *const ThreadArgs) void {
         switch (event) {
             .Shutdown => return,
             .UserToolRequest => |utr| {
+                // Slice 7 / WU-7: Agent → Tools dispatch. When the Agent
+                // thread receives a UserToolRequest, it ALSO posts a
+                // DispatchToolRequest to `tui_to_tools` so the tools
+                // pool can spawn the actual subprocess. This is the
+                // "Agent tells Tools what to run" pathway — separate from
+                // the LLM call (api_client.Client.stream) which runs in
+                // parallel. Per design §3.4 the LLM may decide what tools
+                // to call; here we forward the user's request verbatim
+                // (v1 conservative — future slice: parse LLM tool_calls JSON).
+                agentDispatchTool(args, utr);
+
                 // Build the Request — mock vs real branch is mutually
                 // exclusive (REQ-TUI-027 + REQ-TUI-043). The mock branch
                 // is selected when `args.mock_handle != null`; the real
@@ -643,6 +654,22 @@ fn nowMs() i64 {
 /// subprocess + captures stdout + timeout/cancel/exit classification).
 /// Multiple workers may run concurrently to dispatch multiple tool
 /// requests in parallel; bounded by the channel capacity + N.
+/// Slice 7 / WU-7: forward a UserToolRequest to the tools pool via the
+/// `tui_to_tools` channel as a `DispatchToolRequest`. Used by
+/// `agentThreadLoop` to spawn subprocesses in parallel with LLM calls.
+/// Idempotent: the channel may dedupe or buffer; agents are
+/// single-shot. Test-only helper — no behavioral side effect if the
+/// channel is full (tryPut silently fails — caller logs and continues).
+fn agentDispatchTool(args: *const ThreadArgs, utr: channels_mod.UserToolArgs) void {
+    args.channels.tui_to_tools.tryPut(args.io, .{
+        .DispatchToolRequest = utr,
+    }) catch |err| {
+        var buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "agent dispatch failed: {s}", .{@errorName(err)}) catch "agent dispatch failed";
+        logger.global().log(args.io, .warn, msg) catch {};
+    };
+}
+
 /// Slice 7 / WU-6: tools thread orchestrator. Spawns a pool of
 /// `TOOLS_POOL_SIZE` workers (each running `toolsWorkerMain`) + joins
 /// them on shutdown. Workers share `ThreadArgs` (channels + shutdown
@@ -1315,4 +1342,49 @@ test "classifySignal: SIGKILL (9) is signaled_other" {
     // SIGKILL == 9. Generic kill, not sandbox-related.
     const status: u32 = 9;
     try testing.expectEqual(SubprocessExit.signaled_other, SubprocessExit.classifySignal(status));
+}
+
+// =============================================================================
+// Agent → Tools dispatch helper (Slice 7 / WU-7)
+// =============================================================================
+
+test "agentDispatchTool: posts DispatchToolRequest on tui_to_tools" {
+    // Set up a minimal Runtime so agentDispatchTool has channels to write to.
+    // We don't spawn threads — just exercise the helper directly.
+    var runtime = try Runtime.spawn(.{});
+    defer runtime.deinit();
+    runtime.shutdown(testing.io);
+
+    // Build a ThreadArgs pointing to runtime's channels + our own shutdown
+    // atomic + dummy cancel pipe (agentDispatchTool only touches channels
+    // + io, not shutdown or cancel_pipe).
+    var shutdown = std.atomic.Value(bool).init(false);
+    const args: ThreadArgs = .{
+        .io = testing.io,
+        .allocator = std.heap.page_allocator,
+        .channels = &runtime.channels,
+        .cancel_pipe = .{ -1, -1 },
+        .shutdown = &shutdown,
+        .key = null,
+        .mock_handle = null,
+        .initial_auth_state = .needs_first_entry,
+    };
+
+    const utr: channels_mod.UserToolArgs = .{
+        .id = 42,
+        .name = "/bin/echo",
+        .args = "hello world",
+    };
+    agentDispatchTool(&args, utr);
+
+    const event = runtime.channels.tui_to_tools.tryGet(testing.io);
+    try testing.expect(event != null);
+    switch (event.?) {
+        .DispatchToolRequest => |d| {
+            try testing.expectEqual(@as(u64, 42), d.id);
+            try testing.expectEqualStrings("/bin/echo", d.name);
+            try testing.expectEqualStrings("hello world", d.args);
+        },
+        else => return error.UnexpectedEvent,
+    }
 }
