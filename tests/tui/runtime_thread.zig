@@ -1637,6 +1637,11 @@ test "T-SG-7: render wiring is present after tui-render-wiring slice" {
     // from tui.zig Lifecycle (T-2.6.2 deletion). If a future PR
     // reintroduces it, this assertion fails.
     try testing.expect(std.mem.indexOf(u8, tui_src, "prev_snapshot:") == null);
+    // Sub-assertion 4 (counter-anchor): first_frame field is GONE
+    // from tui.zig Lifecycle (issue #52 cleanup — submitFrame uses
+    // force_full_redraw instead). If a future PR reintroduces it,
+    // this assertion fails.
+    try testing.expect(std.mem.indexOf(u8, tui_src, "first_frame:") == null);
 }
 
 // T-SG-8 fold-in: REQ-RW-008 (S-RW-011) — WindowMock + 5 draw fns
@@ -1854,18 +1859,20 @@ test "T-TIW-6: emitFrame trailing cursor position (REQ-TIW-001 + REQ-TIRFIX-002)
 }
 
 // =============================================================================
-// tui-input-rendering-fixes W3 tests (REQ-TIRFIX-003 — first_frame sentinel).
+// tui-input-rendering-fixes W3 tests (REQ-TIRFIX-003 — force_full_redraw
+// sentinel).
 //
 // Bug 3 root cause: `lifecycle.prev_snapshot orelse current` at
 // src/tui.zig:584 was dead code (prev_snapshot is zero-init'd at
-// src/runtime.zig:396-410 BEFORE the first redraw). The fix is an
-// explicit first_frame flag: frame 1 emits \x1b[2J\x1b[H + full
-// snapshot; frame 2+ uses the diff path with REQ-TIRFIX-002's trailing
-// cursor fix. These tests exercise the public behavior end-to-end via
-// a synthetic Lifecycle (no real TTY).
+// src/runtime.zig:396-410 BEFORE the first redraw). The fix is the
+// explicit force_full_redraw flag (Phase 2 PR2 T-2.5.1 — submitFrame
+// uses this to force frame 1 to emit \x1b[2J\x1b[H + full snapshot;
+// frame 2+ uses the diff path with REQ-TIRFIX-002's trailing cursor
+// fix). These tests exercise the public behavior end-to-end via a
+// synthetic Lifecycle (no real TTY).
 // =============================================================================
 
-test "T-TIRFIX-003a: first_frame emits full snapshot with 2J H preamble" {
+test "T-TIRFIX-003a: force_full_redraw emits full snapshot with 2J H preamble" {
     // Synthetic Lifecycle. Use a 10×3 buffer to keep the assertion small.
     const W: u16 = 10;
     const H: u16 = 3;
@@ -1878,7 +1885,7 @@ test "T-TIRFIX-003a: first_frame emits full snapshot with 2J H preamble" {
         .width = W,
         .height = H,
         .no_tty = false,
-        .first_frame = true,
+        .force_full_redraw = true,
         .parser = .{ .ring_buf = undefined, .ring_len = 0, .paste_active = false },
     };
 
@@ -1890,7 +1897,10 @@ test "T-TIRFIX-003a: first_frame emits full snapshot with 2J H preamble" {
     win.cells[1 * W + 5] = .{ .ch = 'Y', .style = .{} };
     const current = win.snapshot();
 
-    // Manually invoke the first_frame path (mirrors src/tui.zig:575-628).
+    // Manually invoke the force_full_redraw path (mirrors src/tui.zig
+    // submitFrame's force_full_redraw branch: 2J H preamble + walk every
+    // non-space cell). After consumption submitFrame flips the flag —
+    // we replicate that side effect manually here.
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try w.writeAll("\x1b[2J\x1b[H");
@@ -1905,7 +1915,7 @@ test "T-TIRFIX-003a: first_frame emits full snapshot with 2J H preamble" {
         if (cell.style.bold) try terminal.style.bold(&w, true);
         try w.writeByte(@intCast(cell.ch));
     }
-    lc.first_frame = false;
+    lc.force_full_redraw = false;
 
     const out = buf[0..w.end];
     // Frame 1 starts with the ED + CUP preamble.
@@ -1914,11 +1924,11 @@ test "T-TIRFIX-003a: first_frame emits full snapshot with 2J H preamble" {
     try testing.expect(std.mem.indexOf(u8, out, "X") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Y") != null);
     // After frame 1, the sentinel flips.
-    try testing.expect(!lc.first_frame);
+    try testing.expect(!lc.force_full_redraw);
 }
 
 test "T-TIRFIX-003b: second frame is diff only (no 2J preamble)" {
-    // From T-TIRFIX-003a state: first_frame=false, prev_snapshot set.
+    // From T-TIRFIX-003a state: force_full_redraw=false, prev_snapshot set.
     // Invoke emitFrame directly with prev_snapshot and a small delta in
     // current. Output must NOT contain \x1b[2J (no full-frame preamble).
     const W: u16 = 60;
