@@ -1,4 +1,4 @@
-// src/channels.zig — 5 bounded channels (cap 256) + Event union (15 variants) +
+// src/channels.zig — 5 bounded channels (cap 256) + Event union (19 variants) +
 // 16ms SSE coalesce on Agent→TUI edge.
 //
 // Spec:    sdd/tui-recovery/spec  (id=407) REQ-TUI-004
@@ -10,9 +10,10 @@
 // coalesce via `pushSseChunk`. Overflow logs the exact warn string
 // "agent→tui SSE channel overflow; dropped oldest chunk" via logger.global().
 //
-// Event union carries 15 variants across the 5 edges (per design#408 §1.2).
-// This file is the type source-of-truth for runtime + tui; both consume
-// the Event union by `@import`ing this file through `root.channels`.
+// Event union carries 19 variants across the 6 edges (per design#408 §1.2
+// + WU-3 of post-roadmap-hygiene-and-offload). This file is the type
+// source-of-truth for runtime + tui; both consume the Event union by
+// `@import`ing this file through `root.channels`.
 //
 // Linux/x86_64 Zig 0.16 only — matches every other module in the project.
 
@@ -30,8 +31,18 @@ comptime {
 }
 
 // =============================================================================
-// Event union (15 variants per design#408 §1.2)
+// Event union (19 variants per design#408 §1.2 + WU-3)
 // =============================================================================
+
+/// Inline buffer size for `Event.ValidateApiRequest.key_or_pass`. The
+/// payload carries the typed API key OR the unlock passphrase depending
+/// on `req.kind`; 512 matches the existing 128-byte `err` buffer with
+/// 4× headroom for the typical 24-256 byte secrets Zargeant manages.
+/// ponytail: inline buffer (no `[]const u8` slice aliases the TUI
+/// thread's stack-local `state.key_entry.draft` after submit — Bug 1
+/// pattern, 2026-09-01). The data lives in the channel ring buffer
+/// from the moment the producer writes it.
+pub const VALIDATE_KEY_BUF_LEN: usize = 512;
 
 /// Agent error classification (consumed by ErrorModal in R-PR 3).
 pub const AgentErrorKind = enum {
@@ -57,15 +68,24 @@ pub const AuthKind = enum {
     key_invalid,
 };
 
-/// Single Event union across the 5 channel edges. 18 variants.
+/// Single Event union across the 5 channel edges. 19 variants.
 /// WU-2 (tui-input-flow-bugfixes-2, CAP-03/04/08): added the
 /// `ValidateApiReply` variant so the per-submit worker thread spawned
 /// in `submitKeyEntryAsync` / `submitUnlockAsync` can post the result
 /// back to the TUI thread. The payload uses INLINE buffers (Bug 1
 /// pattern — WU-1) so no slice aliases the worker's stack-local
 /// storage after the worker exits.
+///
+/// WU-3 (post-roadmap-hygiene-and-offload, FU-1 [HIGH]): added the
+/// `ValidateApiRequest` variant so the TUI thread can dispatch the
+/// per-submit validate probe onto the existing Agent thread (no
+/// per-submit worker anymore — the runtime's 3-thread orchestrator
+/// owns all long-lived threading). The Agent thread drains
+/// `tui_to_agent` → `agentRunValidate` → posts `ValidateApiReply` on
+/// `submit_reply`. The payload carries an inline buffer (Bug 1 pattern)
+/// for the key/passphrase, NOT a `[]const u8` slice.
 pub const Event = union(enum) {
-    // TUI→Agent (7)
+    // TUI→Agent (8)
     KeyPress: terminal.event.Key,
     ApiKeySubmitted: []const u8,
     UnlockPasswordSubmitted: []const u8,
@@ -79,6 +99,15 @@ pub const Event = union(enum) {
     /// thread uses it as a signal to keep the in-memory key in sync
     /// with the on-disk file (future: trigger a backend sync).
     ConsentGrant: []const u8,
+    /// WU-3 (post-roadmap-hygiene-and-offload, FU-1 [HIGH]): the
+    /// per-submit validate probe request. `key_or_pass` carries the
+    /// typed API key (kind=.key_entry) OR the unlock passphrase
+    /// (kind=.unlock); the Agent thread routes to validateViaApiWithTarget
+    /// (key_entry) or loadWithUnlock (unlock) and posts a
+    /// `ValidateApiReply` on `submit_reply` with the result. Cancel-pipe
+    /// plumbing is the runtime's `args.cancel_pipe` — no per-submit worker
+    /// holds its own pipe anymore.
+    ValidateApiRequest: ValidateApiRequestPayload,
     Shutdown,
 
     // Agent→TUI (4 — SSE-coalesced StreamChunk on agent_to_tui)
@@ -101,6 +130,33 @@ pub const Event = union(enum) {
 
     // Worker→TUI (1 — async submit reply, tui-input-flow-bugfixes-2 WU-2)
     ValidateApiReply: ValidateApiReplyPayload,
+};
+
+/// Payload for `Event.ValidateApiRequest` (WU-3, FU-1 [HIGH]).
+///
+/// `kind = .key_entry` → `key_or_pass[0..key_len]` is the typed API key
+/// the user pressed Enter on in the `.key_entry` modal. The Agent
+/// thread validates it against `api.minimax.io:443` (real mode) or
+/// `127.0.0.1:<mock_port>` (mock mode) via
+/// `api_auth.validateViaApiWithTarget`. The success path carries the
+/// last 4 bytes of the key in `ValidateApiReplyPayload.last_four` so
+/// the TUI thread can render `consent_prompt`.
+///
+/// `kind = .unlock` → `key_or_pass[0..key_len]` is the unlock passphrase.
+/// The Agent thread calls `api_auth.loadWithUnlock` against the XDG
+/// credentials path. `ValidateApiReplyPayload.last_four` is set to
+/// `{0} ** 4` (unused for unlock — kept uniform to keep the reply
+/// shape invariant).
+///
+/// ponytail: `key_or_pass` is INLINE — no `[]const u8` slice aliases
+/// the TUI thread's stack-local `state.key_entry.draft` /
+/// `state.unlock_prompt.draft` after submit (Bug 1 pattern,
+/// 2026-09-01). The data lives in the channel ring buffer from the
+/// moment the TUI thread writes it; the Agent thread consumes a copy.
+pub const ValidateApiRequestPayload = struct {
+    kind: enum { key_entry, unlock },
+    key_or_pass: [VALIDATE_KEY_BUF_LEN]u8 = .{0} ** VALIDATE_KEY_BUF_LEN,
+    key_len: usize = 0,
 };
 
 /// Payload for `Event.ValidateApiReply` (WU-2).
@@ -378,7 +434,7 @@ pub fn pushSseChunk(io: std.Io, ch: *Channel(Event), seq: u64, text: []const u8)
 
 const testing = std.testing;
 
-test "Event union has 18 variants" {
+test "Event union has 19 variants" {
     // REQ-TUI-004 scenario 4 — every variant from design#408 §1.2 resolves.
     // PR 2 (tui-runtime-integration #441, REQ-TUI-042) added the `Relock`
     // variant for the 5-min idle relock: 15 → 16.
@@ -386,8 +442,10 @@ test "Event union has 18 variants" {
     // variant: 16 → 17.
     // WU-2 (tui-input-flow-bugfixes-2, CAP-03/04/08) added the
     // `ValidateApiReply` variant for the async submit reply: 17 → 18.
+    // WU-3 (post-roadmap-hygiene-and-offload, FU-1 [HIGH]) added the
+    // `ValidateApiRequest` variant for the Agent-thread offload: 18 → 19.
     const fields = @typeInfo(Event).@"union".fields;
-    try testing.expectEqual(@as(usize, 18), fields.len);
+    try testing.expectEqual(@as(usize, 19), fields.len);
 }
 
 test "channels have capacity 256 (5 edges)" {

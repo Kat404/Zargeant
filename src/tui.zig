@@ -1061,14 +1061,18 @@ pub fn handleKeyInput(
                     return true;
                 },
                 .enter => {
-                    // WU-2 (CAP-03): spawn worker, return ≤1ms. State
-                    // transitions on submit_reply consumption, not here.
+                    // WU-3 (FU-1 [HIGH]): post Event.ValidateApiRequest on
+                    // channels.tui_to_agent; the Agent thread routes via
+                    // agentRunValidate → posts Event.ValidateApiReply on
+                    // channels.submit_reply. TUI returns ≤1ms (channel
+                    // tryPut is O(1)); state transitions on submit_reply
+                    // consumption in drainSubmitReply below.
                     try @import("modal.zig").submitKeyEntryAsync(
                         io,
                         alloc,
                         state,
                         cancel_pipe,
-                        &channels.submit_reply,
+                        channels,
                     ); // REQ-TIW-006
                     return true;
                 },
@@ -1102,25 +1106,23 @@ pub fn handleKeyInput(
                 return true;
             },
             .enter => {
-                // WU-2 (CAP-04): spawn worker, return ≤1ms. State
-                // transitions on submit_reply consumption, not here.
-                // T-R5.4 (PR3 R5 wiring): thread cancel_pipe from
-                // handleKeyInput's param through to submitUnlockAsync
-                // so the spawned worker can poll(2) the read fd before
-                // invoking api_auth.loadWithUnlock. The `cancel_pipe`
-                // arg originates from `args.cancel_pipe` in
-                // runtime.zig's ThreadArgs → tuiThreadLoop parameter →
-                // handleKeyInput parameter → submitUnlockAsync → LoadCtx
-                // (T-R5.2). It mirrors the cancel_pipe threading on
-                // the .key_entry arm for submitKeyEntryAsync (line
-                // ~1047).
+                // WU-3 (FU-1 [HIGH]): post Event.ValidateApiRequest on
+                // channels.tui_to_agent; the Agent thread routes via
+                // agentRunValidate → posts Event.ValidateApiReply on
+                // channels.submit_reply. TUI returns ≤1ms (channel
+                // tryPut is O(1)); state transitions on submit_reply
+                // consumption in drainSubmitReply below. cancel_pipe is
+                // still threaded through (kept in the helper signature
+                // for symmetry with submitKeyEntryAsync + future use);
+                // runtime.zig's Agent thread owns the live cancel_pipe
+                // via args.cancel_pipe.
                 try @import("modal.zig").submitUnlockAsync(
                     io,
                     alloc,
                     state,
                     cancel_pipe,
-                    &channels.submit_reply,
-                ); // REQ-TIW-006
+                    channels,
+                );
                 return true;
             },
             .esc => {
@@ -1136,13 +1138,14 @@ pub fn handleKeyInput(
 /// Drain one tick of `submit_reply` events into the modal state. Returns
 /// true when at least one reply was consumed (caller MUST set
 /// `redraw_pending = true`). Mirrors `modal.runtimeDriverTick`'s shape
-/// but for the WU-2 worker reply channel.
+/// but for the Agent-thread `ValidateApiReply` channel.
 ///
-/// WU-2 (CAP-03/04/08/14): the worker reply carries INLINE buffers
-/// (Bug 1 pattern) — no slice aliases the worker's stack-local storage
-/// after the worker exits. The TUI thread joins the worker via
-/// `state.X.worker_thread` AFTER consuming the reply (fire-and-forget
-/// + join-on-reply, design D1).
+/// WU-3 (FU-1 [HIGH]): the reply carries INLINE buffers (Bug 1 pattern)
+/// — no slice aliases the Agent thread's stack-local storage after the
+/// helper returns. There's no per-submit worker to join anymore — the
+/// Agent thread is long-lived (owned by the runtime) and the helper
+/// returns before the reply is on the channel. We just flip
+/// `validating = false` and transition the state.
 pub fn drainSubmitReply(
     io: std.Io,
     state: *@import("modal.zig").State,
@@ -1153,14 +1156,8 @@ pub fn drainSubmitReply(
         consumed = true;
         switch (event) {
             .ValidateApiReply => |payload| {
-                // Join the worker BEFORE reading inline data (join-on-
-                // reply ordering; the worker has already exited by the
-                // time the reply is in the channel buffer, so the join
-                // is immediate).
                 switch (state.*) {
                     .key_entry => |*ke| {
-                        if (ke.worker_thread) |t| t.join();
-                        ke.worker_thread = null;
                         ke.validating = false;
                         if (payload.success) {
                             // Advance to .consent_prompt with the
@@ -1188,9 +1185,7 @@ pub fn drainSubmitReply(
                         }
                     },
                     .unlock_prompt => |*up| {
-                        if (up.worker_thread) |t| t.join();
                         const next_attempts: u8 = up.attempts + 1;
-                        up.worker_thread = null;
                         up.validating = false;
                         if (payload.success) {
                             // Advance to .agent_loop.

@@ -600,6 +600,16 @@ fn agentThreadLoop(args: *const ThreadArgs) void {
                 // 5-min idle threshold lands.
                 _ = key_bytes;
             },
+            .ValidateApiRequest => |req| {
+                // WU-3 (post-roadmap-hygiene-and-offload, FU-1 [HIGH]):
+                // route the per-submit validate probe to agentRunValidate.
+                // The helper calls api_auth.validateViaApiWithTarget
+                // (key_entry) or api_auth.loadWithUnlock (unlock) and
+                // posts Event.ValidateApiReply on channels.submit_reply
+                // for the TUI thread to drain. cancel_pipe plumbing is
+                // args.cancel_pipe (runtime-owned, no per-submit pipe).
+                agentRunValidate(args, req);
+            },
             .ConsentGrant => |path| {
                 // REQ-VER-011 — TUI thread just wrote the credentials
                 // file (submitConsentGrant completed). The Agent treats
@@ -668,6 +678,147 @@ fn agentDispatchTool(args: *const ThreadArgs, utr: channels_mod.UserToolArgs) vo
         const msg = std.fmt.bufPrint(&buf, "agent dispatch failed: {s}", .{@errorName(err)}) catch "agent dispatch failed";
         logger.global().log(args.io, .warn, msg) catch {};
     };
+}
+
+// =============================================================================
+// WU-3 (post-roadmap-hygiene-and-offload, FU-1 [HIGH]) — validateViaApi offload.
+//
+// The per-submit modal path used to spawn a one-shot worker thread
+// (`runValidateWorker` at src/modal.zig:953) that duplicated the threading
+// + cancel-pipe plumbing the runtime already owns. WU-3 routes the
+// validate probe onto the existing Agent thread via this helper:
+//
+//:   submitKeyEntryAsync (TUI thread)
+//:     └─ channels.tui_to_agent.tryPut(Event.ValidateApiRequest)
+//:         agentThreadLoop (Agent thread)
+//:           └─ agentRunValidate(args, req)
+//:               ├─ key_entry → api_auth.validateViaApiWithTarget
+//:               │              (real: api.minimax.io:443, mock: 127.0.0.1:<port>)
+//:               └─ unlock    → api_auth.loadWithUnlock (XDG credentials path)
+//:             channels.submit_reply.tryPut(Event.ValidateApiReply)
+//
+// The TUI thread's drainSubmitReply consumes the reply on the next 16ms
+// poll cycle. cancel-pipe plumbing is the runtime's `args.cancel_pipe`
+// (owned by Runtime.cancel_pipe, no per-submit pipe). `pub fn` mirrors
+// `buildMockRequest` / `buildRealRequest` for testability.
+// =============================================================================
+
+/// Offload handler for `Event.ValidateApiRequest`. Called by
+/// `agentThreadLoop` when it pulls the request from `tui_to_agent`.
+/// Routes to `validateViaApiWithTarget` (key_entry) or `loadWithUnlock`
+/// (unlock), then posts `Event.ValidateApiReply` on `submit_reply`.
+///
+/// Tiger Style: bounded buffers, explicit slice bounds, inline error
+/// strings. No recursion. No `std.Thread.spawn` (the Agent thread is
+/// the only worker in flight — owned by the runtime).
+pub fn agentRunValidate(args: *const ThreadArgs, req: channels_mod.ValidateApiRequestPayload) void {
+    const api_auth = @import("api_auth.zig");
+    const key_slice = req.key_or_pass[0..req.key_len];
+
+    var payload: channels_mod.ValidateApiReplyPayload = .{
+        .success = false,
+        .last_four = .{0} ** 4,
+        .err = .{0} ** 128,
+        .err_len = 0,
+    };
+
+    switch (req.kind) {
+        .key_entry => {
+            // Compute last_four from the trailing 4 bytes of the key.
+            // Defensive: clamp at req.key_len so a too-short key doesn't
+            // over-read the inline buffer.
+            if (req.key_len >= 4) {
+                const start = req.key_len - 4;
+                @memcpy(payload.last_four[0..], key_slice[start..][0..4]);
+            } else if (req.key_len > 0) {
+                @memcpy(payload.last_four[0..], key_slice[0..req.key_len]);
+            }
+
+            // Mock-mode routing: when args.mock_handle != null, the
+            // runtime is in --mock mode (REQ-TUI-023) and the probe
+            // targets 127.0.0.1:<mock_port> without TLS (mirrors the
+            // mock/real branch in agentThreadLoop's UserToolRequest arm).
+            const is_mock = args.mock_handle != null;
+            const target_host: []const u8 = if (is_mock) "127.0.0.1" else "api.minimax.io";
+            const target_port: u16 = if (is_mock) args.mock_handle.?.port else 443;
+
+            const result = api_auth.validateViaApiWithTarget(
+                args.io,
+                args.allocator,
+                key_slice,
+                target_host,
+                target_port,
+                args.cancel_pipe,
+            );
+
+            if (result) {
+                payload.success = true;
+            } else |err| {
+                payload.success = false;
+                const written = std.fmt.bufPrint(
+                    &payload.err,
+                    "API rejected key: {s}",
+                    .{@errorName(err)},
+                ) catch blk: {
+                    @memcpy(payload.err[0.."API rejected key".len], "API rejected key");
+                    break :blk "API rejected key";
+                };
+                payload.err_len = written.len;
+            }
+        },
+        .unlock => {
+            // Compute the XDG credentials path. The runtime owns the
+            // cancel_pipe; loadWithUnlock doesn't accept one (Argon2id
+            // KDF cancel is deferred — see T-R5.3 future Phase 3+ slice).
+            // Tiger Style §4: defensive guard on path_buf size.
+            var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const path = api_auth.xdgCredentialsPath(&path_buf) orelse {
+                const written = std.fmt.bufPrint(
+                    &payload.err,
+                    "Unlock failed: no storage path",
+                    .{},
+                ) catch blk: {
+                    @memcpy(payload.err[0.."No storage path".len], "No storage path");
+                    break :blk "No storage path";
+                };
+                payload.err_len = written.len;
+                args.channels.submit_reply.tryPut(args.io, .{
+                    .ValidateApiReply = payload,
+                }) catch {};
+                return;
+            };
+
+            const result = api_auth.loadWithUnlock(args.io, path, key_slice);
+            if (result) |key| {
+                // Memory hygiene: zero the key bytes before freeing. The
+                // TUI thread will zero its own copy from the draft on
+                // success (via the existing drainSubmitReply path).
+                @memset(key, 0);
+                args.allocator.free(key);
+                payload.success = true;
+                // last_four stays zeros — not meaningful for unlock.
+            } else |err| {
+                payload.success = false;
+                const written = std.fmt.bufPrint(
+                    &payload.err,
+                    "Unlock failed: {s}",
+                    .{@errorName(err)},
+                ) catch blk: {
+                    @memcpy(payload.err[0.."Unlock failed".len], "Unlock failed");
+                    break :blk "Unlock failed";
+                };
+                payload.err_len = written.len;
+            }
+        },
+    }
+
+    // Post the reply. tryPut never blocks (the TUI thread is the only
+    // consumer + there's at most one in-flight per submit). Silent
+    // failure if the channel is closed (shutdown raced the producer) —
+    // mirrors the existing `runValidateWorker` pattern.
+    args.channels.submit_reply.tryPut(args.io, .{
+        .ValidateApiReply = payload,
+    }) catch {};
 }
 
 /// Slice 7 / WU-6: tools thread orchestrator. Spawns a pool of

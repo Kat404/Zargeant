@@ -411,16 +411,22 @@ pub const ErrorKind = enum {
 /// WU-2 (tui-input-flow-bugfixes-2, CAP-08): `validating` is true while
 /// the per-submit worker thread runs `api_auth.validateViaApi`. The
 /// TUI render path draws a spinner glyph (when implemented) instead of
-/// the prompt during this window. `worker_thread` carries the handle so
-/// the TUI can join it after consuming the worker reply (fire-and-forget
-/// with join-on-reply — design D1).
+/// the prompt during this window.
+///
+/// WU-3 (post-roadmap-hygiene-and-offload, FU-1 [HIGH]): no `worker_thread`
+/// field — the per-submit worker is gone. submitKeyEntryAsync now posts
+/// `Event.ValidateApiRequest` on `channels.tui_to_agent`; the Agent thread
+/// routes through `agentRunValidate` and posts
+/// `Event.ValidateApiReply` on `channels.submit_reply`. drainSubmitReply
+/// (in src/tui.zig) consumes the reply on the next 16ms poll cycle +
+/// flips `validating = false`. No `std.Thread.spawn` outside runtime.zig
+/// (the runtime's 3-thread orchestrator owns all long-lived threading).
 pub const KeyEntryState = struct {
     draft: [256]u8 = .{0} ** 256,
     draft_len: usize = 0,
     err_msg_buf: [128]u8 = .{0} ** 128,
     err_msg_len: usize = 0,
     validating: bool = false,
-    worker_thread: ?std.Thread = null,
     // WU 0.6 (tui-ship-fast-phase0, Bug 4): explicit cursor position for
     // the key_entry modal. drawKeyEntry writes these fields; emitFrame
     // reads them and emits CUP at this position UNCONDITIONALLY (no
@@ -436,6 +442,10 @@ pub const KeyEntryState = struct {
 /// `attempts` counts failed unlock submissions; submitUnlockAsync transitions
 /// to `.error_modal` once the cap (3) is reached (REQ-VER-012).
 /// ponytail: err_msg_buf INLINE (Bug 1) — see KeyEntryState.
+///
+/// WU-3: no `worker_thread` field — see KeyEntryState doc. submitUnlockAsync
+/// posts `Event.ValidateApiRequest` on `channels.tui_to_agent` (the unlock
+/// branch in `agentRunValidate` calls `api_auth.loadWithUnlock`).
 pub const UnlockState = struct {
     draft: [256]u8 = .{0} ** 256,
     draft_len: usize = 0,
@@ -443,7 +453,6 @@ pub const UnlockState = struct {
     err_msg_len: usize = 0,
     attempts: u8 = 0,
     validating: bool = false,
-    worker_thread: ?std.Thread = null,
 };
 
 /// 3-attempt cap (REQ-VER-012). After 3 wrong passphrases the unlock
@@ -828,27 +837,38 @@ pub fn renderKeyEntryToGrid(grid: *ScreenGrid, state: *const State) void {
 }
 
 /// Format-pre-flight + API-validation submit handler for KeyEntry (WU-2:
-/// renamed from `submitKeyEntry` — was synchronous, now async).
+/// renamed from `submitKeyEntry` — was synchronous, then async; WU-3
+/// reverts the threading — the request goes on the Agent thread).
 ///
-/// WU-2 (tui-input-flow-bugfixes-2, CAP-03/04/08/11): the format pre-flight
-/// stays synchronous (no I/O), but the API validation is offloaded to a
-/// per-submit `std.Thread.spawn` worker (D1). The TUI thread returns
-/// within ≤1ms; the worker posts a single `Event.ValidateApiReply` (with
-/// inline buffers — Bug 1 pattern) to `reply_ch`; the TUI poll loop drains
-/// it on the next 16ms tick and transitions the state.
+/// WU-3 (post-roadmap-hygiene-and-offload, FU-1 [HIGH]): the format
+/// pre-flight stays synchronous (no I/O). The API validation request is
+/// posted on `channels.tui_to_agent` as `Event.ValidateApiRequest`. The
+/// Agent thread (already running, owned by `Runtime`) drains the
+/// channel → `agentRunValidate` → `api_auth.validateViaApiWithTarget` →
+/// `Event.ValidateApiReply` on `channels.submit_reply`. The TUI poll loop
+/// (`drainSubmitReply`) consumes the reply on the next 16ms tick +
+/// transitions the state. No `std.Thread.spawn` outside `runtime.zig`
+/// (the runtime's 3-thread orchestrator owns all long-lived threading).
 ///
 /// Format pre-flight (synchronous, REQ-TUI-006 scenario 1): redisplay
 /// (state stays `.key_entry`, err_msg set).
-/// Spawn worker (CAP-03): state becomes `.key_entry{ .validating = true }`.
-/// Worker reply (CAP-08): `.ok` → advance to `.consent_prompt`;
+/// Post request (CAP-03): state becomes `.key_entry{ .validating = true }`.
+/// Reply consumption (CAP-08): `.ok` → advance to `.consent_prompt`;
 /// `.err` → stay in `.key_entry` with err_msg populated.
+///
+/// Signature change (WU-3): the `reply_ch: *Channel(Event)` parameter
+/// is replaced with `channels: *Channels` (TUI-side threads-the-request
+/// onto `channels.tui_to_agent` instead of dispatching into the spawned
+/// worker's reply channel).
 pub fn submitKeyEntryAsync(
     io: std.Io,
     alloc: std.mem.Allocator,
     state: *State,
     cancel_pipe: ?[2]i32,
-    reply_ch: *channels_mod.Channel(channels_mod.Event),
+    channels: *channels_mod.Channels,
 ) !void {
+    _ = cancel_pipe;
+    _ = alloc;
     const payload = &state.key_entry;
     const draft = payload.draft[0..payload.draft_len];
 
@@ -869,47 +889,27 @@ pub fn submitKeyEntryAsync(
         return;
     }
 
-    // WU-2: snapshot the draft into a heap-owned buffer so the worker
-    // outlives the state-owned draft. The TUI thread may mutate the
-    // state-owned draft if the user types more chars after the worker
-    // starts; the worker must not see those mutations.
-    const ctx = alloc.create(ValidateCtx) catch return;
-    errdefer alloc.destroy(ctx);
-    const key_copy = alloc.dupe(u8, draft) catch return;
-    errdefer alloc.free(key_copy);
-    ctx.* = .{
-        .io = io,
-        .alloc = alloc,
-        .key = key_copy,
-        .cancel_pipe = cancel_pipe,
-        .reply_ch = reply_ch,
+    // WU-3: post the request on channels.tui_to_agent. The Agent thread
+    // (already running) drains it via agentRunValidate which calls
+    // api_auth.validateViaApiWithTarget + posts Event.ValidateApiReply
+    // on channels.submit_reply. Inline buffer (Bug 1 pattern) — no slice
+    // aliases the TUI thread's state-owned draft after this fn returns.
+    var req: channels_mod.Event = .{
+        .ValidateApiRequest = .{
+            .kind = .key_entry,
+            .key_or_pass = .{0} ** channels_mod.VALIDATE_KEY_BUF_LEN,
+            .key_len = draft.len,
+        },
     };
+    @memcpy(req.ValidateApiRequest.key_or_pass[0..draft.len], draft);
 
-    // ponytail: per-submit spawn (D1). One worker in flight at a time
-    // (state machine invariant). Spawn cost (~50-200μs) is invisible vs.
-    // the 1-3s TLS handshake.
-    const thread = std.Thread.spawn(.{}, runValidateWorker, .{ctx}) catch |err| {
-        // Spawn failure — synchronous fall-back (write the error inline).
-        var buf: [128]u8 = .{0} ** 128;
-        const written = std.fmt.bufPrint(&buf, "spawn failed: {s}", .{@errorName(err)}) catch blk: {
-            @memcpy(buf[0.."spawn failed".len], "spawn failed");
-            break :blk "spawn failed";
-        };
-        state.* = .{
-            .key_entry = .{
-                .draft = payload.draft,
-                .draft_len = payload.draft_len,
-                .err_msg_buf = buf,
-                .err_msg_len = written.len,
-                .validating = false,
-            },
-        };
-        return;
-    };
+    // tryPut never blocks (the Agent thread is the only consumer + the
+    // channel capacity is 256). Failure here means the runtime is in
+    // shutdown — the request is dropped silently (matches the existing
+    // runValidateWorker's `catch {}` semantics).
+    channels.tui_to_agent.tryPut(io, req) catch {};
 
-    // Mark validating BEFORE storing the thread handle so the renderer
-    // sees the spinner state. The TUI thread joins `worker_thread` AFTER
-    // consuming the reply from submit_reply (join-on-reply, design D1).
+    // Mark validating so the renderer shows the spinner glyph.
     state.* = .{
         .key_entry = .{
             .draft = payload.draft,
@@ -917,108 +917,8 @@ pub fn submitKeyEntryAsync(
             .err_msg_buf = .{0} ** 128,
             .err_msg_len = 0,
             .validating = true,
-            .worker_thread = thread,
         },
     };
-}
-
-/// Worker context for the per-submit validateViaApi worker (WU-2,
-/// CAP-03/04/11). Heap-allocated by the spawner; freed by the worker
-/// on exit. The draft + path copies ensure the worker outlives any
-/// state-owned slices the TUI thread mutates after the spawn.
-const ValidateCtx = struct {
-    io: std.Io,
-    alloc: std.mem.Allocator,
-    key: []u8,
-    cancel_pipe: ?[2]i32,
-    reply_ch: *channels_mod.Channel(channels_mod.Event),
-};
-
-/// Worker context for the per-submit loadWithUnlock worker (WU-2,
-/// CAP-04/08/11). Same shape as ValidateCtx plus the XDG path the
-/// worker reads from.
-///
-/// T-R5.1 (tui-ship-fast-phase2, PR3 R5 wiring — REQ-CHANNELS-001):
-/// gains `cancel_pipe: ?[2]i32 = null` so the load worker (PR3 T-R5.3)
-/// can poll(2) the cancel fd before invoking `api_auth.loadWithUnlock`.
-/// The pre-call poll aborts the worker within the 100ms REQ-NEW-006
-/// target when a Ctrl+C arrives during unlock submit; intra-KDF cancel
-/// is deferred to a future Phase 3+ KDF-hook slice (it requires
-/// extending `api_auth.loadWithUnlock`'s signature to take a cancel
-/// pipe through the Argon2id call site — out of scope here).
-///
-/// The default `null` matches ValidateCtx's contract — submitUnlockAsync
-/// overrides it at construction when the caller provides a pipe.
-const LoadCtx = struct {
-    io: std.Io,
-    alloc: std.mem.Allocator,
-    passphrase: []u8,
-    path: []u8,
-    next_attempts: u8,
-    cancel_pipe: ?[2]i32 = null,
-    reply_ch: *channels_mod.Channel(channels_mod.Event),
-};
-
-/// Worker thread body for submitKeyEntryAsync (WU-2, CAP-03/04/11).
-/// Runs api_auth.validateViaApiWithTarget, builds a ValidateApiReplyPayload
-/// with INLINE buffers (Bug 1 pattern), posts to reply_ch, exits.
-///
-/// ponytail: the inline buffer eliminates the slice-of-stack-local hazard
-/// (WU-1 Bug 1). Once the worker writes the payload to the channel ring
-/// buffer, the data is owned by the channel and survives the worker exit.
-/// The TUI thread joins this thread via `state.key_entry.worker_thread`
-/// after consuming the reply (join-on-reply).
-fn runValidateWorker(ctx: *ValidateCtx) void {
-    // Defer order = LIFO. ctx must be destroyed LAST (it owns the
-    // alloc pointer the other defers use). Declare destroys first so
-    // they fire last.
-    defer ctx.alloc.destroy(ctx);
-    defer ctx.alloc.free(ctx.key);
-
-    // Compute last_four from the draft BEFORE running the probe so the
-    // success reply carries it for the consent_prompt render.
-    var last_four: [4]u8 = .{0} ** 4;
-    if (ctx.key.len >= 4) {
-        const start = ctx.key.len - 4;
-        @memcpy(last_four[0..], ctx.key[start..]);
-    }
-
-    // Run the blocking probe. The TUI thread is back in mibu poll;
-    // cancel_pipe (if non-null) wires Ctrl+C to this probe (≤100ms abort).
-    // We use `validateViaApi` (the api.minimax.io default — not the
-    // WithTarget variant) to keep the production literal out of modal.zig
-    // (T-SG-2 mock-mode guard).
-    const result = api_auth.validateViaApi(
-        ctx.io,
-        ctx.alloc,
-        ctx.key,
-        ctx.cancel_pipe,
-    );
-
-    // Build reply with INLINE buffers. `err` is the inline buffer (Bug 1
-    // pattern); never slice-of-stack-local. `last_four` is also inline.
-    var payload: channels_mod.ValidateApiReplyPayload = .{
-        .success = false,
-        .last_four = last_four,
-        .err = .{0} ** 128,
-        .err_len = 0,
-    };
-    if (result) {
-        payload.success = true;
-    } else |err| {
-        payload.success = false;
-        // WU-1 inline-buffer pattern: format into the payload's buffer.
-        // The previous `var buf: [64]u8` + slice was Bug 1.
-        const written = std.fmt.bufPrint(&payload.err, "API rejected key: {s}", .{@errorName(err)}) catch blk: {
-            @memcpy(payload.err[0.."API rejected key".len], "API rejected key");
-            break :blk "API rejected key";
-        };
-        payload.err_len = written.len;
-    }
-
-    // Post the reply. tryPut never blocks (channel is large enough for
-    // one reply per submit; producer is the only worker in flight).
-    ctx.reply_ch.tryPut(ctx.io, .{ .ValidateApiReply = payload }) catch {};
 }
 
 /// Render the Unlock modal into `grid`. Pure renderer — does NOT
@@ -1165,30 +1065,42 @@ pub fn drawUnlock(win: *WindowMock, state: *State) !void {
 }
 
 /// Submit handler for the Unlock modal (WU-2: renamed from `submitUnlock`
-/// — was synchronous, now async).
+/// — was synchronous, then async; WU-3 reverts the threading — the
+/// request goes on the Agent thread).
 ///
-/// WU-2 (tui-input-flow-bugfixes-2, CAP-04/08/11): the XDG path lookup +
-/// 3-attempt cap + spawn of a per-submit worker thread all happen on the
-/// TUI thread; `api_auth.loadWithUnlock` runs on the worker. TUI returns
-/// to mibu poll within ≤1ms; worker posts `Event.ValidateApiReply` to
-/// `reply_ch`; TUI consumes on next 16ms tick and transitions the state.
+/// WU-3 (post-roadmap-hygiene-and-offload, FU-1 [HIGH]): the XDG path
+/// lookup + 3-attempt cap pre-check stay synchronous on the TUI
+/// thread. The actual `loadWithUnlock` call moves to the Agent thread
+/// via `agentRunValidate` (called from the new
+/// `Event.ValidateApiRequest` arm in `agentThreadLoop`). TUI returns to
+/// the mibu poll within ≤1ms; Agent posts `Event.ValidateApiReply` on
+/// `channels.submit_reply`; TUI consumes on next 16ms tick and
+/// transitions the state.
 ///
 /// Cap pre-check (REQ-VER-012): if `next_attempts >= UNLOCK_MAX_ATTEMPTS`
-/// we escalate to `.error_modal` IMMEDIATELY before spawning the worker —
+/// we escalate to `.error_modal` IMMEDIATELY before posting the request —
 /// no point calling loadWithUnlock when the answer is already "too many".
+///
+/// Path pre-check: the XDG credentials path lookup stays on the TUI
+/// thread (synchronous). When no path resolves, we write a
+/// "No storage path" error reply inline (no Agent round-trip needed).
+/// The `agentRunValidate` helper also re-checks the path internally
+/// as a defensive guard — the path resolution is idempotent and cheap.
+///
+/// Signature change (WU-3): the `reply_ch: *Channel(Event)` parameter
+/// is replaced with `channels: *Channels`. `cancel_pipe` is now
+/// unused (cancel plumbing lives on the Agent thread via
+/// `args.cancel_pipe`); kept in the signature for `submitKeyEntryAsync`
+/// symmetry.
 pub fn submitUnlockAsync(
     io: std.Io,
     alloc: std.mem.Allocator,
     state: *State,
-    /// T-R5.2 (tui-ship-fast-phase2, PR3 R5 wiring — REQ-CHANNELS-002):
-    /// per-submit cancel pipe forwarded to the spawned worker via
-    /// LoadCtx.cancel_pipe. Null disables the pipe entirely (tests,
-    /// no-TTY paths) — mirrors the validateViaApi contract. A Ctrl+C
-    /// arriving during in-flight loadWithUnlock aborts within 100ms
-    /// per REQ-NEW-006 invariant.
     cancel_pipe: ?[2]i32,
-    reply_ch: *channels_mod.Channel(channels_mod.Event),
+    channels: *channels_mod.Channels,
 ) !void {
+    _ = cancel_pipe;
+    _ = alloc;
     const payload = &state.unlock_prompt;
     const draft = payload.draft[0..payload.draft_len];
     // REQ-VER-012 — 3-attempt cap. Increment on entry; on the Nth
@@ -1199,7 +1111,18 @@ pub fn submitUnlockAsync(
     // Storage path is conventionally the same XDG location the consent
     // prompt writes to. We compute it lazily here via api_auth (R-PR 4
     // exposes a helper; for now we hardcode the XDG lookup fallback).
-    const path = storageCredentialsPath(&path_buf) orelse {
+    //
+    // WU-3: the actual `loadWithUnlock` call now happens on the Agent
+    // thread via `agentRunValidate` (which calls
+    // `api_auth.xdgCredentialsPath` internally — the lookup is
+    // idempotent + cheap, ~1ms). The TUI-side lookup here serves as a
+    // synchronous path-availability pre-check: if the user has no
+    // $XDG_CONFIG_HOME / $HOME, we want "No storage path" surfaced
+    // immediately (within the ≤1ms budget) rather than waiting for the
+    // Agent round-trip. The `_ =` binding exists only for its side-effect
+    // (the early return on `null`); the path bytes are NOT shipped to
+    // the Agent (they live in this stack frame and go out of scope).
+    _ = storageCredentialsPath(&path_buf) orelse {
         // WU-1 (Fix A): inline buffer (was `err_msg = "No storage path"`
         // — string literal aliasing .rodata, technically safe but uniform
         // shape is the contract).
@@ -1229,7 +1152,7 @@ pub fn submitUnlockAsync(
     };
 
     // Cap pre-check: if we're already at the cap, escalate to error_modal
-    // BEFORE spawning the worker (no point loading the file).
+    // BEFORE posting the request (no point loading the file).
     if (next_attempts >= UNLOCK_MAX_ATTEMPTS) {
         var too_buf: [128]u8 = .{0} ** 128;
         const too_len = copyInline(&too_buf, "Too many failed unlock attempts");
@@ -1242,45 +1165,21 @@ pub fn submitUnlockAsync(
         return;
     }
 
-    // WU-2: snapshot draft + path into a heap-owned buffer so the worker
-    // outlives the state-owned slices.
-    const ctx = alloc.create(LoadCtx) catch return;
-    errdefer alloc.destroy(ctx);
-    const pass_copy = alloc.dupe(u8, draft) catch return;
-    errdefer alloc.free(pass_copy);
-    const path_copy = alloc.dupe(u8, path) catch return;
-    errdefer alloc.free(path_copy);
-    ctx.* = .{
-        .io = io,
-        .alloc = alloc,
-        .passphrase = pass_copy,
-        .path = path_copy,
-        .next_attempts = next_attempts,
-        // T-R5.2: forward the caller-provided pipe so runLoadWorker can
-        // poll(2) the read fd before invoking api_auth.loadWithUnlock.
-        .cancel_pipe = cancel_pipe,
-        .reply_ch = reply_ch,
+    // WU-3: post the request on channels.tui_to_agent. The Agent thread
+    // (already running) drains it via agentRunValidate which calls
+    // api_auth.loadWithUnlock + posts Event.ValidateApiReply on
+    // channels.submit_reply. Inline buffer (Bug 1 pattern) — no slice
+    // aliases the TUI thread's state-owned draft after this fn returns.
+    var req: channels_mod.Event = .{
+        .ValidateApiRequest = .{
+            .kind = .unlock,
+            .key_or_pass = .{0} ** channels_mod.VALIDATE_KEY_BUF_LEN,
+            .key_len = draft.len,
+        },
     };
+    @memcpy(req.ValidateApiRequest.key_or_pass[0..draft.len], draft);
 
-    // ponytail: per-submit spawn (D1). Mirrors submitKeyEntryAsync.
-    const thread = std.Thread.spawn(.{}, runLoadWorker, .{ctx}) catch |err| {
-        var buf: [128]u8 = .{0} ** 128;
-        const written = std.fmt.bufPrint(&buf, "spawn failed: {s}", .{@errorName(err)}) catch blk: {
-            @memcpy(buf[0.."spawn failed".len], "spawn failed");
-            break :blk "spawn failed";
-        };
-        state.* = .{
-            .unlock_prompt = .{
-                .draft = payload.draft,
-                .draft_len = payload.draft_len,
-                .err_msg_buf = buf,
-                .err_msg_len = written.len,
-                .attempts = next_attempts,
-                .validating = false,
-            },
-        };
-        return;
-    };
+    channels.tui_to_agent.tryPut(io, req) catch {};
 
     state.* = .{
         .unlock_prompt = .{
@@ -1290,104 +1189,8 @@ pub fn submitUnlockAsync(
             .err_msg_len = 0,
             .attempts = payload.attempts, // attempts bumped on reply consume
             .validating = true,
-            .worker_thread = thread,
         },
     };
-}
-
-/// Worker thread body for submitUnlockAsync (WU-2, CAP-04/08/11).
-/// Runs api_auth.loadWithUnlock, builds a ValidateApiReplyPayload with
-/// INLINE buffers, posts to reply_ch, exits.
-///
-/// ponytail: same shape as runValidateWorker — inline buffers eliminate
-/// slice-of-stack-local (Bug 1). `loadWithUnlock` returns a heap-allocated
-/// key buffer; we memset(0) + free before posting the reply so the key
-/// bytes do not linger on the worker thread's heap.
-fn runLoadWorker(ctx: *LoadCtx) void {
-    // Defer order = LIFO. ctx must be destroyed LAST (it owns the
-    // alloc pointer the other defers use). Declare destroys first so
-    // they fire last.
-    defer ctx.alloc.destroy(ctx);
-    defer ctx.alloc.free(ctx.passphrase);
-    defer ctx.alloc.free(ctx.path);
-
-    // T-R5.3 (tui-ship-fast-phase2, PR3 R5 wiring — REQ-CHANNELS-003):
-    // Pre-call poll of cancel_pipe. If the writer (Ctrl+C key-event
-    // intercept at src/tui.zig:962) fired between the TUI thread's
-    // spawn and the worker's poll, the read fd is readable on entry.
-    // We short-circuit BEFORE the Argon2id KDF runs — closing the
-    // 100ms REQ-NEW-006 invariant for the unlock submit path. Without
-    // this check, the worker would block in api_auth.loadWithUnlock
-    // for ~2s (Argon2id m=64MiB t=3) even after a Ctrl+C.
-    //
-    // NOTE: this is the PRE-CALL poll only. Intra-KDF cancel requires
-    // a future Phase 3+ slice that threads cancel_pipe through
-    // api_auth.loadWithUnlock and the Argon2id call site — out of
-    // scope here (constraint: do not modify api_auth.loadWithUnlock
-    // signature).
-    //
-    // poll() with timeout=0 returns immediately (no block). readable>0
-    // means at least one fd has a POLL.IN event pending.
-    if (ctx.cancel_pipe) |fds| {
-        var pfds: [1]std.os.linux.pollfd = .{.{
-            .fd = fds[0],
-            .events = std.os.linux.POLL.IN,
-            .revents = 0,
-        }};
-        // poll() takes a many pointer to pollfd; coerce the
-        // single-element array pointer. Mirrors the cancel_e2e.zig
-        // @ptrCast pattern at tests/cancel_e2e.zig:223. std.os.linux.poll
-        // returns usize (no error union) — a 0 return means timeout
-        // (no readable fds within the 0ms wait).
-        const readable = std.os.linux.poll(@ptrCast(&pfds[0]), 1, 0);
-        if (readable > 0 and (pfds[0].revents & std.os.linux.POLL.IN) != 0) {
-            // Cancel signaled — post a Cancelled reply and exit without
-            // running the KDF. The TUI thread will drain via
-            // drainSubmitReply on the next 16ms tick and transition
-            // the state. The payload.err = "Cancelled" literal matches
-            // the cancel_e2e.zig convention so downstream drain code
-            // can detect it with a strcmp (consistency with
-            // validateViaApi's error.Cancelled return).
-            var cancelled: channels_mod.ValidateApiReplyPayload = .{
-                .success = false,
-                .last_four = .{0} ** 4,
-                .err = .{0} ** 128,
-                .err_len = 0,
-            };
-            const written = std.fmt.bufPrint(&cancelled.err, "Cancelled", .{}) catch blk: {
-                @memcpy(cancelled.err[0.."Cancelled".len], "Cancelled");
-                break :blk "Cancelled";
-            };
-            cancelled.err_len = written.len;
-            ctx.reply_ch.tryPut(ctx.io, .{ .ValidateApiReply = cancelled }) catch {};
-            return;
-        }
-    }
-
-    const result = api_auth.loadWithUnlock(ctx.io, ctx.path, ctx.passphrase);
-
-    var payload: channels_mod.ValidateApiReplyPayload = .{
-        .success = false,
-        .last_four = .{0} ** 4,
-        .err = .{0} ** 128,
-        .err_len = 0,
-    };
-    if (result) |key| {
-        // Memory hygiene — zero the key bytes before freeing. The TUI
-        // thread will zero its own copy from the draft on success.
-        @memset(key, 0);
-        ctx.alloc.free(key);
-        payload.success = true;
-    } else |err| {
-        payload.success = false;
-        const written = std.fmt.bufPrint(&payload.err, "Unlock failed: {s}", .{@errorName(err)}) catch blk: {
-            @memcpy(payload.err[0.."Unlock failed".len], "Unlock failed");
-            break :blk "Unlock failed";
-        };
-        payload.err_len = written.len;
-    }
-
-    ctx.reply_ch.tryPut(ctx.io, .{ .ValidateApiReply = payload }) catch {};
 }
 
 /// Esc handler for the Unlock modal: cancel and return to `.key_entry`
@@ -2086,11 +1889,10 @@ test "KeyEntry rejects malformed format (redisplay)" {
     defer win.deinit();
     try drawKeyEntry(win, &state);
     // Submit handler transitions back to key_entry with err_msg_buf
-    // populated (WU-1 inline-buffer shape; WU-2 renamed to submitKeyEntryAsync).
-    // The format-fail path is synchronous — no worker spawned, the
-    // reply_ch argument is unused.
-    var ch: channels_mod.Channel(channels_mod.Event) = .{};
-    defer ch.close(testing.io);
+    // populated (WU-1 inline-buffer shape; WU-2 renamed to submitKeyEntryAsync;
+    // WU-3 — no worker spawned, no request posted, channels param is unused).
+    var ch: channels_mod.Channels = channels_mod.Channels.init();
+    defer ch.closeAll(testing.io);
     submitKeyEntryAsync(testing.io, testing.allocator, &state, null, &ch) catch {};
     try testing.expect(std.meta.activeTag(state) == .key_entry);
     try testing.expect(state.key_entry.err_msg_len > 0);
@@ -2661,12 +2463,12 @@ test "CAP-12: openErrorModal copies caller msg into inline buffer" {
 test "CAP-04: submitKeyEntryAsync returns ≤1ms on format-fail (synchronous path)" {
     // CAP-04 — the synchronous format pre-flight path returns within
     // ≤1ms. We exercise this branch via an invalid-format draft so the
-    // test stays hermetic (no real DNS, no worker thread spawned).
+    // test stays hermetic (no real DNS, no request posted).
     //
-    // The async spawn branch (valid format → worker → DNS) is verified
-    // by the unlock path (CAP-04 below) which uses loadWithUnlock
-    // against a non-existent file (no network). The timing budget
-    // applies equally: spawn cost is ~50-200μs.
+    // The async path (valid format → post on channels.tui_to_agent →
+    // Agent thread → agentRunValidate → ValidateApiReply) is exercised
+    // by the unlock tests below. The timing budget applies equally to
+    // the post-to-channel path (channel tryPut is O(1)).
     var draft_buf: [256]u8 = .{0} ** 256;
     @memcpy(draft_buf[0..2], "xx"); // too short — validateFormat fails
     var state: State = .{
@@ -2675,8 +2477,8 @@ test "CAP-04: submitKeyEntryAsync returns ≤1ms on format-fail (synchronous pat
             .draft_len = 2,
         },
     };
-    var ch: channels_mod.Channel(channels_mod.Event) = .{};
-    defer ch.close(testing.io);
+    var ch: channels_mod.Channels = channels_mod.Channels.init();
+    defer ch.closeAll(testing.io);
 
     const start = std.Io.Timestamp.now(testing.io, .real).nanoseconds;
     try submitKeyEntryAsync(testing.io, testing.allocator, &state, null, &ch);
@@ -2685,82 +2487,80 @@ test "CAP-04: submitKeyEntryAsync returns ≤1ms on format-fail (synchronous pat
     // CAP-04 timing budget: ≤1ms (1000000ns).
     try testing.expect(elapsed_ns < std.time.ns_per_ms);
     // Format-fail path: state stays in .key_entry with err populated;
-    // validating stays false (no worker spawned).
+    // validating stays false (no request posted).
     try testing.expect(std.meta.activeTag(state) == .key_entry);
     try testing.expect(state.key_entry.validating == false);
     try testing.expect(state.key_entry.err_msg_len > 0);
 }
 
-test "CAP-04: submitUnlockAsync returns ≤1ms and transitions state to .validating" {
+test "CAP-04: submitUnlockAsync returns ≤1ms and posts request on tui_to_agent" {
     // CAP-04 — submitUnlockAsync (mirror of submitKeyEntryAsync) also
     // returns within ≤1ms. We need XDG_CONFIG_HOME or HOME set so
     // storageCredentialsPath resolves (otherwise the synchronous
-    // fall-back path is taken — no worker spawned — and validating
+    // fall-back path is taken — no request posted — and validating
     // stays false).
     //
     // The test env typically has HOME=/root or similar; we proceed.
     var state: State = .{ .unlock_prompt = .{} };
-    var ch: channels_mod.Channel(channels_mod.Event) = .{};
-    defer ch.close(testing.io);
+    var ch: channels_mod.Channels = channels_mod.Channels.init();
+    defer ch.closeAll(testing.io);
 
     const start = std.Io.Timestamp.now(testing.io, .real).nanoseconds;
-    // T-R5.2: cancel_pipe param added (4th arg); tests pass null.
     submitUnlockAsync(testing.io, testing.allocator, &state, null, &ch) catch {};
     const elapsed_ns = std.Io.Timestamp.now(testing.io, .real).nanoseconds - start;
 
-    // Either the worker was spawned (state.validating == true) OR the
+    // Either the request was posted (state.validating == true) OR the
     // synchronous fall-back ran (no HOME — state has err_msg). Both are
     // valid; we just check the function returns within ≤1ms.
     try testing.expect(elapsed_ns < std.time.ns_per_ms);
     if (state.unlock_prompt.validating) {
-        // Worker was spawned — the async path is exercised.
-        try testing.expect(state.unlock_prompt.worker_thread != null);
-
-        // Drain the worker reply to avoid leak detection at test
-        // shutdown. loadWithUnlock against a non-existent file returns
-        // OpenFailed within microseconds — well under 16ms.
+        // Request is in flight on the Agent thread. We can't run the
+        // Agent thread in this test, so we just verify the request was
+        // queued on channels.tui_to_agent (drain it to confirm).
+        var saw_request = false;
         var drain_iters: usize = 0;
-        while (drain_iters < 100) : (drain_iters += 1) {
-            if (ch.tryGet(testing.io)) |ev| {
-                _ = ev;
-                if (state.unlock_prompt.worker_thread) |t| t.join();
-                state.unlock_prompt.worker_thread = null;
-                state.unlock_prompt.validating = false;
+        while (drain_iters < 50) : (drain_iters += 1) {
+            if (ch.tui_to_agent.tryGet(testing.io)) |ev| {
+                if (ev == .ValidateApiRequest) {
+                    try testing.expect(ev.ValidateApiRequest.kind == .unlock);
+                    saw_request = true;
+                }
                 break;
             }
             var ts = std.os.linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
             _ = std.os.linux.nanosleep(&ts, null);
         }
+        try testing.expect(saw_request);
     }
 }
 
-test "CAP-08: worker reply observed within 16ms via channels.submit_reply" {
-    // CAP-08 — the per-submit worker posts Event.ValidateApiReply to
-    // channels.submit_reply. The TUI poll loop (drainSubmitReply in
-    // src/tui.zig) consumes the reply on the next 16ms tick. We
-    // exercise the worker path via submitUnlockAsync (which calls
-    // loadWithUnlock against a non-existent file → OpenFailed reply
-    // posted within microseconds, well under the 16ms budget).
+test "CAP-08: ValidateApiRequest posted on tui_to_agent (Agent drains it → posts ValidateApiReply)" {
+    // CAP-08 (WU-3 updated) — submitUnlockAsync posts
+    // Event.ValidateApiRequest on channels.tui_to_agent. The Agent
+    // thread (already running in production) drains it via
+    // agentRunValidate which calls api_auth.loadWithUnlock + posts
+    // Event.ValidateApiReply on channels.submit_reply.
     //
-    // This test exercises BOTH the async spawn (CAP-04) and the reply
-    // observation (CAP-08) end-to-end.
+    // We exercise the post-side of the protocol here (the Agent arm
+    // is tested end-to-end in tests/tui/runtime_thread.zig via the
+    // WU-3 RED→GREEN fixtures). loadWithUnlock against a non-existent
+    // XDG path → OpenFailed → mapped to AuthError.OpenFailed reply.
     var state: State = .{ .unlock_prompt = .{} };
-    var ch: channels_mod.Channel(channels_mod.Event) = .{};
-    defer ch.close(testing.io);
+    var ch: channels_mod.Channels = channels_mod.Channels.init();
+    defer ch.closeAll(testing.io);
 
-    try submitUnlockAsync(testing.io, testing.allocator, &state, null, &ch);
-    // The worker is in flight. Either validating is true (worker
-    // spawned) or we fell back synchronously (no HOME — skip the
-    // observation assertion).
+    submitUnlockAsync(testing.io, testing.allocator, &state, null, &ch) catch {};
+    // Either validating is true (request posted on tui_to_agent) or
+    // we fell back synchronously (no HOME — skip).
     if (!state.unlock_prompt.validating) return;
 
-    // Poll submit_reply with a 16ms budget (the mibu poll cadence).
+    // Drain tui_to_agent within a 16ms budget (the mibu poll cadence).
     const start = std.Io.Timestamp.now(testing.io, .real).nanoseconds;
     const deadline = start + 16 * std.time.ns_per_ms;
-    var reply: ?channels_mod.Event = null;
+    var request: ?channels_mod.Event = null;
     while (std.Io.Timestamp.now(testing.io, .real).nanoseconds < deadline) {
-        if (ch.tryGet(testing.io)) |ev| {
-            reply = ev;
+        if (ch.tui_to_agent.tryGet(testing.io)) |ev| {
+            request = ev;
             break;
         }
         var ts = std.os.linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
@@ -2768,352 +2568,31 @@ test "CAP-08: worker reply observed within 16ms via channels.submit_reply" {
     }
     const elapsed_ns = std.Io.Timestamp.now(testing.io, .real).nanoseconds - start;
 
-    // CAP-08 timing budget: ≤16ms. We allow generous headroom.
+    // CAP-08 timing budget: ≤16ms.
     try testing.expect(elapsed_ns < 16 * std.time.ns_per_ms);
-    try testing.expect(reply != null);
-    if (reply) |ev| {
-        try testing.expect(ev == .ValidateApiReply);
-        try testing.expect(!ev.ValidateApiReply.success); // OpenFailed reply
-        try testing.expect(ev.ValidateApiReply.err_len > 0);
-
-        // Mirror tuiThreadLoop's drain logic: join worker, transition
-        // state. Join happens BEFORE we use state (join-on-reply).
-        if (state.unlock_prompt.worker_thread) |t| t.join();
-        state.unlock_prompt.worker_thread = null;
-        state.unlock_prompt.validating = false;
-        const next_attempts: u8 = state.unlock_prompt.attempts + 1;
-        if (next_attempts < UNLOCK_MAX_ATTEMPTS) {
-            var err_buf: [128]u8 = .{0} ** 128;
-            const n = @min(ev.ValidateApiReply.err_len, err_buf.len);
-            @memcpy(err_buf[0..n], ev.ValidateApiReply.err[0..n]);
-            state = .{
-                .unlock_prompt = .{
-                    .draft = state.unlock_prompt.draft,
-                    .draft_len = state.unlock_prompt.draft_len,
-                    .err_msg_buf = err_buf,
-                    .err_msg_len = n,
-                    .attempts = next_attempts,
-                    .validating = false,
-                },
-            };
-        }
-
-        // CAP-08 err-path: state stays in .unlock_prompt with err
-        // populated + attempts incremented.
-        try testing.expect(std.meta.activeTag(state) == .unlock_prompt);
-        try testing.expect(state.unlock_prompt.attempts == 1);
-        try testing.expect(state.unlock_prompt.err_msg_len > 0);
-        try testing.expectEqualStrings("Unlock failed: OpenFailed", state.unlock_prompt.err_msg_buf[0..state.unlock_prompt.err_msg_len]);
+    try testing.expect(request != null);
+    if (request) |ev| {
+        try testing.expect(ev == .ValidateApiRequest);
+        try testing.expect(ev.ValidateApiRequest.kind == .unlock);
+        try testing.expect(ev.ValidateApiRequest.key_len > 0);
     }
 }
 
 // =============================================================================
-// T-R5.1 (tui-ship-fast-phase2, PR3 R5 wiring — REQ-CHANNELS-001)
+// WU-3 (post-roadmap-hygiene-and-offload, FU-1 [HIGH]) — T-R5.* tests REMOVED.
 //
-// LoadCtx gains a `cancel_pipe: ?[2]i32` field mirroring the existing
-// ValidateCtx shape. The field is allocated/initialized by submitUnlockAsync
-// (T-R5.2) and polled by runLoadWorker (T-R5.3) so a Ctrl+C during the
-// unlock submit aborts the worker within the 100ms REQ-NEW-006 target.
+// The per-submit worker types (ValidateCtx, LoadCtx) and worker fns
+// (runValidateWorker, runLoadWorker) are gone. submitKeyEntryAsync /
+// submitUnlockAsync now post Event.ValidateApiRequest on
+// channels.tui_to_agent; the Agent thread (already running) routes
+// through agentRunValidate → api_auth.{validateViaApiWithTarget,
+// loadWithUnlock} → Event.ValidateApiReply on channels.submit_reply.
+// No per-submit cancel-pipe poll — the runtime's cancel_pipe is the
+// single source of truth for Ctrl+C abort (REQ-NEW-006).
 //
-// These tests assert the static field contract:
-//   1. The field exists.
-//   2. The default is `null` (when constructed without specifying it).
-//   3. The type is `?[2]i32` so the worker can poll(2) it directly.
-//
-// RED: these tests fail to compile because LoadCtx.cancel_pipe is not
-// yet declared — the failure to compile IS the RED signal.
-//
-// NOTE (Zig 0.16 quirk): `@TypeOf(LoadCtx.cancel_pipe)` is rejected when
-// the field has a default value. We use `@typeInfo(...).@"struct".fields`
-// to read the declared field type instead — it works regardless of
-// whether the field has a default.
+// The cancel-pipe contract is verified end-to-end by:
+//   - tests/cancel_path.zig (CAP-09 writer-side latency)
+//   - tests/cancel_e2e.zig (validateViaApiWithTarget cancel via poll)
+//   - tests/tui/runtime_thread.zig (WU-3 RED→GREEN agentRunValidate
+//     fixtures: success, error, cancel-via-pipe cases)
 // =============================================================================
-
-test "T-R5.1: LoadCtx has cancel_pipe field with type ?[2]i32" {
-    // Compile-time assertion that the field exists with the expected
-    // type. Mirrors ValidateCtx's shape (validated against the parent
-    // commit's existing field; LoadCtx must match).
-    try testing.expect(@hasField(LoadCtx, "cancel_pipe"));
-
-    // Look up the field type via the typeInfo reflection — works with
-    // default-value fields (see NOTE above). Inline the loop so the
-    // index / type match happens at comptime (Zig 0.16 rejects
-    // runtime use of `StructField` values).
-    const info = @typeInfo(LoadCtx).@"struct";
-    var found_cancel_pipe = false;
-    inline for (info.fields) |f| {
-        if (std.mem.eql(u8, f.name, "cancel_pipe")) {
-            try testing.expectEqual(?[2]i32, f.type);
-            found_cancel_pipe = true;
-        }
-    }
-    try testing.expect(found_cancel_pipe);
-}
-
-test "T-R5.1: LoadCtx.cancel_pipe defaults to null" {
-    // Default-constructed LoadCtx must default cancel_pipe to null
-    // (matches ValidateCtx's contract — submitUnlockAsync overrides the
-    // default at construction when the caller passes a pipe).
-    const ctx: LoadCtx = .{
-        .io = undefined,
-        .alloc = undefined,
-        .passphrase = undefined,
-        .path = undefined,
-        .next_attempts = 0,
-        .reply_ch = undefined,
-    };
-    try testing.expectEqual(@as(?[2]i32, null), ctx.cancel_pipe);
-}
-
-// =============================================================================
-// T-R5.2 (tui-ship-fast-phase2, PR3 R5 wiring — REQ-CHANNELS-002)
-//
-// submitUnlockAsync gains a `cancel_pipe: ?[2]i32` parameter forwarded
-// to LoadCtx.cancel_pipe so the worker (T-R5.3) can poll(2) on the
-// read fd before invoking api_auth.loadWithUnlock. The signature
-// becomes:
-//
-//     pub fn submitUnlockAsync(
-//         io: std.Io,
-//         alloc: std.mem.Allocator,
-//         state: *State,
-//         cancel_pipe: ?[2]i32,            // NEW (PR3 R5)
-//         reply_ch: *channels_mod.Channel(channels_mod.Event),
-//     ) !void
-//
-// This is a BREAKING change — every caller must add the new arg.
-// The handler ships the pipe verbatim: null is a no-op (no pre-call
-// poll), non-null wires the worker's Readable-events poll to the
-// provided fds. Tests in this block exercise both shapes.
-//
-// RED: submitUnlockAsync doesn't yet populate LoadCtx.cancel_pipe
-// from the new param, so the GREEN test below (asserting non-null
-// forwarding) fails. The signature change also surfaces as compile
-// errors at the existing callsites (src/tui.zig:1088 + the
-// CAP-04/CAP-08 tests in this file), which is the intended RED signal
-// for downstream callers — they must update to pass the arg.
-// =============================================================================
-
-test "T-R5.2: submitUnlockAsync accepts null cancel_pipe without crashing" {
-    // Hermetic test: empty .unlock_prompt + no HOME/XDG → no storage
-    // path → the synchronous fall-back path runs (sets err_msg + maybe
-    // .error_modal). No worker spawns, but the signature must accept
-    // `null` cleanly.
-    var state: State = .{ .unlock_prompt = .{} };
-    var ch: channels_mod.Channel(channels_mod.Event) = .{};
-    defer ch.close(testing.io);
-
-    // submitUnlockAsync returns !void; we accept any outcome (synchronous
-    // fall-back, async spawn, cap pre-check).
-    _ = submitUnlockAsync(testing.io, testing.allocator, &state, null, &ch) catch {};
-    // Drain any worker that might have spawned.
-    var drain_iters: usize = 0;
-    while (drain_iters < 50) : (drain_iters += 1) {
-        if (ch.tryGet(testing.io)) |ev| {
-            _ = ev;
-            if (state.unlock_prompt.worker_thread) |t| t.join();
-            state.unlock_prompt.worker_thread = null;
-            state.unlock_prompt.validating = false;
-            break;
-        }
-        var ts = std.os.linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-        _ = std.os.linux.nanosleep(&ts, null);
-    }
-}
-
-test "T-R5.2: submitUnlockAsync populates LoadCtx.cancel_pipe when non-null" {
-    // GREEN: when the caller passes a non-null cancel pipe, the
-    // LoadCtx passed to runLoadWorker sees the same pipe. We exercise
-    // this by:
-    //   1. Setting HOME to a tmp dir via env so storageCredentialsPath
-    //      resolves to a real path (we point at a non-existent file so
-    //      loadWithUnlock returns OpenFailed quickly).
-    //   2. Calling submitUnlockAsync(cancel_pipe = [.fd, .fd]).
-    //   3. Draining the worker reply, then introspecting... but the
-    //      LoadCtx is internal to runLoadWorker and freed before we
-    //      can inspect it.
-    //
-    // ALTERNATIVE: we instead rely on the static @hasField contract
-    // (T-R5.1 GREEN) + the GREEN signature contract (no failures when
-    // a non-null pipe is passed). The actual runtime check is below:
-    // we assert that submitting with a non-null pipe does NOT crash
-    // and the worker path runs.
-    var state: State = .{ .unlock_prompt = .{} };
-    var ch: channels_mod.Channel(channels_mod.Event) = .{};
-    defer ch.close(testing.io);
-
-    const fds: [2]i32 = .{ -1, -1 };
-    _ = submitUnlockAsync(testing.io, testing.allocator, &state, fds, &ch) catch {};
-    // Drain worker (Hermetic — may or may not spawn depending on HOME).
-    var drain_iters: usize = 0;
-    while (drain_iters < 50) : (drain_iters += 1) {
-        if (ch.tryGet(testing.io)) |ev| {
-            _ = ev;
-            if (state.unlock_prompt.worker_thread) |t| t.join();
-            state.unlock_prompt.worker_thread = null;
-            state.unlock_prompt.validating = false;
-            break;
-        }
-        var ts = std.os.linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-        _ = std.os.linux.nanosleep(&ts, null);
-    }
-}
-
-// =============================================================================
-// T-R5.3 (tui-ship-fast-phase2, PR3 R5 wiring — REQ-CHANNELS-003)
-//
-// runLoadWorker polls ctx.cancel_pipe BEFORE invoking api_auth.loadWithUnlock.
-// If the pipe is readable (cancel was signaled), it returns immediately with
-// payload.success=false, err="Cancelled" — without running the Argon2id KDF
-// (which would otherwise block ~2s with default t=3, m=64MiB parameters).
-//
-// The polling is the 100ms REQ-NEW-006 invariant for the unlock submit
-// path. With the current STUB (no poll), the worker proceeds to
-// loadWithUnlock regardless of cancel state — the RED tests below fail.
-//
-// Verification strategy:
-//   1. Create a real cancel_pipe via std.os.linux.pipe.
-//   2. Write 1 byte to pipe[1] BEFORE spawning the worker (simulating
-//      a Ctrl+C that arrived before the worker's first poll).
-//   3. submitUnlockAsync the worker thread.
-//   4. Drain the worker reply — expect .ValidateApiReply with err="Cancelled".
-//      RED: the err will be "Unlock failed: OpenFailed" (or similar) because
-//      loadWithUnlock ran (or the synchronous fall-back fires).
-//
-// We control the storage path via XDG_CONFIG_HOME so submitUnlockAsync
-// resolves to a real (non-existent) file path that triggers loadWithUnlock
-// (avoiding the synchronous fall-back path that wouldn't reach runLoadWorker).
-// =============================================================================
-
-test "T-R5.3: runLoadWorker honors cancel_pipe pre-call (Cancelled reply when readable)" {
-    // 1. Allocate the cancel_pipe + write before spawn.
-    var cancel_pipe: [2]i32 = .{ -1, -1 };
-    {
-        const rc = std.os.linux.pipe(&cancel_pipe);
-        try testing.expectEqual(@as(usize, 0), rc);
-    }
-    defer {
-        if (cancel_pipe[0] >= 0) _ = std.os.linux.close(cancel_pipe[0]);
-        if (cancel_pipe[1] >= 0) _ = std.os.linux.close(cancel_pipe[1]);
-    }
-    // Simulate a Ctrl+C that arrived BEFORE the worker's first poll.
-    {
-        const byte: [1]u8 = .{0x01};
-        _ = std.os.linux.write(cancel_pipe[1], &byte, 1);
-    }
-    // Drain the byte into a scratch so the fds buffer state doesn't
-    // confuse the test runner's later close().
-    {
-        var drain_buf: [1]u8 = undefined;
-        _ = std.os.linux.read(cancel_pipe[0], &drain_buf, 1);
-    }
-    // Re-write for the actual test — the worker's first poll(2) sees
-    // a readable fd on entry.
-    {
-        const byte: [1]u8 = .{0x01};
-        _ = std.os.linux.write(cancel_pipe[1], &byte, 1);
-    }
-
-    // 2. Point storage at a tmpdir so submitUnlockAsync proceeds past
-    //    the sync fall-back (storageCredentialsPath needs XDG or HOME).
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dir_len = try tmp.dir.realPath(testing.io, &dir_buf);
-    // Best-effort: if setenv/putenv is not available, the test will
-    // skip the actual cancel-pipe branch (still must compile). The CI
-    // environment typically has HOME set already, which submitUnlockAsync
-    // picks up via readEnvVar. We use HOME as our anchor.
-
-    // 3. Spawn the worker via submitUnlockAsync.
-    var state: State = .{ .unlock_prompt = .{} };
-    var ch: channels_mod.Channel(channels_mod.Event) = .{};
-    defer ch.close(testing.io);
-    _ = dir_buf[0..dir_len]; // suppress unused warning when HOME works
-    submitUnlockAsync(testing.io, testing.allocator, &state, cancel_pipe, &ch) catch {};
-
-    // 4. Drain the reply. Expect err="Cancelled" within a short window.
-    //    RED behavior: loadWithUnlock ran (or sync fall-back fired), so
-    //    the err message is "Unlock failed: OpenFailed" or "No storage path".
-    var saw_cancelled = false;
-    var saw_other = false;
-    var drain_iters: usize = 0;
-    while (drain_iters < 200) : (drain_iters += 1) {
-        if (ch.tryGet(testing.io)) |ev| {
-            switch (ev) {
-                .ValidateApiReply => |rep| {
-                    if (!rep.success and rep.err_len > 0) {
-                        if (std.mem.eql(u8, rep.err[0..rep.err_len], "Cancelled")) {
-                            saw_cancelled = true;
-                        } else {
-                            saw_other = true;
-                        }
-                    }
-                    if (state.unlock_prompt.worker_thread) |t| t.join();
-                    state.unlock_prompt.worker_thread = null;
-                    state.unlock_prompt.validating = false;
-                    break;
-                },
-                else => {},
-            }
-            break;
-        }
-        var ts = std.os.linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-        _ = std.os.linux.nanosleep(&ts, null);
-    }
-
-    // GREEN: cancellation detected, err="Cancelled" reply posted within 100ms.
-    try testing.expect(saw_cancelled);
-    try testing.expect(!saw_other);
-}
-
-test "T-R5.3: runLoadWorker proceeds when pipe is NOT readable" {
-    // Counter-test: when no byte is written to cancel_pipe, the worker
-    // proceeds to loadWithUnlock normally and returns either a success
-    // reply or a regular failure reply (OpenFailed for missing file).
-    // GREEN: the worker proceeds; the response is NOT "Cancelled".
-    var cancel_pipe: [2]i32 = .{ -1, -1 };
-    {
-        const rc = std.os.linux.pipe(&cancel_pipe);
-        try testing.expectEqual(@as(usize, 0), rc);
-    }
-    defer {
-        if (cancel_pipe[0] >= 0) _ = std.os.linux.close(cancel_pipe[0]);
-        if (cancel_pipe[1] >= 0) _ = std.os.linux.close(cancel_pipe[1]);
-    }
-    // Do NOT write to cancel_pipe — the worker should proceed normally.
-
-    var state: State = .{ .unlock_prompt = .{} };
-    var ch: channels_mod.Channel(channels_mod.Event) = .{};
-    defer ch.close(testing.io);
-    submitUnlockAsync(testing.io, testing.allocator, &state, cancel_pipe, &ch) catch {};
-
-    // Drain the reply. Expect a non-Cancelled reply OR a no-worker
-    // outcome (synchronous fall-back path took over).
-    var saw_cancelled = false;
-    var drain_iters: usize = 0;
-    while (drain_iters < 200) : (drain_iters += 1) {
-        if (ch.tryGet(testing.io)) |ev| {
-            switch (ev) {
-                .ValidateApiReply => |rep| {
-                    if (!rep.success and rep.err_len > 0) {
-                        if (std.mem.eql(u8, rep.err[0..rep.err_len], "Cancelled")) {
-                            saw_cancelled = true;
-                        }
-                    }
-                    if (state.unlock_prompt.worker_thread) |t| t.join();
-                    state.unlock_prompt.worker_thread = null;
-                    state.unlock_prompt.validating = false;
-                    break;
-                },
-                else => {},
-            }
-            break;
-        }
-        var ts = std.os.linux.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-        _ = std.os.linux.nanosleep(&ts, null);
-    }
-
-    // GREEN: worker proceeded normally; we don't see a Cancelled reply.
-    try testing.expect(!saw_cancelled);
-}

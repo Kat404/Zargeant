@@ -258,39 +258,15 @@ test "T-R5.4: src/tui.zig handleKeyInput(.enter, .unlock_prompt) calls submitUnl
 }
 
 // =============================================================================
-// T-R5.4 (continued) — LoadCtx.cancel_pipe literal grep.
+// WU-3 (post-roadmap-hygiene-and-offload, FU-1 [HIGH]) — T-R5.4 REMOVED.
 //
-// Verifies the LoadCtx struct declaration in src/modal.zig carries the
-// `cancel_pipe: ?[2]i32` field added in T-R5.1 (REQ-CHANNELS-001).
-// Without this literal, a future refactor that strips the field would
-// silently break the T-R5.3 poll-wiring contract (LoadCtx.cancel_pipe
-// wouldn't exist for runLoadWorker to read).
-//
-// The grep is intentionally lenient — it locates the field
-// declaration anywhere in src/modal.zig and asserts the expected
-// type signature. A regression that renames or removes the field
-// causes the literal to disappear; the test fails.
+// LoadCtx was the per-submit worker context for the (now-removed)
+// runLoadWorker path. WU-3 offloads loadWithUnlock to the Agent thread
+// via agentRunValidate (no per-submit worker, no LoadCtx). The
+// cancel-pipe contract is verified at the runtime layer (via
+// args.cancel_pipe threaded into validateViaApiWithTarget) and the
+// ctrl+C writer path (CAP-09 above). The CAP-09 invariant — the
+// Ctrl+C key-event intercept writes 1 byte to cancel_pipe[1] after
+// shutdown.store — is unchanged by WU-3 and stays the authoritative
+// cancel-path test.
 // =============================================================================
-
-test "T-R5.4: src/modal.zig declares LoadCtx.cancel_pipe: ?[2]i32 field" {
-    const content = try readSource("src/modal.zig");
-    defer testing.allocator.free(content);
-
-    // The field is declared inside the `const LoadCtx = struct { ... }`
-    // block. We scan for the literal `cancel_pipe: ?[2]i32` anywhere
-    // in the file — both ValidateCtx (parent commit) and LoadCtx
-    // (T-R5.1) declare this exact literal. The grep is satisfied by
-    // either; the test name scopes the intent.
-    const found = std.mem.indexOf(u8, content, "cancel_pipe: ?[2]i32");
-    try testing.expect(found != null);
-
-    // Additionally confirm LoadCtx specifically declares it — the
-    // struct is delimited by `const LoadCtx = struct {` ... `};`.
-    const struct_start = std.mem.indexOf(u8, content, "const LoadCtx = struct {") orelse {
-        try testing.expect(false); // LoadCtx struct MUST exist
-        return;
-    };
-    const struct_end = std.mem.indexOfPos(u8, content, struct_start, "};\n") orelse content.len;
-    const struct_body = content[struct_start..struct_end];
-    try testing.expect(std.mem.indexOf(u8, struct_body, "cancel_pipe: ?[2]i32") != null);
-}

@@ -535,10 +535,21 @@ pub fn deleteWithConfirmation(io: std.Io, path: []const u8, last_four: []const u
 // Internal helpers (test-grade crypto; ponytail: production = Argon2id/AES-GCM)
 // =============================================================================
 
-/// Returns the XDG credentials path. Computed via $XDG_CONFIG_HOME/zargeant/
-/// credentials.json or $HOME/.config/zargeant/credentials.json. Returns
-/// null if neither env var is set.
-fn xdgCredentialsPath(out_buf: *[std.Io.Dir.max_path_bytes]u8) ?[]const u8 {
+/// Resolve the XDG credentials path used by `loadWithUnlock` (called from
+/// `agentRunValidate` at src/runtime.zig per WU-3 of the
+/// post-roadmap-hygiene-and-offload feature doc, FU-1 [HIGH]). Reads
+/// `$XDG_CONFIG_HOME` / `$HOME` via the existing `readEnv` helper and
+/// returns `<base>/zargeant/credentials.json`. Returns null if neither
+/// env var is set.
+///
+/// ponytail: identical inline impl lives at `src/modal.zig:1981`
+/// (`storageCredentialsPath`, private). Future cleanup can de-duplicate
+/// — the modal's copy is needed for the synchronous `submitUnlockAsync`
+/// path-pre-check, while this `pub` exposes the same lookup to the
+/// runtime's Agent-thread `agentRunValidate`. Made `pub` (was `fn`)
+/// in WU-3 so runtime.zig can compute the path without re-threading
+/// the storageCredentialsPath through the channels.Request payload.
+pub fn xdgCredentialsPath(out_buf: *[std.Io.Dir.max_path_bytes]u8) ?[]const u8 {
     if (readEnv("XDG_CONFIG_HOME")) |xdg| {
         if (xdg.len > 0) {
             const out = std.fmt.bufPrint(out_buf, "{s}/zargeant/credentials.json", .{xdg}) catch return null;
