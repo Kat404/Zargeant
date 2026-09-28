@@ -1,0 +1,54 @@
+# Gentleman Guardian Angel Configuration
+# https://github.com/your-org/gga
+
+# AI Provider (required)
+PROVIDER="minimax:MiniMax-M3"
+
+# File patterns to include in review (comma-separated)
+FILE_PATTERNS="*.zig,*.zon"
+
+# File patterns to exclude from review (comma-separated)
+# Default: none
+# Note: Zig has inline tests (test blocks inside .zig files), no separate
+# test_*.zig convention. Generated/vendor dirs (.zig-cache, zig-out, vendor/)
+# are excluded by .gitignore so they never reach the hook.
+#
+# Anti-bloqueo (per engram obs#1842 playbook): gga reviews the WHOLE file,
+# not just the diff. Trackers (odd/**/*.md) and docs (docs/**/*.md) that
+# LIST historical commits with §X.Y violations get meta-flagged as if
+# they were live violations. Adding them to EXCLUDE_PATTERNS avoids the
+# meta-review trap. *.mdx and content/** are future-proofing for any docs
+# engine migrations.
+EXCLUDE_PATTERNS="odd/**/*.md,docs/**/*.md,*.mdx,**/content/**/*.mdx,**/CHANGELOG.md"
+
+# File containing code review rules
+# Default: AGENTS.md
+RULES_FILE="AGENTS.md"
+
+# Strict mode: fail if AI response is ambiguous
+# Default: true
+# Anti-bloqueo (per engram obs#1842 playbook): STRICT_MODE=true requires
+# the provider to emit `STATUS: PASSED|FAILED` in the FIRST 15 LINES of
+# output. Verbose providers (MiniMax-M3, Claude, Gemini with reasoning)
+# emit the status AFTER line 15 → guaranteed false block. Setting to
+# false allows commits when the response is ambiguous; the deterministic
+# layers (prepare-commit-msg STRICT, pre-push audit) still catch real
+# violations. Trade-off: rely on provider reliability for the AI layer.
+STRICT_MODE="false"
+
+# Timeout in seconds for AI provider response
+# Default: 300 (5 minutes)
+# Increase for large changesets or slow connections
+TIMEOUT="300"
+
+# OpenCode provider: optional reasoning effort / variant
+# Examples: minimal, low, medium, high, max
+# OPENCODE_VARIANT="high"
+
+# OpenCode provider: optional agent profile
+# Keep this lightweight. Agent prompts can add significant token overhead.
+# OPENCODE_AGENT="gga-reviewer"
+
+# Base branch for --pr-mode (auto-detects main/master/develop if empty)
+# Default: auto-detect
+# PR_BASE_BRANCH="main"
