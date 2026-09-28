@@ -1316,32 +1316,32 @@ test "classifySignal: zero status (normal _exit(0)) is exited" {
     // waitpid(2) sets low 7 bits = 0 when child called _exit().
     // Exit code 0 is in bits 8..15.
     const status: u32 = 0;
-    try testing.expectEqual(SubprocessExit.exited, SubprocessExit.classifySignal(status));
+    try testing.expectEqual(SubprocessExit.exited, classifySignal(status));
 }
 
 test "classifySignal: nonzero exit status is still exited" {
     // _exit(42) → status = (42 << 8) = 0x2A00 = 10752. Low 7 bits == 0 → exited.
     const status: u32 = @as(u32, 42) << 8;
-    try testing.expectEqual(SubprocessExit.exited, SubprocessExit.classifySignal(status));
+    try testing.expectEqual(SubprocessExit.exited, classifySignal(status));
 }
 
 test "classifySignal: SIGSYS (31) is sigsys_sandbox" {
     // seccomp kills with SIGSYS when BPF filter rejects a syscall.
     // SIGSYS == 31 on Linux x86_64. WTERMSIG = status & 0x7f.
     const status: u32 = 31;
-    try testing.expectEqual(SubprocessExit.sigsys_sandbox, SubprocessExit.classifySignal(status));
+    try testing.expectEqual(SubprocessExit.sigsys_sandbox, classifySignal(status));
 }
 
 test "classifySignal: SIGSEGV (11) is signaled_other (not sandbox)" {
     // SIGSEGV == 11. Segfault ≠ seccomp violation → signaled_other.
     const status: u32 = 11;
-    try testing.expectEqual(SubprocessExit.signaled_other, SubprocessExit.classifySignal(status));
+    try testing.expectEqual(SubprocessExit.signaled_other, classifySignal(status));
 }
 
 test "classifySignal: SIGKILL (9) is signaled_other" {
     // SIGKILL == 9. Generic kill, not sandbox-related.
     const status: u32 = 9;
-    try testing.expectEqual(SubprocessExit.signaled_other, SubprocessExit.classifySignal(status));
+    try testing.expectEqual(SubprocessExit.signaled_other, classifySignal(status));
 }
 
 // =============================================================================
