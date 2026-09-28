@@ -1441,13 +1441,21 @@ test "WindowMock adapter forwards 10 methods (T-2.4.1)" {
         }
     }
 
-    // Case 3: print writes ASCII chars at positions 0..len. Legacy
-    // fragment-overwrite behavior preserved (each call starts at col=0).
+    // Case 3: printAt writes ASCII chars at explicit (col, row) coords
+    //         with advancing cursor. WU-2 (FU-2): the corrected layout
+    //         MUST NOT overwrite earlier fragments — drawConsentPrompt
+    //         (5 sequential calls) and drawErrorModal (em-dash
+    //         fragmentation at modal.zig:1646-1647) both depended on
+    //         this. Successive calls at distinct columns produce
+    //         distinct cells (no overwrite). print() is back-compat
+    //         shim that delegates to printAt(0, 0, ...) and so
+    //         retains the legacy overwrite behavior at col=0.
     {
         const win = try WindowMock.init(testing.allocator, 20, 10);
         defer win.deinit();
         const g = win.grid.?;
-        try win.print("hello", .{});
+        // First fragment at col=0, row=0.
+        try win.printAt(0, 0, "hello", .{});
         const active = g.active();
         try testing.expectEqual(@as(u21, 'h'), active[0].ch);
         try testing.expectEqual(@as(u21, 'e'), active[1].ch);
@@ -1456,25 +1464,31 @@ test "WindowMock adapter forwards 10 methods (T-2.4.1)" {
         try testing.expectEqual(@as(u21, 'o'), active[4].ch);
         try testing.expectEqual(@as(u21, ' '), active[5].ch);
 
-        // Second call overwrites positions 0..2 with "ABC" (legacy
-        // fragment-overwrite). Positions 3..4 stay 'l','o'.
-        try win.print("ABC", .{});
-        try testing.expectEqual(@as(u21, 'A'), active[0].ch);
-        try testing.expectEqual(@as(u21, 'B'), active[1].ch);
-        try testing.expectEqual(@as(u21, 'C'), active[2].ch);
+        // Second fragment at col=5, row=0 — MUST NOT overwrite cells
+        // 0..4. Positions 0..4 stay 'h','e','l','l','o' (corrected
+        // layout). Cells 5..7 = 'A','B','C'.
+        try win.printAt(5, 0, "ABC", .{});
+        try testing.expectEqual(@as(u21, 'h'), active[0].ch);
+        try testing.expectEqual(@as(u21, 'e'), active[1].ch);
+        try testing.expectEqual(@as(u21, 'l'), active[2].ch);
         try testing.expectEqual(@as(u21, 'l'), active[3].ch);
         try testing.expectEqual(@as(u21, 'o'), active[4].ch);
+        try testing.expectEqual(@as(u21, 'A'), active[5].ch);
+        try testing.expectEqual(@as(u21, 'B'), active[6].ch);
+        try testing.expectEqual(@as(u21, 'C'), active[7].ch);
     }
 
-    // Case 4: print handles multi-byte UTF-8 atomically. € (U+20AC,
+    // Case 4: printAt handles multi-byte UTF-8 atomically. € (U+20AC,
     // 3-byte UTF-8) must land in ONE cell with ch=0x20AC, NOT three
     // single-byte cells with ch=0xE2/0x82/0xAC. The legacy byte-
     // iter impl fragmented multi-byte UTF-8; the new Utf8View-based
-    // impl fixes it.
+    // printAt impl (shared with print via delegation) fixes it.
+    // printAt is the new primary path — drawErrorModal's em-dash hint
+    // (modal.zig:1646-1647) depends on this contract.
     {
         const win = try WindowMock.init(testing.allocator, 20, 10);
         defer win.deinit();
-        try win.print("€", .{});
+        try win.printAt(0, 0, "€", .{});
         const active = win.grid.?.active();
         // Find the cell with ch=0x20AC (€).
         var found_euro: usize = 0;

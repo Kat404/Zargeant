@@ -220,41 +220,73 @@ pub const WindowMock = struct {
     }
 
     /// Print `text` with `style` starting at (col=0, row=0), advancing
-    /// linearly with wrapping at `cols`. The legacy fragment-
-    /// overwriting behavior is preserved (each call starts at col=0,
-    /// so multi-call layered rendering — as in drawConsentPrompt —
-    /// sees each fragment's chars overwrite the previous at the same
-    /// offset). Multi-byte UTF-8 is parsed via `Utf8View` so each
-    /// codepoint lands in ONE cell (fixing the legacy byte-
-    /// fragmentation bug that drawErrorModal's em-dash hint hit).
+    /// linearly with wrapping at `cols`. Back-compat shim for the 12+
+    /// tests that relied on the legacy fragment-overwriting behavior
+    /// (each call starts at col=0, so multi-call layered rendering
+    /// overwrites earlier fragments at the same offset). New code
+    /// MUST prefer `printAt(col, row, text, style)` so fragments
+    /// advance instead of overwriting. Multi-byte UTF-8 is parsed
+    /// via `Utf8View` (delegated to `printAt`) so each codepoint
+    /// lands in ONE cell.
     pub fn print(self: *WindowMock, text: []const u8, style: Style) !void {
+        return self.printAt(0, 0, text, style);
+    }
+
+    /// Print `text` with `style` starting at (col, row), advancing
+    /// linearly with wrapping at `cols`. WU-2 (FU-2 [P3 hygiene]):
+    /// the draw fns (drawConsentPrompt / drawErrorModal /
+    /// drawKeyEntry / drawUnlock / drawAgentLoopView) call this
+    /// with an advancing cursor so multi-fragment banners do NOT
+    /// overwrite each other's chars at (0, 0). The previous
+    /// `print`-only design forced every fragment to overwrite the
+    /// previous one — drawConsentPrompt's 5 sequential calls
+    /// silently collapsed to a single trailing fragment, and
+    /// drawErrorModal's em-dash hint fragmented across three
+    /// cells. `printAt` mirrors the advancing `grid.writeCell(...)`
+    /// coords the `render*ToGrid` siblings already use.
+    ///
+    /// UTF-8 atomicity: each codepoint (parsed via `Utf8View`) lands
+    /// in ONE cell. Invalid UTF-8 falls back to byte-iteration (the
+    /// pre-fix behavior — preserves the assertion at T-2.4.1 case 4
+    /// that no cell holds a fragmented 0xAC byte from a € glyph).
+    ///
+    /// Preconditions:
+    /// - `col < self.cols && row < self.rows` (OOB-start is a no-op;
+    ///   wrap-around inside the loop naturally honours the bounds).
+    /// - `text.len > 0` (no-op fast-path).
+    pub fn printAt(self: *WindowMock, col: u16, row: u16, text: []const u8, style: Style) !void {
         if (self.cols == 0 or self.rows == 0) return;
         if (text.len == 0) return;
+        // Tiger Style §4 — defensive precondition on the start position.
+        // OOB-start is a programmer error; silently dropping is wrong, but
+        // emit a no-op rather than panicking so a slightly-off caller
+        // doesn't crash the test (mirrors writeCellRaw's bounds guard).
+        if (col >= self.cols or row >= self.rows) return;
 
-        var col: u16 = 0;
-        var row: u16 = 0;
+        var cur_col: u16 = col;
+        var cur_row: u16 = row;
 
         var view = std.unicode.Utf8View.init(text) catch {
             // Invalid UTF-8 — byte-iterate as a defensive fallback.
             for (text) |c| {
-                self.writeCellRaw(col, row, c, style);
-                col += 1;
-                if (col >= self.cols) {
-                    col = 0;
-                    row += 1;
-                    if (row >= self.rows) return;
+                self.writeCellRaw(cur_col, cur_row, c, style);
+                cur_col += 1;
+                if (cur_col >= self.cols) {
+                    cur_col = 0;
+                    cur_row += 1;
+                    if (cur_row >= self.rows) return;
                 }
             }
             return;
         };
         var iter = view.iterator();
         while (iter.nextCodepoint()) |cp| {
-            self.writeCellRaw(col, row, cp, style);
-            col += 1;
-            if (col >= self.cols) {
-                col = 0;
-                row += 1;
-                if (row >= self.rows) return;
+            self.writeCellRaw(cur_col, cur_row, cp, style);
+            cur_col += 1;
+            if (cur_col >= self.cols) {
+                cur_col = 0;
+                cur_row += 1;
+                if (cur_row >= self.rows) return;
             }
         }
     }
@@ -605,7 +637,13 @@ pub fn drawKeyEntry(win: *WindowMock, state: *State) !void {
 
     win.clear();
     const payload = &state.key_entry;
-    try win.print("Enter API key: ", .{});
+    // WU-2 (FU-2): printAt(col=0, row=0, ...) — explicit origin for the
+    // prompt prefix. The masked `*` chars + err_msg + spinner still write
+    // via win.cells[x] = ... at explicit offsets below; only this prefix
+    // needs the per-codepoint UTF-8 walk printAt provides (ASCII-only so
+    // equivalent, but the contract now matches drawConsentPrompt /
+    // drawErrorModal).
+    try win.printAt(0, 0, "Enter API key: ", .{});
     // REQ-TIRFIX-004 (tui-input-rendering-fixes #1576): input-field
     // display offset. When `draft_len` exceeds the visible window
     // (`max_visible = cols - prefix_len - 1`, reserving one cell for
@@ -659,9 +697,9 @@ pub fn drawKeyEntry(win: *WindowMock, state: *State) !void {
         // previously `payload.err_msg: ?[]const u8` aliased a stack-local
         // `var buf` in submitKeyEntry/submitUnlock and dangled.
         const msg = payload.err_msg_buf[0..payload.err_msg_len];
-        // zargeant/tui-display-err: write err_msg to row 2 (cells[win.cols..])
-        // instead of win.print(msg, ...) which starts at cells[0] and
-        // overwrites the prompt. Mirrors drawAgentLoopView's row-tracking.
+        // zargeant/tui-display-err: write err_msg to row 1 (cells[win.cols..])
+        // instead of win.printAt(msg, ...) which would start at cells[0]
+        // and overwrite the prompt. Mirrors drawAgentLoopView's row-tracking.
         for (msg, 0..) |c, i| {
             const idx = win.cols + i;
             if (idx >= win.cells.len) break;
@@ -1065,7 +1103,11 @@ pub fn renderUnlockToGrid(grid: *ScreenGrid, state: *const State) void {
 pub fn drawUnlock(win: *WindowMock, state: *State) !void {
     win.clear();
     const payload = &state.unlock_prompt;
-    try win.print("Unlock passphrase: ", .{});
+    // WU-2 (FU-2): printAt(col=0, row=0, ...) — explicit origin for the
+    // prompt prefix. ASCII-only so equivalent to print here, but using
+    // printAt keeps the contract uniform across all 5 draw fns (and
+    // future-proofs for non-ASCII passphrase prompts).
+    try win.printAt(0, 0, "Unlock passphrase: ", .{});
     // REQ-TIRFIX-004 (tui-input-rendering-fixes #1576) — symmetric
     // fix to drawKeyEntry. `prefix_len = "Unlock passphrase: ".len = 19`.
     const prefix_len: usize = "Unlock passphrase: ".len;
@@ -1102,9 +1144,9 @@ pub fn drawUnlock(win: *WindowMock, state: *State) !void {
         // WU-1 (Fix A): read inline err_msg_buf[0..err_msg_len]. See
         // drawKeyEntry's mirror comment for the dangling-pointer rationale.
         const msg = payload.err_msg_buf[0..payload.err_msg_len];
-        // zargeant/tui-display-err: write err_msg to row 2 (cells[win.cols..])
-        // instead of win.print(msg, ...) which starts at cells[0] and
-        // overwrites the prompt. Mirrors drawAgentLoopView's row-tracking.
+        // zargeant/tui-display-err: write err_msg to row 1 (cells[win.cols..])
+        // instead of win.printAt(msg, ...) which would start at cells[0]
+        // and overwrite the prompt. Mirrors drawAgentLoopView's row-tracking.
         for (msg, 0..) |c, i| {
             const idx = win.cols + i;
             if (idx >= win.cells.len) break;
@@ -1447,14 +1489,34 @@ pub fn renderConsentPromptToGrid(grid: *ScreenGrid, state: *const State) void {
 /// Render the ConsentPrompt modal into `win`. Pure renderer — does NOT
 /// mutate state. Callers drive `consent_prompt → agent_loop` via
 /// `submitConsentGrant` (REQ-TUI-008).
+///
+/// WU-2 (FU-2): the 5 sequential fragments now advance via
+/// `printAt(col, 0, ...)`. Pre-fix each `win.print` started at
+/// col=0, silently overwriting earlier fragments — the visible
+/// result was just ")?" (the last fragment). The `render*ToGrid`
+/// sibling at `renderConsentPromptToGrid` already used advancing
+/// `grid.writeCell(col, 0, ...)` coords (see the comment block at
+/// that fn for the design §3.4 contract); this fn now mirrors it.
+/// T-SG-8 preserves the pub fn signature verbatim.
 pub fn drawConsentPrompt(win: *WindowMock, state: *State) !void {
     win.clear();
     const payload = &state.consent_prompt;
-    try win.print("Store key at ", .{});
-    try win.print(payload.path, .{ .underline = true });
-    try win.print(" (mode 0o600, last-4 ", .{});
-    try win.print(&payload.last_four, .{ .bold = true });
-    try win.print(")?", .{});
+    // Banner layout (row 0, 5 fragments — mirrors renderConsentPromptToGrid):
+    //   "Store key at " (13) + path (N, underline) + " (mode 0o600, last-4 "
+    //   (21) + last_four (4, bold) + ")?" (2)
+    var col: u16 = 0;
+    try win.printAt(col, 0, "Store key at ", .{});
+    col += @as(u16, @intCast("Store key at ".len));
+    try win.printAt(col, 0, payload.path, .{ .underline = true });
+    col += @as(u16, @intCast(payload.path.len));
+    try win.printAt(col, 0, " (mode 0o600, last-4 ", .{});
+    col += @as(u16, @intCast(" (mode 0o600, last-4 ".len));
+    // last_four is a fixed 4-byte buffer; pass the slice verbatim so
+    // NUL bytes (default-initialised state) render as 0x00 cells, not
+    // skipped — mirrors renderConsentPromptToGrid's contract.
+    try win.printAt(col, 0, &payload.last_four, .{ .bold = true });
+    col += @as(u16, @intCast(payload.last_four.len));
+    try win.printAt(col, 0, ")?", .{});
 }
 
 /// On consent grant (user typed `yes`), call `api_auth.writeWithConsent`
@@ -1661,21 +1723,40 @@ pub fn renderErrorModalToGrid(grid: *ScreenGrid, state: *const State) void {
 /// Render the ErrorModal into `win`. The error class drives a banner;
 /// tls_gated shows the env-var hint `ZARGEANT_RUN_TLS_HANDSHAKE=1`
 /// prominently (REQ-TUI-009 scenario 1).
+///
+/// WU-2 (FU-2): the fragments now advance via `printAt(col, 0, ...)`.
+/// Pre-fix each `win.print` started at col=0, overwriting earlier
+/// fragments — drawErrorModal collapsed to just the trailing hint
+/// (or message, depending on kind). Crucially the em-dash hint
+/// (" — set ZARGEANT_RUN_TLS_HANDSHAKE=1") contains U+2014
+/// (3-byte UTF-8). `printAt` delegates to `Utf8View`, so the em-dash
+/// lands as ONE cell (U+2014), not three byte-cells (0xE2/0x82/0xAC).
+/// T-SG-8 preserves the pub fn signature verbatim.
 pub fn drawErrorModal(win: *WindowMock, state: *State) !void {
     win.clear();
     const payload = &state.error_modal;
     var class_buf: [32]u8 = undefined;
     const class_str = std.fmt.bufPrint(&class_buf, "[{s}]", .{@tagName(payload.kind)}) catch "[?]";
-    try win.print("Error: ", .{ .bold = true });
-    try win.print(class_str, .{ .bold = true });
-    try win.print(" ", .{});
+    // Banner layout (row 0, advancing cursor — mirrors renderErrorModalToGrid):
+    //   "Error: " (7, bold) + "[<class>]" (bold) + " " + message + (if
+    //   kind == .tls_gated) " — set ZARGEANT_RUN_TLS_HANDSHAKE=1" (bold).
+    var col: u16 = 0;
+    try win.printAt(col, 0, "Error: ", .{ .bold = true });
+    col += @as(u16, @intCast("Error: ".len));
+    try win.printAt(col, 0, class_str, .{ .bold = true });
+    col += @as(u16, @intCast(class_str.len));
+    try win.printAt(col, 0, " ", .{});
+    col += @as(u16, @intCast(" ".len));
     // WU-1 (Fix A, D2): read inline message_buf[0..message_len]. See
     // drawKeyEntry for the dangling-pointer rationale.
     if (payload.message_len > 0) {
-        try win.print(payload.message_buf[0..payload.message_len], .{});
+        const msg = payload.message_buf[0..payload.message_len];
+        try win.printAt(col, 0, msg, .{});
+        col += @as(u16, @intCast(msg.len));
     }
     if (payload.kind == .tls_gated) {
-        try win.print(" — set ZARGEANT_RUN_TLS_HANDSHAKE=1", .{ .bold = true });
+        const hint = " — set ZARGEANT_RUN_TLS_HANDSHAKE=1";
+        try win.printAt(col, 0, hint, .{ .bold = true });
     }
 }
 
@@ -1774,32 +1855,37 @@ pub fn renderAgentLoopToGrid(grid: *ScreenGrid, state: *const State) void {
 
 /// Render the AgentLoopView: cumulative LLM text on top + status bar
 /// (model name, token count, last-update timestamp) on the bottom row.
+///
+/// WU-2 (FU-2): the two row 0 + bottom-row fragments now route through
+/// `printAt(col, row, ...)` for the per-codepoint UTF-8 walk. The
+/// previous direct `win.cells[i] = ...` writes were byte-only and
+/// would have fragmented any multi-byte UTF-8 in the cumulative text
+/// (mirrors the drawErrorModal em-dash bug). The fragments do NOT
+/// overlap (row 0 vs last row), so the legacy code had no visible
+/// overwrite bug — but using `printAt` keeps the contract uniform
+/// with drawConsentPrompt / drawErrorModal / drawKeyEntry / drawUnlock.
+/// T-SG-8 preserves the pub fn signature verbatim.
 pub fn drawAgentLoopView(win: *WindowMock, state: *State) !void {
     win.clear();
     const payload = &state.agent_loop;
-    // The cumulative text is owned by the AgentLoopState (ArrayList<u8>).
-    // We print up to one row of it (truncate if it overflows).
+    // Fragment 1 (row 0): cumulative LLM text. The cumulative text is
+    // owned by the AgentLoopState (ArrayList<u8>). We print up to one
+    // row of it (truncate if it overflows).
     if (payload.cumulative.items.len > 0) {
-        const max: usize = @min(payload.cumulative.items.len, @as(usize, win.size().cols));
-        for (payload.cumulative.items[0..max], 0..) |c, i| {
-            win.cells[i] = .{ .ch = c, .style = .{} };
-        }
+        const cumulative_slice = payload.cumulative.items[0..@min(payload.cumulative.items.len, @as(usize, win.size().cols))];
+        try win.printAt(0, 0, cumulative_slice, .{});
     }
-    // Status bar (bottom row) — write into the last row.
+    // Fragment 2 (last row): status bar "model={s} tokens={d} t={d}ms".
     if (win.rows > 0) {
-        const last_row: usize = @as(usize, win.rows - 1) * @as(usize, win.cols);
+        const last_row: u16 = win.rows - 1;
         var status_buf: [128]u8 = undefined;
         const status_str = std.fmt.bufPrint(
             &status_buf,
             "model={s} tokens={d} t={d}ms",
             .{ payload.model, payload.tokens, payload.last_update_ms },
         ) catch "model=? tokens=0 t=0ms";
-        const status_len: usize = @min(status_str.len, win.size().cols);
-        for (status_str[0..status_len], 0..) |c, i| {
-            if (last_row + i < win.cells.len) {
-                win.cells[last_row + i] = .{ .ch = c, .style = .{ .reverse = true } };
-            }
-        }
+        const status_slice = status_str[0..@min(status_str.len, @as(usize, win.size().cols))];
+        try win.printAt(0, last_row, status_slice, .{ .reverse = true });
     }
 }
 
