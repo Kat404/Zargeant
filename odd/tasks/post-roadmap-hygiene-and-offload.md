@@ -37,7 +37,7 @@ Close out the post-roadmap backlog that accumulated during the 2026-09-26 housek
 | File | Action | WU |
 | --- | --- | --- |
 | `src/channels.zig` | +1 variant `Event.ValidateApiRequest { kind: enum{ key_entry, unlock }, key_or_pass: [BUF_LEN]u8, key_len: usize }` | WU-3 |
-| `src/runtime.zig` | New arm in `agentThreadLoop` for `ValidateApiRequest` → `agentRunValidate` helper → `Event.ValidateApiReply` on `submit_reply` (16→17 variants) | WU-3 |
+| `src/runtime.zig` | New arm in `agentThreadLoop` for `ValidateApiRequest` → `agentRunValidate` helper → `Event.ValidateApiReply` on `submit_reply` (18→19 variants — `ValidateApiRequest` joined `TUI→Agent (8)`) | WU-3 |
 | `src/modal.zig` | **Drop** `runValidateWorker` + `ValidateCtx` + `LoadCtx` + `std.Thread.spawn` at `:807, :853, :1137`. Replace call sites with `Event.ValidateApiRequest` post on `tui_to_agent` | WU-3 |
 | `src/modal.zig` | Add `WindowMock.printAt(self, col, row, text, style)`. Keep `WindowMock.print` as `printAt(0,0,…)` for back-compat. Update `drawConsentPrompt`/`:drawErrorModal`/`drawKeyEntry`/`drawUnlock`/`drawAgentLoopView` to use `printAt` with advancing cursor. T-SG-8 signatures verbatim | WU-2 |
 | `src/api_client.zig` | Add regression test `test "testing.allocator never reaches production"` that fails if any non-test-block line references `testing.allocator` / `testing.io` | WU-1 |
@@ -73,7 +73,7 @@ Close out the post-roadmap backlog that accumulated during the 2026-09-26 housek
 - [ ] `just test-tui` + `just test-runtime-thread` pass
 
 ### WU-3 (FU-1 Agent-thread offload) [HIGH]
-- [ ] `Event.ValidateApiRequest` added to `src/channels.zig::Event` (16→17 variants). All 3 docs/grep sites that count variants stay in sync (no automated test exists for this — manual `git grep` confirmation only)
+- [ ] `Event.ValidateApiRequest` added to `src/channels.zig::Event` (18→19 variants). Variant count is asserted via file-header comment + manual `git grep "TUI→Agent (" src/channels.zig` (no automated test for the count — confirmed at writer time)
 - [ ] `agentRunValidate(args, req: Event.ValidateApiRequest)` helper added in `src/runtime.zig`
 - [ ] `agentThreadLoop` drains `Event.ValidateApiRequest` → routes to `agentRunValidate` → posts `Event.ValidateApiReply` on `submit_reply` (existing reply channel, unchanged)
 - [ ] `src/modal.zig::runValidateWorker` + `ValidateCtx` + `LoadCtx` removed; `submitKeyEntryAsync`/`submitUnlockAsync` now post `Event.ValidateApiRequest` on `tui_to_agent`
@@ -171,7 +171,7 @@ already existed (WU-2 of tui-input-flow-bugfixes-2), so only the
 request side was missing.
 
 - Add Event.ValidateApiRequest { kind, key_or_pass, key_len }
-  to src/channels.zig::Event (16→17 variants)
+  to src/channels.zig::Event (18→19 variants)
 - Add agentRunValidate(args, req) helper in src/runtime.zig
 - agentThreadLoop routes ValidateApiRequest → agentRunValidate →
   posts Event.ValidateApiReply on submit_reply
@@ -248,7 +248,7 @@ Optional Event.ToolCallsDetected variant deferred if budget tight.
 
 > **R-2 (LOW):** WU-2 `printAt` changes affect 5 `draw*` functions. Mitigation: T-SG-8 contract test (`modal.zig:59` + `runtime_thread.zig:1649`) enforces verbatim signature preservation; review the diff to confirm no signature churn.
 
-> **R-3 (LOW):** WU-4 depends on WU-3 landing first (channels.zig 16→17 variants in WU-3, then 17→18 if `ToolCallsDetected` ships). Mitigation: ship WU-4 as PR-3 after PR-2 merges; do not start WU-4 on the local branch until PR-2 is merged to main.
+> **R-3 (LOW):** WU-4 depends on WU-3 landing first (channels.zig 18→19 variants in WU-3, then 19→20 if `ToolCallsDetected` ships). Mitigation: ship WU-4 as PR-3 after PR-2 merges; do not start WU-4 on the local branch until PR-2 is merged to main.
 
 > **R-4 (NEGLIGIBLE):** WU-1 audit is a no-op confirmation. Risk: future leak goes undetected. Mitigation: the regression test parses its own source on each run; build flags (ReleaseSafe/ReleaseFast) reject `testing.allocator` in production paths.
 
@@ -266,7 +266,7 @@ Optional Event.ToolCallsDetected variant deferred if budget tight.
 - `src/modal.zig:1944-1955` — `io_allocator` helper (already-gated pattern)
 - `src/runtime.zig:497-613` — `agentThreadLoop` (template for the new arm)
 - `src/runtime.zig:663-671` — `agentDispatchTool` (template for `agentRunValidate`)
-- `src/channels.zig:79-189` — `Event` union (current 16 variants; will become 17 after WU-3)
+- `src/channels.zig:79-189` — `Event` union (current 19 variants as of WU-3 merge; will become 20 if `ToolCallsDetected` ships in WU-4)
 - `src/api_sse.zig:269` — `std.json.parseFromSlice` reference pattern
 - `src/api_sse.zig:285-295` — current SSE parser (only walks `delta.content` / `.reasoning_content`)
 - `tests/tui/runtime_thread.zig:1414, :1467, :1649, :1893, :1974, :2018, :2797, :2837, :2877, :3033, :3053, :3072, :3089` — existing T-SG-8 + per-frame assertions
