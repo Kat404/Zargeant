@@ -112,3 +112,76 @@ test "T-AC-3: tls_conn.connect signature matches bridge fn shape" {
     const payload = @typeInfo(info.return_type.?).error_union.payload;
     try testing.expectEqual(ApiClient.tls_conn, payload);
 }
+
+// =============================================================================
+// T-AUDIT-1: testing.allocator / testing.io never reach production paths in
+// src/api_client.zig. Defends against the regression that bit modal.zig and
+// api_auth.zig in PR #15. Closes the api-client-testability-audit item from
+// the 2026-09-26 housekeeping inventory — see
+// odd/tasks/post-roadmap-hygiene-and-offload.md WU-1.
+//
+// Walks the source line-by-line, tracking brace depth. Any reference to
+// `testing.allocator` or `testing.io` on a non-comment line while outside a
+// `test "…" { … }` block is flagged. Doc comments (//, ///) are skipped — the
+// only "non-test" match in the current source is a doc comment at
+// src/api_client.zig:174 that documents WHY we avoid testing.allocator in
+// production paths. Build flags (ReleaseSafe/ReleaseFast) also reject any
+// leak at compile time; this test is the in-source companion.
+// =============================================================================
+test "T-AUDIT-1: testing.allocator never reaches production paths in api_client.zig" {
+    const io = testing.io;
+    const content = std.Io.Dir.cwd().readFileAlloc(io, "src/api_client.zig", testing.allocator, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer testing.allocator.free(content);
+
+    var line_no: usize = 1;
+    var brace_depth: usize = 0;
+    var test_brace_depth: ?usize = null;
+    var leaks: std.ArrayList(struct { line_no: usize, text: []const u8 }) = .empty;
+    defer leaks.deinit(testing.allocator);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| : (line_no += 1) {
+        const trimmed = std.mem.trim(u8, line, " \t");
+
+        // Skip line-level comments (//, ///). Doc comments may mention
+        // testing.allocator to explain WHY we don't use it in production
+        // (see src/api_client.zig:174) — these are not leaks.
+        const is_line_comment = std.mem.startsWith(u8, trimmed, "//");
+        if (!is_line_comment) {
+            // Top-level decl: enter a new test block.
+            if (std.mem.startsWith(u8, trimmed, "test \"")) {
+                test_brace_depth = brace_depth;
+            }
+
+            // Flag any reference on this non-comment line if we're outside a test.
+            const has_alloc_ref = std.mem.indexOf(u8, line, "testing.allocator") != null;
+            const has_io_ref = std.mem.indexOf(u8, line, "testing.io") != null;
+            if ((has_alloc_ref or has_io_ref) and test_brace_depth == null) {
+                try leaks.append(testing.allocator, .{ .line_no = line_no, .text = line });
+            }
+        }
+
+        // Track braces AFTER processing the line's content.
+        for (line) |ch| {
+            if (ch == '{') {
+                brace_depth += 1;
+            } else if (ch == '}') {
+                if (brace_depth > 0) brace_depth -= 1;
+                if (test_brace_depth) |tbd| {
+                    if (brace_depth == tbd) test_brace_depth = null;
+                }
+            }
+        }
+    }
+
+    if (leaks.items.len > 0) {
+        std.debug.print("\nFAIL: testing.allocator/testing.io found outside test blocks in src/api_client.zig:\n", .{});
+        for (leaks.items) |leak| {
+            std.debug.print("  L{d}: {s}\n", .{ leak.line_no, leak.text });
+        }
+        return error.TestingAllocatorLeak;
+    }
+}
