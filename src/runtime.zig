@@ -971,25 +971,43 @@ fn classifySignal(status: u32) SubprocessExit {
     return .signaled_other;
 }
 
+fn isWhitespace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n';
+}
+
 fn parse_argv(allocator: std.mem.Allocator, args: []const u8) ![]const []const u8 {
-    // Upper bound: every char + tool name could be its own arg + 1 for safety.
-    var argv_storage = try allocator.alloc([]const u8, args.len + 1);
+    // Pre-pass: count tokens so storage length == returned slice length.
+    // Without this, `allocator.free(argv)` at the call site uses
+    // argv.len × @sizeOf([]const u8) bytes, which would mismatch the
+    // original `args.len + 1` capacity and panic the testing allocator
+    // with "Invalid free" (or silently corrupt the heap in ReleaseSafe).
     var argc: usize = 0;
+    {
+        var i: usize = 0;
+        while (i < args.len) {
+            while (i < args.len and isWhitespace(args[i])) : (i += 1) {}
+            if (i >= args.len) break;
+            while (i < args.len and !isWhitespace(args[i])) : (i += 1) {}
+            argc += 1;
+        }
+    }
+
+    var argv_storage = try allocator.alloc([]const u8, argc);
+    var slot: usize = 0;
     var i: usize = 0;
     while (i < args.len) {
-        // Skip leading whitespace
-        while (i < args.len and (args[i] == ' ' or args[i] == '\t' or args[i] == '\n')) : (i += 1) {}
+        while (i < args.len and isWhitespace(args[i])) : (i += 1) {}
         if (i >= args.len) break;
         const start = i;
-        while (i < args.len and args[i] != ' ' and args[i] != '\t' and args[i] != '\n') : (i += 1) {}
-        const end = i;
+        while (i < args.len and !isWhitespace(args[i])) : (i += 1) {}
         // Tiger Style §6: explicit allocation; failure modes are
         // `OutOfMemory` propagated via `?` to the caller (which can
         // post ToolError.spawn_failed).
-        argv_storage[argc] = try allocator.dupe(u8, args[start..end]);
-        argc += 1;
+        argv_storage[slot] = try allocator.dupe(u8, args[start..i]);
+        slot += 1;
     }
-    return argv_storage[0..argc];
+    std.debug.assert(slot == argc); // Tiger Style §4: post-condition
+    return argv_storage;
 }
 
 // =============================================================================
@@ -1316,32 +1334,32 @@ test "classifySignal: zero status (normal _exit(0)) is exited" {
     // waitpid(2) sets low 7 bits = 0 when child called _exit().
     // Exit code 0 is in bits 8..15.
     const status: u32 = 0;
-    try testing.expectEqual(SubprocessExit.exited, SubprocessExit.classifySignal(status));
+    try testing.expectEqual(SubprocessExit.exited, classifySignal(status));
 }
 
 test "classifySignal: nonzero exit status is still exited" {
     // _exit(42) → status = (42 << 8) = 0x2A00 = 10752. Low 7 bits == 0 → exited.
     const status: u32 = @as(u32, 42) << 8;
-    try testing.expectEqual(SubprocessExit.exited, SubprocessExit.classifySignal(status));
+    try testing.expectEqual(SubprocessExit.exited, classifySignal(status));
 }
 
 test "classifySignal: SIGSYS (31) is sigsys_sandbox" {
     // seccomp kills with SIGSYS when BPF filter rejects a syscall.
     // SIGSYS == 31 on Linux x86_64. WTERMSIG = status & 0x7f.
     const status: u32 = 31;
-    try testing.expectEqual(SubprocessExit.sigsys_sandbox, SubprocessExit.classifySignal(status));
+    try testing.expectEqual(SubprocessExit.sigsys_sandbox, classifySignal(status));
 }
 
 test "classifySignal: SIGSEGV (11) is signaled_other (not sandbox)" {
     // SIGSEGV == 11. Segfault ≠ seccomp violation → signaled_other.
     const status: u32 = 11;
-    try testing.expectEqual(SubprocessExit.signaled_other, SubprocessExit.classifySignal(status));
+    try testing.expectEqual(SubprocessExit.signaled_other, classifySignal(status));
 }
 
 test "classifySignal: SIGKILL (9) is signaled_other" {
     // SIGKILL == 9. Generic kill, not sandbox-related.
     const status: u32 = 9;
-    try testing.expectEqual(SubprocessExit.signaled_other, SubprocessExit.classifySignal(status));
+    try testing.expectEqual(SubprocessExit.signaled_other, classifySignal(status));
 }
 
 // =============================================================================
@@ -1351,9 +1369,17 @@ test "classifySignal: SIGKILL (9) is signaled_other" {
 test "agentDispatchTool: posts DispatchToolRequest on tui_to_tools" {
     // Set up a minimal Runtime so agentDispatchTool has channels to write to.
     // We don't spawn threads — just exercise the helper directly.
+    // NOTE: do NOT call runtime.shutdown() here — that closes the channels
+    // and would make the agentDispatchTool tryPut fail (the catch branch
+    // would then call logger.global() and panic without init).
     var runtime = try Runtime.spawn(.{});
     defer runtime.deinit();
-    runtime.shutdown(testing.io);
+
+    // agentDispatchTool logs to logger.global() in its error catch path;
+    // initialize the global so any future expansion that hits the catch
+    // branch doesn't panic with "logger.global() called before initGlobal()".
+    try logger.initGlobal(testing.io);
+    defer logger.deinitGlobal(testing.io);
 
     // Build a ThreadArgs pointing to runtime's channels + our own shutdown
     // atomic + dummy cancel pipe (agentDispatchTool only touches channels
