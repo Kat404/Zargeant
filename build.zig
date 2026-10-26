@@ -3,10 +3,10 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{ .default_target = .{} });
     const optimize = b.option(
-        std.builtin.OptimizeMode,
+        std.lang.Optimize,
         "optimize",
         "Prioritize performance, safety, or fast compilation (Debug, ReleaseSafe, ReleaseFast)",
-    ) orelse .Debug;
+    ) orelse .debug;
 
     // mibu dep removed (PR 6, terminal-control-lib-from-scratch, WU 6.5).
     // The terminal control layer is now an in-tree src/terminal/ module
@@ -37,8 +37,8 @@ pub fn build(b: *std.Build) void {
         .name = "zargeant",
         .root_module = exe_mod,
     });
-    exe.lto = if (optimize == .ReleaseFast) .full else null;
-    exe.root_module.strip = optimize == .ReleaseFast;
+    exe.lto = if (optimize == .fast) .full else null;
+    exe.root_module.strip = optimize == .fast;
     b.installArtifact(exe);
 
     // run step: `zig build run -- --mock` (or with no args for production mode).
@@ -47,7 +47,7 @@ pub fn build(b: *std.Build) void {
     const run_exe = b.addRunArtifact(exe);
     const run_step = b.step("run", "Run zargeant (pass args after `--`, e.g. `zig build run -- --mock`)");
     run_step.dependOn(&run_exe.step);
-    if (b.args) |args| run_exe.addArgs(args);
+    run_exe.addPassthruArgs();
 
     // exe: tools/debug_call.zig (manual-only API key probe).
     // tls-handrolled (sdd id=323, T3.5): wires the micro-CLI as a runnable step.
