@@ -641,7 +641,7 @@ pub const ToolSubprocess = struct {
     /// Loops on `EINTR`. Returns the raw status word; callers use
     /// `std.os.linux.W.{IFEXITED,IFSIGNALED,EXITSTATUS,TERMSIG}` to decode.
     pub fn wait(self: *ToolSubprocess) !u32 {
-        var status: u32 = 0;
+        var status: i32 = 0;
         while (true) {
             const rc = std.os.linux.waitpid(self.pid, &status, 0);
             if (rc == std.math.maxInt(usize)) {
@@ -652,7 +652,7 @@ pub const ToolSubprocess = struct {
                 if (err == .INTR) continue;
                 return error.WaitpidFailed;
             }
-            return status;
+            return @bitCast(status);
         }
     }
 };
