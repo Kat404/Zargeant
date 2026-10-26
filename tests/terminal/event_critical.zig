@@ -200,10 +200,10 @@ test "C11: CSI 8 t (no params) returns .resize (single-arg form)" {
 
 test "C23: terminal.event exposes pollReadable function" {
     const info: std.builtin.Type = @typeInfo(event);
-    const decls = info.@"struct".decls;
+    const decls = info.@"struct".decl_names;
     var found = false;
     for (decls) |d| {
-        if (std.mem.eql(u8, d.name, "pollReadable")) {
+        if (std.mem.eql(u8, d, "pollReadable")) {
             found = true;
         }
     }
@@ -220,11 +220,11 @@ test "C23: terminal.event exposes pollReadable function" {
 test "D4: Parser.next accepts an injected poll_fn (no mutable global)" {
     const Parser = event.Parser;
     const info: std.builtin.Type = @typeInfo(Parser);
-    const decls = info.@"struct".decls;
+    const decls = info.@"struct".decl_names;
     var found_next = false;
     var poll_fn_in_signature = false;
     for (decls) |d| {
-        if (std.mem.eql(u8, d.name, "next")) {
+        if (std.mem.eql(u8, d, "next")) {
             found_next = true;
             // Zig 0.16 Type.Declaration only has `name`; we cannot inspect
             // the signature at runtime. The compile-time signature check is

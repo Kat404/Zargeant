@@ -91,8 +91,8 @@ pub const ScreenGrid = struct {
             .cols = cols,
             .rows = rows,
             .cells = .{
-                .{empty_cell} ** MAX_CELL_BUF,
-                .{empty_cell} ** MAX_CELL_BUF,
+                @splat(empty_cell),
+                @splat(empty_cell),
             },
             .active_idx = 0,
         };

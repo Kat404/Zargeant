@@ -72,7 +72,7 @@ pub fn runBlocking(
 /// comptime branches on whether Result is an error union.
 fn cancelFuture(comptime Fut: type, fut: *Fut, io: std.Io) void {
     if (fut.any_future == null) return;
-    if (@typeInfo(@typeInfo(Fut).@"struct".fields[1].type) == .error_union) {
+    if (@typeInfo(@typeInfo(Fut).@"struct".field_types[1]) == .error_union) {
         _ = fut.cancel(io) catch {};
     } else _ = fut.cancel(io);
 }

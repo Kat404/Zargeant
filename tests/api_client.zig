@@ -102,11 +102,11 @@ test "T-AC-2: validateViaApiWithTarget TLS uses bridge_sync_async" {
 test "T-AC-3: tls_conn.connect signature matches bridge fn shape" {
     const FnTy = @TypeOf(ApiClient.tls_conn.connect);
     const info = @typeInfo(FnTy).@"fn";
-    try testing.expectEqual(@as(usize, 4), info.params.len);
-    try testing.expectEqual(std.Io, info.params[0].type.?);
-    try testing.expectEqual(std.mem.Allocator, info.params[1].type.?);
-    try testing.expectEqual([]const u8, info.params[2].type.?);
-    try testing.expectEqual(u16, info.params[3].type.?);
+    try testing.expectEqual(@as(usize, 4), info.param_types.len);
+    try testing.expectEqual(std.Io, info.param_types[0].?);
+    try testing.expectEqual(std.mem.Allocator, info.param_types[1].?);
+    try testing.expectEqual([]const u8, info.param_types[2].?);
+    try testing.expectEqual(u16, info.param_types[3].?);
     // Return type must be an error union wrapping tls_conn.
     try testing.expect(@typeInfo(info.return_type.?) == .error_union);
     const payload = @typeInfo(info.return_type.?).error_union.payload;

@@ -37,7 +37,7 @@ comptime {
 /// masked-vs-visible; `draft` is the buffered passphrase (zeroed by the
 /// Agent thread on consume per REQ-TUI-007 memory hygiene rule).
 pub const State = struct {
-    draft: [256]u8 = .{0} ** 256,
+    draft: [256]u8 = @splat(0),
     draft_len: usize = 0,
     reveal: bool = false,
 };

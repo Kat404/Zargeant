@@ -312,7 +312,7 @@ pub const disableBracketedPaste = @import("dpm").disableBracketedPaste;
 const testing = std.testing;
 
 test "TermSize is a 2-field struct" {
-    try testing.expect(@typeInfo(TermSize).@"struct".fields.len == 2);
+    try testing.expect(@typeInfo(TermSize).@"struct".field_names.len == 2);
     const sz: TermSize = .{ .width = 120, .height = 40 };
     try testing.expectEqual(@as(u16, 120), sz.width);
     try testing.expectEqual(@as(u16, 40), sz.height);
@@ -322,11 +322,11 @@ test "RawTerm.disableRawMode is a method declaration" {
     // Smoke canary at tests/tui/terminal_smoke.zig:38 asserts decls.len > 0;
     // the method counts as the 1 declaration. Guard against accidental
     // removal of the method.
-    const decls = @typeInfo(RawTerm).@"struct".decls;
+    const decls = @typeInfo(RawTerm).@"struct".decl_names;
     try testing.expect(decls.len > 0);
     var saw_disable = false;
     for (decls) |d| {
-        if (std.mem.eql(u8, d.name, "disableRawMode")) saw_disable = true;
+        if (std.mem.eql(u8, d, "disableRawMode")) saw_disable = true;
     }
     try testing.expect(saw_disable);
 }
@@ -348,7 +348,7 @@ test "term.zig re-exports the 6 DPM entry points (design C31)" {
     // WU-2 (tui-keyentry-rebuild, REQ-NEW-002) extends the list with the
     // 2 DEC 2004 entry points so the namespace stays discoverable.
     const term_info: std.builtin.Type = @typeInfo(@import("term.zig"));
-    const decls = term_info.@"struct".decls;
+    const decls = term_info.@"struct".decl_names;
     const required = [_][]const u8{
         "enterAlternateScreen",
         "exitAlternateScreen",
@@ -364,7 +364,7 @@ test "term.zig re-exports the 6 DPM entry points (design C31)" {
     for (required) |name| {
         var found = false;
         for (decls) |d| {
-            if (std.mem.eql(u8, d.name, name)) {
+            if (std.mem.eql(u8, d, name)) {
                 found = true;
                 break;
             }

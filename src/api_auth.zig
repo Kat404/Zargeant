@@ -1089,8 +1089,8 @@ test "deriveKey produces 32-byte output for known password+salt" {
 
 // T-C1.2a — encrypt+decrypt (AES-256-GCM) round-trip.
 test "encrypt+decrypt round-trip" {
-    const key: [32]u8 = [_]u8{0xAA} ** 32;
-    const nonce: [12]u8 = [_]u8{0xBB} ** 12;
+    const key: [32]u8 = @splat(0xAA);
+    const nonce: [12]u8 = @splat(0xBB);
     const plaintext = "the quick brown fox jumps over the lazy dog";
     var ct_buf: [43]u8 = undefined;
     var tag: [16]u8 = undefined;
@@ -1102,9 +1102,9 @@ test "encrypt+decrypt round-trip" {
 
 // T-C1.2b — tampered ciphertext → error.AuthenticationFailed.
 test "tampered ciphertext → error.AuthenticationFailed" {
-    const key: [32]u8 = [_]u8{0xAA} ** 32;
-    const nonce: [12]u8 = [_]u8{0xBB} ** 12;
-    var ct: [16]u8 = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0xAA);
+    const nonce: [12]u8 = @splat(0xBB);
+    var ct: [16]u8 = @splat(0);
     var tag: [16]u8 = undefined;
     encrypt(&ct, &tag, "0123456789abcdef", key, nonce);
     ct[0] ^= 0x01; // flip one bit

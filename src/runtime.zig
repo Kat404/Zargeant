@@ -717,8 +717,8 @@ pub fn agentRunValidate(args: *const ThreadArgs, req: channels_mod.ValidateApiRe
 
     var payload: channels_mod.ValidateApiReplyPayload = .{
         .success = false,
-        .last_four = .{0} ** 4,
-        .err = .{0} ** 128,
+        .last_four = @splat(0),
+        .err = @splat(0),
         .err_len = 0,
     };
 
@@ -1250,9 +1250,9 @@ test "shutdown timeout API surface returns JoinResult enum" {
         const info = @typeInfo(JoinResult).@"enum";
         var saw_clean = false;
         var saw_timeout = false;
-        for (info.fields) |f| {
-            if (std.mem.eql(u8, f.name, "clean")) saw_clean = true;
-            if (std.mem.eql(u8, f.name, "timeout")) saw_timeout = true;
+        for (info.field_names) |f| {
+            if (std.mem.eql(u8, f, "clean")) saw_clean = true;
+            if (std.mem.eql(u8, f, "timeout")) saw_timeout = true;
         }
         if (!saw_clean or !saw_timeout) @compileError("JoinResult missing clean/timeout tags");
     }

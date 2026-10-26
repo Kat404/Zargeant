@@ -347,19 +347,19 @@ test "Agent body: ChunkEvent.err maps to AgentErrorPayload (auth kind)" {
     // Spot-check a few representative kinds.
     {
         const p = Rt.mapChunkError(ApiClient.ErrorKind.Unauthorized);
-        try testing.expectEqual(@as(usize, @intFromEnum(p.kind)), @intFromEnum(Rt.AgentErrorClass.auth));
+        try testing.expectEqual(@as(usize, @backingInt(p.kind)), @backingInt(Rt.AgentErrorClass.auth));
     }
     {
         const p = Rt.mapChunkError(ApiClient.ErrorKind.TlsHandshakeFailed);
-        try testing.expectEqual(@as(usize, @intFromEnum(p.kind)), @intFromEnum(Rt.AgentErrorClass.tls_gated));
+        try testing.expectEqual(@as(usize, @backingInt(p.kind)), @backingInt(Rt.AgentErrorClass.tls_gated));
     }
     {
         const p = Rt.mapChunkError(ApiClient.ErrorKind.Cancelled);
-        try testing.expectEqual(@as(usize, @intFromEnum(p.kind)), @intFromEnum(Rt.AgentErrorClass.network));
+        try testing.expectEqual(@as(usize, @backingInt(p.kind)), @backingInt(Rt.AgentErrorClass.network));
     }
     {
         const p = Rt.mapChunkError(ApiClient.ErrorKind.MalformedStream);
-        try testing.expectEqual(@as(usize, @intFromEnum(p.kind)), @intFromEnum(Rt.AgentErrorClass.internal));
+        try testing.expectEqual(@as(usize, @backingInt(p.kind)), @backingInt(Rt.AgentErrorClass.internal));
     }
 }
 
@@ -367,11 +367,11 @@ test "Agent body: error mapping is exhaustive across all 15 ErrorKind variants" 
     // REQ-TUI-026 scenario 2 — exhaustive switch over api_client.ErrorKind.
     // Compile-time guarantee: the switch has no else arm, so adding a new
     // ErrorKind variant forces a build failure until the mapping is updated.
-    const fields = @typeInfo(ApiClient.ErrorKind).@"enum".fields;
-    try testing.expectEqual(@as(usize, 15), fields.len);
+    const enum_info = @typeInfo(ApiClient.ErrorKind).@"enum";
+    try testing.expectEqual(@as(usize, 15), enum_info.field_names.len);
     // Touch every variant — compile-time check that the switch covers them.
-    inline for (fields) |f| {
-        const kind: ApiClient.ErrorKind = @enumFromInt(f.value);
+    inline for (enum_info.field_names, enum_info.field_values) |_, f_value| {
+        const kind: ApiClient.ErrorKind = @fromBackingInt(@intCast(f_value));
         _ = Rt.mapChunkError(kind);
     }
 }
@@ -394,12 +394,12 @@ test "TUI body: ThreadArgs carries key + mock_handle (null defaults)" {
         .mock_handle = null,
     };
     // Compile-time check that the fields exist.
-    const info = @typeInfo(Rt.ThreadArgs).@"struct".fields;
+    const info = @typeInfo(Rt.ThreadArgs).@"struct".field_names;
     var saw_key = false;
     var saw_handle = false;
     inline for (info) |f| {
-        if (std.mem.eql(u8, f.name, "key")) saw_key = true;
-        if (std.mem.eql(u8, f.name, "mock_handle")) saw_handle = true;
+        if (std.mem.eql(u8, f, "key")) saw_key = true;
+        if (std.mem.eql(u8, f, "mock_handle")) saw_handle = true;
     }
     try testing.expect(saw_key);
     try testing.expect(saw_handle);
@@ -408,11 +408,11 @@ test "TUI body: ThreadArgs carries key + mock_handle (null defaults)" {
 test "TUI body: openErrorModal classification routes errors to correct kinds" {
     // REQ-TUI-031 — AgentErrorPayload.kind from Agent maps to modal.ErrorKind.
     // Pure mapping function: exhausts the 5-class enum.
-    try testing.expectEqual(@as(usize, @intFromEnum(Rt.openErrorKind(Rt.AgentErrorClass.auth))), @intFromEnum(M.ErrorKind.auth));
-    try testing.expectEqual(@as(usize, @intFromEnum(Rt.openErrorKind(Rt.AgentErrorClass.network))), @intFromEnum(M.ErrorKind.network));
-    try testing.expectEqual(@as(usize, @intFromEnum(Rt.openErrorKind(Rt.AgentErrorClass.tls_gated))), @intFromEnum(M.ErrorKind.tls_gated));
-    try testing.expectEqual(@as(usize, @intFromEnum(Rt.openErrorKind(Rt.AgentErrorClass.sandbox))), @intFromEnum(M.ErrorKind.sandbox));
-    try testing.expectEqual(@as(usize, @intFromEnum(Rt.openErrorKind(Rt.AgentErrorClass.internal))), @intFromEnum(M.ErrorKind.internal));
+    try testing.expectEqual(@as(usize, @backingInt(Rt.openErrorKind(Rt.AgentErrorClass.auth))), @backingInt(M.ErrorKind.auth));
+    try testing.expectEqual(@as(usize, @backingInt(Rt.openErrorKind(Rt.AgentErrorClass.network))), @backingInt(M.ErrorKind.network));
+    try testing.expectEqual(@as(usize, @backingInt(Rt.openErrorKind(Rt.AgentErrorClass.tls_gated))), @backingInt(M.ErrorKind.tls_gated));
+    try testing.expectEqual(@as(usize, @backingInt(Rt.openErrorKind(Rt.AgentErrorClass.sandbox))), @backingInt(M.ErrorKind.sandbox));
+    try testing.expectEqual(@as(usize, @backingInt(Rt.openErrorKind(Rt.AgentErrorClass.internal))), @backingInt(M.ErrorKind.internal));
 }
 
 // =============================================================================
@@ -616,10 +616,10 @@ test "main preflight: Runtime.Config carries initial_auth_state (default .needs_
     // so main() can thread the preflight result into the runtime. Default
     // .needs_first_entry keeps existing `Runtime.spawn(.{})` callers compiling.
     var cfg: Rt.Config = .{};
-    try testing.expectEqual(@as(usize, @intFromEnum(cfg.initial_auth_state)), @intFromEnum(Auth.AuthState.needs_first_entry));
+    try testing.expectEqual(@as(usize, @backingInt(cfg.initial_auth_state)), @backingInt(Auth.AuthState.needs_first_entry));
     // Verify the field can be set + read back.
     cfg.initial_auth_state = .has_disk_file;
-    try testing.expectEqual(@as(usize, @intFromEnum(cfg.initial_auth_state)), @intFromEnum(Auth.AuthState.has_disk_file));
+    try testing.expectEqual(@as(usize, @backingInt(cfg.initial_auth_state)), @backingInt(Auth.AuthState.has_disk_file));
 }
 
 test "main preflight: ThreadArgs (tui.zig canonical) carries initial_auth_state" {
@@ -637,10 +637,10 @@ test "main preflight: ThreadArgs (tui.zig canonical) carries initial_auth_state"
         .mock_handle = null,
         .initial_auth_state = .has_disk_file,
     };
-    const info = @typeInfo(Tui.ThreadArgs).@"struct".fields;
+    const info = @typeInfo(Tui.ThreadArgs).@"struct".field_names;
     var saw_auth = false;
     inline for (info) |f| {
-        if (std.mem.eql(u8, f.name, "initial_auth_state")) saw_auth = true;
+        if (std.mem.eql(u8, f, "initial_auth_state")) saw_auth = true;
     }
     try testing.expect(saw_auth);
 }
@@ -801,7 +801,7 @@ test "idle relock: tuiThreadMain references isIdleRelockDue (static-grep)" {
 // =============================================================================
 
 test "no-TTY: Lifecycle carries no_tty flag for degraded mode (REQ-TUI-047)" {
-    const info = @typeInfo(Tui.ThreadArgs).@"struct".fields;
+    const info = @typeInfo(Tui.ThreadArgs).@"struct".field_names;
     _ = info; // compile-time only
     // The Lifecycle struct lives in src/tui.zig. We assert the field
     // exists at the type level via @typeInfo. This is a static-grep
@@ -2074,7 +2074,7 @@ test "T-TIW-1: handleKeyInput appends char to draft (REQ-TIW-004)" {
         try testing.expectEqual(@as(u8, 'a'), state.key_entry.draft[0]);
     }
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..3], "abc");
         var state: M.State = .{ .key_entry = .{
             .draft = draft_buf,
@@ -2132,7 +2132,7 @@ test "T-TIW-2: handleKeyInput decrements draft on backspace (REQ-TIW-005)" {
     // S-TIW-009: empty-draft no-op (draft_len=0 → backspace → draft_len=0,
     //           returns false).
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..3], "abc");
         var state: M.State = .{ .key_entry = .{
             .draft = draft_buf,
@@ -2190,7 +2190,7 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
     {
         var ch: Ch.Channels = Ch.Channels.init();
         defer ch.closeAll(testing.io);
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..2], "xx"); // too short — validateFormat fails
         var state: M.State = .{ .key_entry = .{
             .draft = draft_buf,
@@ -2288,7 +2288,7 @@ test "T-TIW-3: handleKeyInput submits on enter + cancels unlock on esc (REQ-TIW-
     //   - draft_len == 0 (cleared)
     //   - err_msg_len == 0 (cleared)
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..5], "hello");
         var state: M.State = .{ .key_entry = .{
             .draft = draft_buf,
@@ -2349,7 +2349,7 @@ test "WU 1.5.1: handleKeyInput ignores all input while key_entry.validating=true
     //              (the typical default) lets char / Enter / Backspace
     //              through as before.
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..3], "abc");
         var state: M.State = .{
             .key_entry = .{
@@ -2372,7 +2372,7 @@ test "WU 1.5.1: handleKeyInput ignores all input while key_entry.validating=true
         try testing.expectEqual(@as(usize, 3), state.key_entry.draft_len);
     }
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..3], "abc");
         var state: M.State = .{ .key_entry = .{
             .draft = draft_buf,
@@ -2394,7 +2394,7 @@ test "WU 1.5.1: handleKeyInput ignores all input while key_entry.validating=true
         try testing.expect(state.key_entry.validating);
     }
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..3], "abc");
         var state: M.State = .{ .key_entry = .{
             .draft = draft_buf,
@@ -2466,9 +2466,9 @@ test "WU 1.5.3: Esc on key_entry clears draft + err_msg (R6)" {
     //              regressed by the key_entry fix — guards the v2 invariant
     //              "two modal arms, two distinct Esc semantics").
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..5], "hello");
-        var err_buf: [128]u8 = .{0} ** 128;
+        var err_buf: [128]u8 = @splat(0);
         @memcpy(err_buf[0..10], "bad format");
         var state: M.State = .{ .key_entry = .{
             .draft = draft_buf,
@@ -2506,8 +2506,8 @@ test "WU 1.5.3: Esc on key_entry clears draft + err_msg (R6)" {
         try testing.expectEqual(@as(usize, 0), state.key_entry.draft_len);
     }
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
-        @memcpy(draft_buf[0..256], "x" ** 256);
+        var draft_buf: [256]u8 = @splat(0);
+        @memcpy(draft_buf[0..256], (@as([256]u8, @splat('x')))[0..]);
         var state: M.State = .{ .key_entry = .{
             .draft = draft_buf,
             .draft_len = 256,
@@ -2804,7 +2804,7 @@ test "WU 0.5: drawKeyEntry exposes cursor at prefix_len+0 when draft_len=0 (empt
     // diff cell is the prompt's trailing space at (col=14, row=0). The
     // trailing goTo emits `\x1b[1;15H`, NOT `\x1b[1;16H` as this test
     // asserts.
-    const draft_buf: [256]u8 = .{0} ** 256;
+    const draft_buf: [256]u8 = @splat(0);
     var state: M.State = .{
         .key_entry = .{
             .draft = draft_buf,
@@ -2842,7 +2842,7 @@ test "WU 0.5: drawKeyEntry exposes cursor at prefix_len+3 when draft_len=3 ('abc
     //
     // Pre-fix (RED): last_x = 17 (the 3rd `*`), trailing goTo emits
     // `\x1b[1;18H`, NOT `\x1b[1;19H` as this test asserts.
-    var draft_buf: [256]u8 = .{0} ** 256;
+    var draft_buf: [256]u8 = @splat(0);
     const draft = "abc";
     @memcpy(draft_buf[0..draft.len], draft);
     var state: M.State = .{
@@ -2882,7 +2882,7 @@ test "WU 0.5: drawKeyEntry caps cursor at the visible-window right edge on long 
     // Pre-fix (RED): last_x = 79 (the LAST visible `*` at the right
     // edge of the visible window). Trailing goTo emits `\x1b[1;80H`,
     // NOT `\x1b[1;81H` as this test asserts.
-    var draft_buf: [256]u8 = .{0} ** 256;
+    var draft_buf: [256]u8 = @splat(0);
     var i: usize = 0;
     while (i < draft_buf.len) : (i += 1) draft_buf[i] = 'x';
     var state: M.State = .{
@@ -3052,7 +3052,7 @@ test "WU 1.5.2: drawKeyEntry spinner does NOT render at row 1 when draft saturat
         var win = try M.WindowMock.init(testing.allocator, cols, rows);
         defer win.deinit();
 
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..12], "abcdefghijkl");
         var state: M.State = .{ .key_entry = .{
             .draft = draft_buf,
@@ -3072,7 +3072,7 @@ test "WU 1.5.2: drawKeyEntry spinner does NOT render at row 1 when draft saturat
         var win = try M.WindowMock.init(testing.allocator, cols, rows);
         defer win.deinit();
 
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..12], "abcdefghijkl");
         var state: M.State = .{
             .key_entry = .{
@@ -3091,8 +3091,8 @@ test "WU 1.5.2: drawKeyEntry spinner does NOT render at row 1 when draft saturat
         var win = try M.WindowMock.init(testing.allocator, cols, rows);
         defer win.deinit();
 
-        var draft_buf: [256]u8 = .{0} ** 256;
-        @memcpy(draft_buf[0..65], "x" ** 65);
+        var draft_buf: [256]u8 = @splat(0);
+        @memcpy(draft_buf[0..65], (@as([65]u8, @splat('x')))[0..]);
         var state: M.State = .{ .key_entry = .{
             .draft = draft_buf,
             .draft_len = 65,
@@ -3108,7 +3108,7 @@ test "WU 1.5.2: drawKeyEntry spinner does NOT render at row 1 when draft saturat
         var win = try M.WindowMock.init(testing.allocator, cols, rows);
         defer win.deinit();
 
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..10], "abcdefghij");
         var state: M.State = .{ .key_entry = .{
             .draft = draft_buf,
@@ -3485,12 +3485,12 @@ test "T-R2.3.3: @hasDecl terminal.event.Parser.setKittyActive (compile-time symb
     // The setter must exist on the Parser struct (added in T-R2.1) so
     // tuiThreadInit can call it. Compile-time symbol guard — fails if
     // a future refactor renames or removes the setter. We scan
-    // `@typeInfo(Parser).@"struct".decls` for the decl name.
+    // `@typeInfo(Parser).@"struct".decl_names` for the decl name.
     const info: std.builtin.Type = @typeInfo(terminal.event.Parser);
-    const decls = info.@"struct".decls;
+    const decls = info.@"struct".decl_names;
     var found = false;
     for (decls) |d| {
-        if (std.mem.eql(u8, d.name, "setKittyActive")) {
+        if (std.mem.eql(u8, d, "setKittyActive")) {
             found = true;
             break;
         }
@@ -3757,7 +3757,7 @@ test "T-2.6.1.8: submitFrame on state.key_entry emits trailing CUP at cursor pos
     var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
 
-    const draft_buf: [256]u8 = .{0} ** 256;
+    const draft_buf: [256]u8 = @splat(0);
     var state: M.State = .{ .key_entry = .{
         .draft = draft_buf,
         .draft_len = 0,
@@ -4140,7 +4140,7 @@ test "WU-3 RED: agentRunValidate (key_entry, mock 200) posts success reply with 
     var req: Ch.Event = .{
         .ValidateApiRequest = .{
             .kind = .key_entry,
-            .key_or_pass = .{0} ** 512,
+            .key_or_pass = @splat(0),
             .key_len = key.len,
         },
     };
@@ -4203,7 +4203,7 @@ test "WU-3 RED: agentRunValidate (key_entry, mock 401) posts failure reply with 
     var req: Ch.Event = .{
         .ValidateApiRequest = .{
             .kind = .key_entry,
-            .key_or_pass = .{0} ** 512,
+            .key_or_pass = @splat(0),
             .key_len = key.len,
         },
     };
@@ -4286,7 +4286,7 @@ test "WU-3 RED: agentRunValidate honors cancel_pipe (REQ-NEW-006 within budget)"
     var req: Ch.Event = .{
         .ValidateApiRequest = .{
             .kind = .key_entry,
-            .key_or_pass = .{0} ** 512,
+            .key_or_pass = @splat(0),
             .key_len = key.len,
         },
     };

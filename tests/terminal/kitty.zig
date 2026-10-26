@@ -61,7 +61,7 @@ test "KittyFlags all-three .bits() returns 7 (disambiguate|report_events|alterna
 
 // =============================================================================
 // Scenario 2 — KittyFlags has at least one declaration (REQ-TCL-003 + design C32).
-//   GIVEN @typeInfo(KittyFlags).@"struct".decls
+//   GIVEN @typeInfo(KittyFlags).@"struct".decl_names
 //   WHEN iterated
 //   THEN len > 0 (the bits() method counts as the required decl so the
 //        renamed tests/tui/terminal_smoke.zig canary decls.len > 0 passes)
@@ -69,11 +69,11 @@ test "KittyFlags all-three .bits() returns 7 (disambiguate|report_events|alterna
 
 test "KittyFlags has at least one decl (C32 canary lock-in)" {
     const info: std.builtin.Type = @typeInfo(kitty.KittyFlags);
-    const decls = info.@"struct".decls;
+    const decls = info.@"struct".decl_names;
     try testing.expect(decls.len > 0);
     var saw_bits = false;
     for (decls) |d| {
-        if (std.mem.eql(u8, d.name, "bits")) saw_bits = true;
+        if (std.mem.eql(u8, d, "bits")) saw_bits = true;
     }
     try testing.expect(saw_bits);
 }

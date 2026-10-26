@@ -367,11 +367,11 @@ test "Mode struct shape: is_supported field + supported() method" {
     // because Zig forbids a field and method sharing the same name. The
     // method name MUST be `supported()` to match src/tui.zig:110.
     const info: std.builtin.Type = @typeInfo(Mode);
-    const fields = info.@"struct".fields;
+    const fields = info.@"struct".field_names;
     try std.testing.expectEqual(@as(usize, 2), fields.len);
     var saw_is_supported = false;
     for (fields) |f| {
-        if (std.mem.eql(u8, f.name, "is_supported")) saw_is_supported = true;
+        if (std.mem.eql(u8, f, "is_supported")) saw_is_supported = true;
     }
     try std.testing.expect(saw_is_supported);
 }
@@ -395,15 +395,15 @@ test "DecRpmParseResult struct shape: ok + supported + mode_mismatch fields" {
     // each combination of (ok, supported, mode_mismatch) to a specific
     // probe outcome (covered by the parse + impl tests in probe_lexer.zig).
     const info: std.builtin.Type = @typeInfo(DecRpmParseResult);
-    const fields = info.@"struct".fields;
+    const fields = info.@"struct".field_names;
     try std.testing.expectEqual(@as(usize, 3), fields.len);
     var saw_ok = false;
     var saw_supported = false;
     var saw_mode_mismatch = false;
     for (fields) |f| {
-        if (std.mem.eql(u8, f.name, "ok")) saw_ok = true;
-        if (std.mem.eql(u8, f.name, "supported")) saw_supported = true;
-        if (std.mem.eql(u8, f.name, "mode_mismatch")) saw_mode_mismatch = true;
+        if (std.mem.eql(u8, f, "ok")) saw_ok = true;
+        if (std.mem.eql(u8, f, "supported")) saw_supported = true;
+        if (std.mem.eql(u8, f, "mode_mismatch")) saw_mode_mismatch = true;
     }
     try std.testing.expect(saw_ok);
     try std.testing.expect(saw_supported);

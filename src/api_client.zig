@@ -230,7 +230,7 @@ pub const ChunkEventStream = struct {
                         return p;
                     }
                     return ChunkEvent{ .err = .{
-                        .kind = @as(ErrorKind, @enumFromInt(@intFromEnum(e.kind))),
+                        .kind = @as(ErrorKind, @fromBackingInt(@intCast(@backingInt(e.kind)))),
                         .raw_bytes = e.raw_bytes,
                     } };
                 },
@@ -282,7 +282,7 @@ fn sseEventToChunkEvent(ev: @import("api_sse.zig").Event) ChunkEvent {
         } },
         .done => .{ .done = {} },
         .err => |e| .{ .err = .{
-            .kind = @as(ErrorKind, @enumFromInt(@intFromEnum(e.kind))),
+            .kind = @as(ErrorKind, @fromBackingInt(@intCast(@backingInt(e.kind)))),
             .raw_bytes = e.raw_bytes,
         } },
         .pending => .{ .done = {} }, // never reached

@@ -932,13 +932,13 @@ test "Key anonymous-struct coercion omits mods (C30)" {
 }
 
 test "key char payload is u21" {
-    try std.testing.expect(@typeInfo(KeyCode).@"union".fields.len > 0);
+    try std.testing.expect(@typeInfo(KeyCode).@"union".field_names.len > 0);
     const kc: KeyCode = .{ .char = '€' };
     try std.testing.expect(kc.char == 0x20AC);
 }
 
 test "Event union has 8 variants matching src/tui.zig switch arms" {
-    try testing.expectEqual(@as(usize, 8), @typeInfo(Event).@"union".fields.len);
+    try testing.expectEqual(@as(usize, 8), @typeInfo(Event).@"union".field_names.len);
     // Spot-check the bare-match void tags exist with void payloads.
     const ev: Event = .resize;
     _ = ev;
@@ -956,10 +956,10 @@ test "Event.resize is a void tag (C21)" {
 
 test "pollReadable exists on terminal.event namespace (C23)" {
     const info: std.builtin.Type = @typeInfo(@import("event.zig"));
-    const decls = info.@"struct".decls;
+    const decls = info.@"struct".decl_names;
     var found = false;
     for (decls) |d| {
-        if (std.mem.eql(u8, d.name, "pollReadable")) {
+        if (std.mem.eql(u8, d, "pollReadable")) {
             found = true;
             break;
         }
