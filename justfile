@@ -117,12 +117,12 @@ test-embedded:
     #!/usr/bin/env bash
     set -euo pipefail
     # Step A: trigger compilation via timeout — listen IPC hangs after compile
-    timeout 10 zig build test --summary all > /dev/null 2>&1 || true
+    timeout 120 zig build test --summary all > /dev/null 2>&1 || true
     # Step B: pick the largest test binary (embedded src/*.zig ~197 tests)
     bin=""
     best_count=0
     for b in $(find .zig-cache/o -name "test" -type f -executable 2>/dev/null); do
-        ntests=$(timeout 15 "$b" 2>/dev/null | grep -cE "^[0-9]+/[0-9]+ " || true)
+        ntests=$(timeout 15 "$b" 2>&1 | grep -cE "^[0-9]+/[0-9]+ " || true)
         if [ "$ntests" -gt "$best_count" ]; then
             best_count=$ntests
             bin="$b"
