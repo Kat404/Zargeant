@@ -574,7 +574,7 @@ comptime {
                 break;
             }
         }
-        if (!found) @compileError("syscall " ++ @as([]const u8, @tagName(@as(std.os.linux.E, @enumFromInt(@as(usize, s))))) ++ " missing from merged_allowlist");
+        if (!found) @compileError("syscall " ++ @as([]const u8, @tagName(@as(std.os.linux.E, @fromBackingInt(@intCast(@as(usize, s)))))) ++ " missing from merged_allowlist");
     }
 }
 
@@ -648,7 +648,7 @@ pub const ToolSubprocess = struct {
                 // EINTR (signal 4) — retry. ponytail: other errors propagate
                 // as error.WaitpidFailed; tests don't depend on the specific
                 // failure mode.
-                const err: std.os.linux.E = @enumFromInt(-@as(isize, @bitCast(rc)));
+                const err: std.os.linux.E = @fromBackingInt(@intCast(-@as(isize, @bitCast(rc))));
                 if (err == .INTR) continue;
                 return error.WaitpidFailed;
             }
@@ -741,49 +741,63 @@ pub const Sandbox = struct {
             // 1. Build Landlock ruleset in this thread (must be same thread
             //    as the restrict_self call — see landlock_restrict_self(2)
             //    EPERM condition for cross-thread inheritance).
+            // S1/WU-1.1 (P0-01 + P0-02 fail-closed restoration):
+            //   - landlock_restrict_self(2) requires PR_SET_NO_NEW_PRIVS to be
+            //     set BEFORE the call (per man 2 landlock_restrict_self: "either
+            //     the caller must have the CAP_SYS_ADMIN capability in its user
+            //     namespace, or the thread must already have the no_new_privs
+            //     bit set"). On a non-root host, calling restrictSelf BEFORE
+            //     prctl(NO_NEW_PRIVS) returns EPERM deterministically and the
+            //     sandbox degrades to fail-open. Seccomp on its own does not
+            //     protect the filesystem — that's Landlock's job. Fail-closed
+            //     is the only correct posture on a security boundary.
+            //   - distinct exit_group codes per failure mode let the parent
+            //     distinguish "child couldn't sandbox" from "binary ran and
+            //     failed" via the existing wait_status parser in runtime.zig.
+            //     See `odd/tasks/s1-wu-1.1-sandbox-fail-closed.md` for the
+            //     surface mapping (123 = Seccomp, 124 = Landlock, 126 = NNP,
+            //     1 = buildFromProfile legacy).
             const applied = sandbox_profile.buildFromProfile(allocator, profile) catch {
                 std.os.linux.exit_group(1);
             };
 
-            // 2. Apply Landlock. Failure here is tolerated (some kernels /
-            //    configs return EPERM for unprivileged callers or have
-            //    partial Landlock support). Seccomp below still applies —
-            //    syscall-level isolation is the primary defense; Landlock
-            //    is best-effort FS hardening. ponytail: best-effort > fail
-            //    closed when the failure mode is environmental, not
-            //    adversarial.
-            _ = sandbox_linux.Landlock.restrictSelf(applied.landlock_fd) catch {};
+            // 1. PR_SET_NO_NEW_PRIVS FIRST — without it, restrictSelf returns
+            //    EPERM deterministically on non-root hosts. Fail-closed.
+            if (std.os.linux.prctl(
+                sandbox_linux.PR_SET_NO_NEW_PRIVS,
+                1,
+                0,
+                0,
+                0,
+            ) != 0) {
+                std.os.linux.exit_group(126);
+            }
 
-            // 3. Close ALL fds > 2 — including the now-applied landlock_fd
-            //    and any parent fds (logger, test handles, etc.). Keeps
-            //    stdin/stdout/stderr so the tool can do I/O.
-            //    ponytail: close_range(3, ∞) is atomic, kernel-5.9+ (PR 3
-            //    already requires ≥5.13 for Landlock).
-            // 2. Close ALL fds > 2 — including the now-applied landlock_fd
-            //    and any parent fds (logger, test handles, etc.). Keeps
-            //    stdin/stdout/stderr so the tool can do I/O.
-            //    ponytail: close_range(3, ∞) is atomic, kernel-5.9+ (PR 3
-            //    already requires ≥5.13 for Landlock). Best-effort — if the
-            //    kernel returns an error, child continues with whatever fd
-            //    table it inherited.
+            // 2. Landlock. EPERM here = kernel <5.13 OR no Landlock ABI; ENOSYS
+            //    = kernel too old. Both are fatal: continuing without Landlock
+            //    means the tool has full FS access (can read ~/.ssh/id_rsa,
+            //    write ~/.bashrc, etc.).
+            sandbox_linux.Landlock.restrictSelf(applied.landlock_fd) catch {
+                std.os.linux.exit_group(124);
+            };
+
+            // 3. close_range — sweep inherited fds. Best-effort: if the kernel
+            //    rejects, the seccomp filter below will deny the openat/ioctl
+            //    needed to use them anyway. Keep the return discarded.
             _ = std.os.linux.close_range(3, std.math.maxInt(i32), .{ .UNSHARE = false, .CLOEXEC = false });
 
-            // 4. Seccomp via raw syscalls.
-            _ = std.os.linux.prctl(sandbox_linux.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-
-            const SockFProg = extern struct {
-                len: u16,
-                filter: [*]const std.os.linux.BPF.Insn,
+            // 4. Seccomp via sandbox_linux.Seccomp.loadFilter (NOT inline
+            //    std.os.linux.seccomp): the wrapper sets NO_NEW_PRIVS defensively
+            //    (in case the prctl above ever drifts out of order) AND checks
+            //    the seccomp() return code. EINVAL/ENOSYS/EFAULT here = the BPF
+            //    didn't install = the tool has full syscall surface. Fail-closed.
+            //
+            // Note: Seccomp.loadFilter internally calls prctl(NO_NEW_PRIVS)
+            // again; that's redundant but not wrong — kernel treats double-NNP
+            // as idempotent.
+            sandbox_linux.Seccomp.loadFilter(&tool_bpf_prog) catch {
+                std.os.linux.exit_group(123);
             };
-            var fprog = SockFProg{
-                .len = @as(u16, @intCast(tool_bpf_prog.len)),
-                .filter = &tool_bpf_prog,
-            };
-            _ = std.os.linux.seccomp(
-                sandbox_linux.SECCOMP.SET_MODE_FILTER,
-                sandbox_linux.SECCOMP.FILTER_FLAG.TSYNC,
-                @as(?*const anyopaque, @ptrCast(&fprog)),
-            );
 
             // Build argv for execve: [*:null]const ?[*:0]const u8.
             // Each element must be null-terminated. Zig string literals are.

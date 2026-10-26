@@ -231,11 +231,24 @@ pub const Seccomp = struct {
     /// Load the cBPF program as the calling thread's Seccomp filter.
     /// MUST be called after `prctl(PR_SET_NO_NEW_PRIVS, 1)`; the kernel
     /// returns EINVAL otherwise. `flags` is typically `FILTER_FLAG.TSYNC`.
+    ///
+    /// S1/WU-1.1 deviation from ODD-REMEDIATION-PLAN §S1/WU-1.1: the plan's
+    /// code uses `std.os.linux.SECCOMP.FProg{...}`, but this Zig 0.16
+    /// stdlib does NOT expose `FProg`. The kernel ABI for `struct sock_fprog`
+    /// is just `{ u16 len, [*]const BPF.Insn filter }`; we define it inline
+    /// here (mirroring what `src/sandbox.zig:774-777` did pre-WU-1.1, which
+    /// is the only working `SockFProg` in the codebase today). Pinned for
+    /// future Zig 0.16.1+ stdlib upgrade.
     pub fn loadFilter(prog: []const std.os.linux.BPF.Insn) !void {
         const pr_rc = std.os.linux.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
         if (pr_rc != 0) return error.NoNewPrivsFailed;
 
-        var fprog = std.os.linux.SECCOMP.FProg{
+        // Inline `struct sock_fprog` ABI: { u16 len, [*]const BPF.Insn filter }.
+        const SockFProg = extern struct {
+            len: u16,
+            filter: [*]const std.os.linux.BPF.Insn,
+        };
+        var fprog = SockFProg{
             .len = @as(u16, @intCast(prog.len)),
             .filter = @ptrCast(prog.ptr),
         };

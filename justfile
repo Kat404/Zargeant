@@ -104,6 +104,10 @@ test-tools:
 test-cancel-path:
     zig build test-cancel-path --summary all
 
+# Run tests/sandbox_order.zig (2 tests, S1/WU-1.1 isolation order guard)
+test-sandbox-order:
+    zig build test-sandbox-order --summary all
+
 # Run tests/cancel_e2e.zig (2 tests, end-to-end cancel pipe, env-gated)
 test-cancel-e2e:
     ZARGEANT_RUN_TUI_CANCEL_E2E=1 zig build test-cancel-e2e --summary all

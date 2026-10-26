@@ -190,6 +190,13 @@ run_step "test-tools (4 tests, tools/ in-file)" \
 run_step "test-cancel-path (4 tests, CAP-09 wiring guard)" \
   podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c 'zig build test-cancel-path --summary all'
 
+# S1/WU-1.1 (P0-01 + P0-02 sandbox fail-closed restoration) — isolation
+# order guard. Asserts child-block PR_SET_NO_NEW_PRIVS precedes
+# Landlock.restrictSelf, and that sandbox_linux.Seccomp.loadFilter is
+# invoked (replaces inline `_ = seccomp(...)` that swallowed rc).
+run_step "test-sandbox-order (2 tests, S1/WU-1.1 isolation order guard)" \
+  podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c 'zig build test-sandbox-order --summary all'
+
 run_step "test-cancel-e2e (2 tests, end-to-end cancel pipe)" \
   podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c 'zig build test-cancel-e2e --summary all'
 

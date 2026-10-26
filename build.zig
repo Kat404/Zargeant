@@ -355,6 +355,26 @@ pub fn build(b: *std.Build) void {
     cancel_path_test_decl.dependOn(&run_cancel_path_test.step);
     test_decl.dependOn(&run_cancel_path_test.step);
 
+    // test step: tests/sandbox_order.zig (S1/WU-1.1 — P0-01 + P0-02 isolation
+    // order guard). Static grep-test: asserts that the child-block
+    // landlock_restrict_self call is preceded by a PR_SET_NO_NEW_PRIVS literal,
+    // and that `sandbox_linux.Seccomp.loadFilter` is invoked (the wrapper that
+    // checks seccomp() return code; replaces the inline `_ =` seccomp call).
+    // See `odd/tasks/s1-wu-1.1-sandbox-fail-closed.md` for context.
+    const sandbox_order_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/sandbox_order.zig"),
+    });
+    const sandbox_order_test_step = b.addTest(.{ .root_module = sandbox_order_test_mod });
+    const run_sandbox_order_test = b.addRunArtifact(sandbox_order_test_step);
+    const sandbox_order_test_decl = b.step(
+        "test-sandbox-order",
+        "Run tests/sandbox_order.zig (S1/WU-1.1 sandbox isolation order guard)",
+    );
+    sandbox_order_test_decl.dependOn(&run_sandbox_order_test.step);
+    test_decl.dependOn(&run_sandbox_order_test.step);
+
     // =========================================================================
     // QA 0 — Static checks: `zig build check`
     //   - `zig fmt --check` for formatting (recursive on src/, tests/, tools/)
