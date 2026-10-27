@@ -51,18 +51,18 @@ Three threads:
 
 In development. All seven planned slices shipped on `main`. Phase 2 Tiger Style retrofit (PRs [#44](https://github.com/Kat404/Zargeant/pull/44), [#49](https://github.com/Kat404/Zargeant/pull/49), [#50](https://github.com/Kat404/Zargeant/pull/50)) and slice 7 (tool subprocess pool, PR [#56](https://github.com/Kat404/Zargeant/pull/56)) are also complete. Tech debt tracked at issues [#51](https://github.com/Kat404/Zargeant/issues/51)–[#54](https://github.com/Kat404/Zargeant/issues/54).
 
-| Slice                                                       | Status         | PR                                                                          | Lines    | Tests   |
-| ----------------------------------------------------------- | -------------- | --------------------------------------------------------------------------- | -------- | ------- |
-| Build toolchain (`build.zig` + `zig.zon`)                   | ✓ shipped      | —                                                                           | 78       | 1 smoke |
-| Logger (`/tmp/ai-harness-debug.log`)                        | ✓ shipped      | —                                                                           | 609      | 15      |
-| Sandbox Linux (Landlock + Seccomp-BPF)                      | ✓ shipped      | —                                                                           | 1,615    | 25      |
-| API Client (MiniMax HTTP-SSE)                               | ✓ shipped      | —                                                                           | ~900     | ~12     |
-| TLS handrolled                                              | ✓ shipped      | —                                                                           | ~700     | ~8      |
-| TUI (in-tree `src/terminal/` + 3-thread orchestrator)       | ✓ shipped      | [#31](https://github.com/Kat404/Zargeant/pull/31), [#32](https://github.com/Kat404/Zargeant/pull/32), [#34](https://github.com/Kat404/Zargeant/pull/34), [#35](https://github.com/Kat404/Zargeant/pull/35), [#36](https://github.com/Kat404/Zargeant/pull/36) (#33 superseded by Phase 2) | ~3,500 | 500 |
-| Tools subprocess pool (slice 7)                             | ✓ shipped      | [#56](https://github.com/Kat404/Zargeant/pull/56)                            | ~190     | 70      |
-| Phase 2 Tiger Style retrofit                                | ✓ shipped      | [#44](https://github.com/Kat404/Zargeant/pull/44), [#49](https://github.com/Kat404/Zargeant/pull/49), [#50](https://github.com/Kat404/Zargeant/pull/50) | ~5,375   | 132     |
-| logger-macos-port                                           | 📋 follow-up   | —                                                                           | —        | —       |
-| sandbox-macos                                               | 📋 follow-up   | —                                                                           | —        | —       |
+| Slice                                                 | Status       | PR                                                                                                                                                                                                                                                                                        | Lines  | Tests   |
+| ----------------------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------- |
+| Build toolchain (`build.zig` + `zig.zon`)             | ✓ shipped    | —                                                                                                                                                                                                                                                                                         | 78     | 1 smoke |
+| Logger (`/tmp/ai-harness-debug.log`)                  | ✓ shipped    | —                                                                                                                                                                                                                                                                                         | 609    | 15      |
+| Sandbox Linux (Landlock + Seccomp-BPF)                | ✓ shipped    | —                                                                                                                                                                                                                                                                                         | 1,615  | 25      |
+| API Client (MiniMax HTTP-SSE)                         | ✓ shipped    | —                                                                                                                                                                                                                                                                                         | ~900   | ~12     |
+| TLS handrolled                                        | ✓ shipped    | —                                                                                                                                                                                                                                                                                         | ~700   | ~8      |
+| TUI (in-tree `src/terminal/` + 3-thread orchestrator) | ✓ shipped    | [#31](https://github.com/Kat404/Zargeant/pull/31), [#32](https://github.com/Kat404/Zargeant/pull/32), [#34](https://github.com/Kat404/Zargeant/pull/34), [#35](https://github.com/Kat404/Zargeant/pull/35), [#36](https://github.com/Kat404/Zargeant/pull/36) (#33 superseded by Phase 2) | ~3,500 | 500     |
+| Tools subprocess pool (slice 7)                       | ✓ shipped    | [#56](https://github.com/Kat404/Zargeant/pull/56)                                                                                                                                                                                                                                         | ~190   | 70      |
+| Phase 2 Tiger Style retrofit                          | ✓ shipped    | [#44](https://github.com/Kat404/Zargeant/pull/44), [#49](https://github.com/Kat404/Zargeant/pull/49), [#50](https://github.com/Kat404/Zargeant/pull/50)                                                                                                                                   | ~5,375 | 132     |
+| logger-macos-port                                     | 📋 follow-up | —                                                                                                                                                                                                                                                                                         | —      | —       |
+| sandbox-macos                                         | 📋 follow-up | —                                                                                                                                                                                                                                                                                         | —      | —       |
 
 **Total**: 500+ tests pass on `zig build test` (Debug + ReleaseSafe + ReleaseFast) as of slice 7 PR #56 + Phase 2 PR #50 merge. The TUI slice replaces the `mibu@636a36a` dependency with an in-tree `src/terminal/` module per ADR 0001 §"Alternatives Considered" #2 + ADR 0003; see [Slice status — TUI](#slice-status--tui) below.
 
@@ -76,14 +76,14 @@ In development. All seven planned slices shipped on `main`. Phase 2 Tiger Style 
 
 zargeant has zero third-party deps — the entire stack is in-tree or Zig stdlib. The full dep audit is in [CONTRIBUTING.md](CONTRIBUTING.md); the short version:
 
-| Component             | Source                                        | License | Pin  |
-| --------------------- | --------------------------------------------- | ------- | ---- |
-| **TUI render**        | `src/terminal/` (in-tree, clean-room)         | Unlicense (project) | — |
-| **HTTP**              | `src/api_client.zig` + `src/api_sse.zig` (internal) | — | — |
-| **Crypto / TLS**      | `src/tls_conn.zig` (handrolled)               | —       | —    |
-| **Sandbox**           | `src/sandbox_linux.zig` (Landlock LSM + Seccomp-BPF) | — | — |
-| **Mock HTTP server**  | `src/mock_server.zig` (internal)              | —       | —    |
-| **Logger**            | `src/logger.zig` → `/tmp/ai-harness-debug.log` (mode `0600`) | — | — |
+| Component            | Source                                                       | License             | Pin |
+| -------------------- | ------------------------------------------------------------ | ------------------- | --- |
+| **TUI render**       | `src/terminal/` (in-tree, clean-room)                        | Unlicense (project) | —   |
+| **HTTP**             | `src/api_client.zig` + `src/api_sse.zig` (internal)          | —                   | —   |
+| **Crypto / TLS**     | `src/tls_conn.zig` (handrolled)                              | —                   | —   |
+| **Sandbox**          | `src/sandbox_linux.zig` (Landlock LSM + Seccomp-BPF)         | —                   | —   |
+| **Mock HTTP server** | `src/mock_server.zig` (internal)                             | —                   | —   |
+| **Logger**           | `src/logger.zig` → `/tmp/ai-harness-debug.log` (mode `0600`) | —                   | —   |
 
 The previous `mibu@636a36a` TUI dependency (per [ADR 0001](docs/decisions/0001-libvaxis-to-mibu.md)) has been replaced by the in-tree `src/terminal/` module implemented in [ADR 0003](docs/decisions/0003-clean-room-impl.md). No third-party TUI dep remains; the project owns the entire TUI surface.
 
@@ -93,17 +93,17 @@ To add a new third-party dep, write a new ADR under `docs/decisions/` first; see
 
 The TUI slice shipped as a 6-PR chained stack on `main` via squash merges on 2026-09-11. Phase 2 (Tiger Style retrofit, PRs [#44](https://github.com/Kat404/Zargeant/pull/44) + [#49](https://github.com/Kat404/Zargeant/pull/49) + [#50](https://github.com/Kat404/Zargeant/pull/50)) superseded slice 6 (PR [#33](https://github.com/Kat404/Zargeant/pull/33)) by replacing the heap-allocated render pipeline with a value-type `ScreenGrid` + pure `diffAndEmit` renderer.
 
-| PR          | Theme                                                                             | Status                                  | PR                                                                       | LoC     |
-| ----------- | --------------------------------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------ | ------- |
-| PR 1        | Foundation + termios (ADR 0002 + `mod.zig` + `term.zig` + MockBackend + 6 tests)  | ✅ MERGED 2026-09-11                    | [#31](https://github.com/Kat404/Zargeant/pull/31)                         | +694    |
-| PR 2        | Emit layer (cursor + style + dpm + kitty)                                        | ✅ MERGED 2026-09-11                    | [#32](https://github.com/Kat404/Zargeant/pull/32)                         | +935    |
-| PR 3        | Event parser part 1 (UTF-8 + base + in-band resize unconditional + EINTR-pending) | ⚠️ CLOSED 2026-09-11 (superseded by Phase 2) | [#33](https://github.com/Kat404/Zargeant/pull/33)                  | +1,336  |
-| PR 4        | Event parser part 2 (kitty kb parser: CSI u + press/repeat/release + mods)        | ✅ MERGED 2026-09-11                    | [#34](https://github.com/Kat404/Zargeant/pull/34)                         | +358    |
-| PR 5        | Probe response lexer (DECRPM reply + `Mode.supported()` + 4 failure modes per C14) | ✅ MERGED 2026-09-11                   | [#35](https://github.com/Kat404/Zargeant/pull/35)                         | +608    |
-| PR 6        | Atomic swap + drop mibu (atomic `mibu → terminal` rename + ADR 0003)              | ✅ MERGED 2026-09-11                    | [#36](https://github.com/Kat404/Zargeant/pull/36)                         | +110    |
-| Phase 2 PR1 | ScreenGrid + DiffEntry + diffAndEmit pure renderer                               | ✅ MERGED 2026-09-24                    | [#44](https://github.com/Kat404/Zargeant/pull/44)                         | +1,150  |
-| Phase 2 PR2 | `render*ToGrid` + WindowMock + build blocker fix                                 | ✅ MERGED 2026-09-24                    | [#49](https://github.com/Kat404/Zargeant/pull/49)                         | +1,869  |
-| Phase 2 PR4 | `kitty_active` + `cancel_pipe` + AGENTS.md §10 Pre-Merge QA Gate Ordering        | ✅ MERGED 2026-09-26                    | [#50](https://github.com/Kat404/Zargeant/pull/50)                         | +2,356  |
+| PR          | Theme                                                                              | Status                                       | PR                                                | LoC    |
+| ----------- | ---------------------------------------------------------------------------------- | -------------------------------------------- | ------------------------------------------------- | ------ |
+| PR 1        | Foundation + termios (ADR 0002 + `mod.zig` + `term.zig` + MockBackend + 6 tests)   | ✅ MERGED 2026-09-11                         | [#31](https://github.com/Kat404/Zargeant/pull/31) | +694   |
+| PR 2        | Emit layer (cursor + style + dpm + kitty)                                          | ✅ MERGED 2026-09-11                         | [#32](https://github.com/Kat404/Zargeant/pull/32) | +935   |
+| PR 3        | Event parser part 1 (UTF-8 + base + in-band resize unconditional + EINTR-pending)  | ⚠️ CLOSED 2026-09-11 (superseded by Phase 2) | [#33](https://github.com/Kat404/Zargeant/pull/33) | +1,336 |
+| PR 4        | Event parser part 2 (kitty kb parser: CSI u + press/repeat/release + mods)         | ✅ MERGED 2026-09-11                         | [#34](https://github.com/Kat404/Zargeant/pull/34) | +358   |
+| PR 5        | Probe response lexer (DECRPM reply + `Mode.supported()` + 4 failure modes per C14) | ✅ MERGED 2026-09-11                         | [#35](https://github.com/Kat404/Zargeant/pull/35) | +608   |
+| PR 6        | Atomic swap + drop mibu (atomic `mibu → terminal` rename + ADR 0003)               | ✅ MERGED 2026-09-11                         | [#36](https://github.com/Kat404/Zargeant/pull/36) | +110   |
+| Phase 2 PR1 | ScreenGrid + DiffEntry + diffAndEmit pure renderer                                 | ✅ MERGED 2026-09-24                         | [#44](https://github.com/Kat404/Zargeant/pull/44) | +1,150 |
+| Phase 2 PR2 | `render*ToGrid` + WindowMock + build blocker fix                                   | ✅ MERGED 2026-09-24                         | [#49](https://github.com/Kat404/Zargeant/pull/49) | +1,869 |
+| Phase 2 PR4 | `kitty_active` + `cancel_pipe` + AGENTS.md §10 Pre-Merge QA Gate Ordering          | ✅ MERGED 2026-09-26                         | [#50](https://github.com/Kat404/Zargeant/pull/50) | +2,356 |
 
 > **Note**: PR #33 (slice 6, event parser part 1) was closed without merge on 2026-09-11 because Phase 2 superseded the heap-allocated render pipeline it targeted. The work it contained was rolled into the Phase 2 Tiger Style retrofit (PRs #44 + #49 + #50).
 
@@ -112,6 +112,7 @@ The slice's full task breakdown (20 WUs across 6 PRs) lives in engram obs#1514. 
 ### Clean-room constraints (CONTRIBUTING.md:41 + ADR 0003 §Negative)
 
 The in-tree `src/terminal/` module was implemented strictly against public specs:
+
 - POSIX `termios(3)` — raw-mode lifecycle, `tcgetattr`/`tcsetattr`/`TIOCGWINSZ` ioctl
 - ECMA-48 §CSI/§SGR — cursor positioning, SGR attributes
 - xterm ctlseqs — DEC private modes 1049/2026/2048, DECRQM/DECRPM probes, in-band resize
@@ -274,7 +275,3 @@ Each slice is its own ODD cycle, persisted in `odd/tasks/<feature>.md` (filesyst
 - TUI render surface: in-tree `src/terminal/` module (clean-room, ~3,500 LoC across 6 chained PRs). The previous `mibu` dependency was replaced per ADR 0003, fulfilling the contingency in ADR 0001 §"Negative".
 - Inspired by [ratatui](https://github.com/ratatui/ratatui) for the Rust TUI ecosystem.
 - Powered by [MiniMax](https://MiniMax.chat) for the inference API.
-
----
-
-![Architecture](docs/arquitectura.png)
