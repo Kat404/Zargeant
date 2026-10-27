@@ -125,6 +125,20 @@ test-all:
     just test
     just test-embedded
 
+# ─── Modo watch con compilacion incremental (Zig 0.17+, x86_64-linux) ───────────
+
+# Rebuild incremental + file watching: rebuilds on save instead of full recompiles
+dev:
+    zig build -fincremental --watch
+
+# Complejidad por fichero (tokens + nodos AST) — metricas de presupuesto de diff
+complexity:
+    zig fmt --complexity src/ tests/ tools/
+
+# Configuracion del build serializada en ZON (diagnostico del configure phase)
+config:
+    zig build --print-configuration
+
 # ─── QA / verify ─────────────────────────────────────────────────────────────
 
 # Run the strict QA gamut (QA 0..6, compile-first in Debug + ReleaseSafe + ReleaseFast)
