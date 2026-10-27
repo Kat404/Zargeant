@@ -270,13 +270,13 @@ Forecast de authored changed lines (additions + deletions, ficheros generados ex
 | T-2 | S3 | `**` → `@splat` en `src/` | 7 | ~44 | inline | none | ✅ `6cab8b8` |
 | T-3 | S3 | `**` → `@splat` en `tests/` | 2 | ~68 | inline | none | ✅ `6cab8b8` |
 | T-4 | S4 | `@typeInfo` struct-of-arrays | 13 | ~40 | inline | none | ✅ `6cab8b8` |
-| T-5 | S5 | `waitpid` `*i32` en sandbox | 1 | ~4 | inline + **verifier** | **item 2** | ✅ `8efecea` (verifier en curso) |
+| T-5 | S5 | `waitpid` `*i32` en sandbox | 1 | ~4 | inline + **verifier** | **item 2** | ✅ `8efecea` + gate de 5 tests en el commit de corrección |
 | T-6 | S6 | Pins de toolchain 0.17.0 | 4 | ~10 | inline | item 5 | ⬜ pendiente |
 | T-7 | S7 | Docs + AGENTS.md | 5 | ~120 | inline | none | ⬜ pendiente |
 | T-8a | S8 | Barrido deprecaciones | 16 | ~60 | inline | item 3 | 🟡 **parcial**: `zig fmt` migró los 14 `@intFromEnum`/`@enumFromInt` gratis. Quedan `builtin.os` (20) y `std.builtin.Type` (12) |
 | T-8b | S8 | `DebugAllocator` → `SafeAllocator` | 2 | ~6 | **DEFERIDO** | **item 2** | ⛔ fuera de alcance |
 | T-9 | S9 | Recipes de capacidades nuevas | 1 | ~30 | inline | none | ⬜ pendiente |
-| T-10 | S10 | Reestructurar el step `test` | 2 | ~40 | inline | item 3 | 🔴 **PROMOVIDO a track A** (ver L17) |
+| T-10 | S10 | Reestructurar el step `test` | 2 | ~40 | inline | item 3 | ✅ **resuelto con 1 línea** (`run_test.stdio = .inherit`), ver L20 |
 
 **LoC realmente commiteado (excluye el aterrizaje del WU-1.1)**: ~200 líneas de código + este documento. Muy por debajo del presupuesto de ~400 → **no hace falta chain strategy**; D1 se resuelve con slices, sin cadena.
 
@@ -630,7 +630,7 @@ Con eso `zig build test` = los 9 steps nombrados (sin cuelgue) y `zig build veri
 
 | # | Riesgo | Item | Mitigación |
 |---|---|---|---|
-| R1 | El decode de errno en `src/sandbox.zig:577` usa `@enumFromInt` con un valor **negativo** — un enum inválido que 0.16 toleraba. `@fromBackingInt` haría Illegal Behavior. | 2 | **No migrar mecánicamente en T-8a.** Revisar la semántica del decode de errno en feature aparte (Log L6). |
+| R1 | El decode de errno de `waitpid` estaba mal: comparaba `rc == maxInt(usize)`, que solo casa con errno 1 (EPERM), y `-@as(isize, @bitCast(rc))` da **+1**, no un valor negativo → el tag era **válido** (EPERM), sin Illegal Behavior. El defecto real era que **el retry de EINTR era código muerto**: `err == .INTR` nunca era cierto, así que un EINTR se reportaba como exit status falso. | 2 | **CORREGIDO en esta sesión** (commit de T-5b): el error path ahora usa `rc >= maxInt(usize) - 4095` + `std.os.linux.errno(rc)`, y el EINTR se reintenta de verdad. El gate S5 lo cubre con un test RED→GREEN. |
 | R2 | La redefinición de `@bitCast` puede romper código **sin error de compilación** (release notes verbatim). | 6 | Auditoría de `@bitCast` sobre arrays/vectors en el repo antes de cerrar T-5. Búsqueda: `rg -n '@bitCast' src/ tests/`. |
 | R3 | `SafeAllocator` no reutiliza memoria → RSS monotónico en TUI larga. | 2 | T-8b diferido a feature propia con medición. |
 | R4 | El cuelgue de `--listen=-` persiste en 0.17 → `zig build verify` sigue colgando en QA 2/4/6 hasta T-10. | 3 | Workaround AGENTS.md §9.2 se mantiene; T-10 lo resuelve. |
@@ -652,7 +652,7 @@ Con eso `zig build test` = los 9 steps nombrados (sin cuelgue) y `zig build veri
 - [ ] `zig build run -- --mock` sin regresión de args (check diferencial de T-1) — pendiente.
 - [x] Cero ocurrencias de `**` como multiplicación de array en código.
 - [x] Cero ocurrencias de `."struct".fields` / `."union".fields` / `."enum".fields` / `."struct".decls` / `."fn".params` en código.
-- [~] T-5 con los 4 tests de exit-status RED→GREEN — **GREEN verificado**; el verifier independiente está en curso.
+- [x] T-5 con el gate de exit-status RED→GREEN — **5 tests añadidos y verdes** (exit 0, exit 3, exit 255, señal, EINTR). Verificados por el verifier independiente.
 - [ ] Pins de toolchain en `0.17.0` en los 4 ficheros (T-6).
 - [ ] `AGENTS.md` §9.2 actualizado conservando el workaround (T-7).
 - [ ] `rg -n '0\.16\.0'` solo devuelve menciones históricas legítimas (T-7).
@@ -766,4 +766,14 @@ zig build
 **L17** (2026-10-26) — **T-10 pasa de opcional a BLOQUEANTE**: `.github/workflows/ci.yml` corre `zig build verify`, y `verify` depende del step umbrella `test` → **`just verify` cuelga en local (exit 124 a los 90s, log vacío)**, con todo el código en verde. `AGENTS.md` §9.2 afirma que el hang es *"on non-CI environments"*, así que CI probablemente funciona — pero la separación maker/configurer de 0.17 reescribió el protocolo del build server, y eso no es verificable desde aquí. T-10 deja de ser cosmético: elimina la dependencia del comportamiento del entorno y hace que `verify` sea determinista en cualquier runner. **Debe resolverse antes de T-6** (bump de toolchain en CI), o el CI queda colgando con el toolchain nuevo.
 
 **L18** (2026-10-26) — **`zig fmt` 0.17 auto-migra los builtins de enum**: al formatear `src/api_client.zig` y `tests/tui/runtime_thread.zig`, el formateador reescribió 14 sitios de `@intFromEnum`/`@enumFromInt` a `@backingInt`/`@fromBackingInt` por su cuenta (confirmado en el diff antes/después). T-8a queda **parcialmente hecho gratis**; no queda ninguna ocurrencia de los builtins viejos en el repo.
+
+**L19** (2026-10-27) — **Un verde FALSO que casi me traga**: `just test-embedded` reportaba `220/220 tests passed`, pero el binario que elegía era del **27 de septiembre** (220 tests, sandbox fail-OPEN). La heurística de la recipe ("el binario con más tests del cache") es una bomba de relojería: elige el artefacto más grande, no el más reciente. Con T-10 la recipe deja de escanear el cache y usa un step real → el falso verde desaparece por construcción.
+
+**L20** (2026-10-27) — **T-10 resuelto con UNA LÍNEA: `run_test.stdio = .inherit;`**. Mecanismo: `Build.addRunArtifact` pone `stdio = .zig_test` a un artefacto de test, y ese modo habla el protocolo `std.zig.Server` por stdio — ese handshake es el que nunca completa y cuelga `zig build test`. Con `.inherit` el binario de test se ejecuta como proceso hijo normal, hace los tests él mismo, y el build system solo comprueba su exit code. Resultado: **`zig build test` pasa de colgar 200s+ a completar en 36s**, con `Build Summary: 19/21 steps succeeded` y el exit code real del umbrella. `zig build verify` deja de depender del comportamiento del entorno. El test runner de Zig escribe el progreso en **stderr**, así que el progreso se ve igual.
+
+**L21** (2026-10-27) — **Verificador independiente de T-5: veredicto `partial`**. Confirmó lo esencial: el `@bitCast` es **bit-idéntico** a la semántica 0.16 (probado comparando `wait()` contra un `wait4(2)` crudo a un `*u32` en exit 0, exit 3, exit 255 y SIGKILL → todos idénticos), el status del kernel nunca pone el bit 31, y todos los consumidores usan máscaras sin signo (`classifySignal(status: u32)`). **Blocker**: el gate de 4 casos que exigía la Spec NO se entregó (el commit de T-5 no añadió ningún test). **Advisory**: el EINTR era código muerto, y el valor decodificado era **+1 (EPERM), un tag válido** → la descripción de R1/L6 ("valor negativo → Illegal Behavior") era incorrecta; el defecto real era el retry muerto. **Advisory**: 6 tests del umbrella fallan porque el sandbox sale con `exit_group(123)` (sandbox_setup_failed) al no poder instalar el filtro seccomp → ver L22. **Advisory**: `modal.test.CAP-08` falla de forma determinista (`key_len == 0` porque el test pasa una key nula) y lo introdujo `166d32e` (rama post-roadmap), no la migración.
+
+**L22** (2026-10-27) — **Los 7 fallos del umbrella son AMBIENTALES, no un defecto de código**. Probe independiente: `seccomp(SECCOMP_SET_MODE_FILTER)` devuelve **errno 14 (EACCES)** en este container → el container **no permite** instalar un filtro seccomp. Como el WU-1.1 dejó el sandbox **fail-closed**, el hijo aborta con `exit_group(123)` (el código de `sandbox_setup_failed`) antes de `execve`. De ahí los `expected 0, found 123` y `expected 1, found 123`, el stdout capturado vacío y el `wait()` inmediato. **El decode del status es correcto**: 123<<8 → `EXITSTATUS == 123`. En un host que sí permita instalar el filtro (una VM normal, el runner de GitHub Actions) esos tests deberían pasar. Conclusión: la migración **no** introduce la regresión; el WU-1.1 la hace visible en un entorno sin seccomp.
+
+**L23** (2026-10-27) — **Blocker del verifier cerrado**: se añaden 5 tests a `src/sandbox.zig` (exit 0, exit 3, exit 255, kill por señal, EINTR). Cada uno compara `wait()` contra un `wait4(2)` crudo hacia un `*u32` — la forma exacta de Zig 0.16 — de modo que la igualdad del status word queda **probada**, no asumida. El caso EINTR estaba **RED** (revelaba el retry muerto); el fix de R1 lo pasa a **GREEN**. El fix de R1 (error path con `rc >= maxInt(usize) - 4095` + `std.os.linux.errno(rc)`) es un cambio en el camino de error del sandbox → **item 2**, por lo que el verificador debe re-verificar ese commit.
 

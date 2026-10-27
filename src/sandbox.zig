@@ -644,11 +644,12 @@ pub const ToolSubprocess = struct {
         var status: i32 = 0;
         while (true) {
             const rc = std.os.linux.waitpid(self.pid, &status, 0);
-            if (rc == std.math.maxInt(usize)) {
-                // EINTR (signal 4) — retry. ponytail: other errors propagate
-                // as error.WaitpidFailed; tests don't depend on the specific
-                // failure mode.
-                const err: std.os.linux.E = @fromBackingInt(@intCast(-@as(isize, @bitCast(rc))));
+            if (rc >= std.math.maxInt(usize) - 4095) {
+                // Error path: a raw syscall return encodes -errno, returned as
+                // usize. The old check compared against maxInt(usize), which
+                // matches errno 1 (EPERM) only — so the EINTR retry below was
+                // dead code and every other errno was misreported as EPERM.
+                const err = std.os.linux.errno(rc);
                 if (err == .INTR) continue;
                 return error.WaitpidFailed;
             }
@@ -967,4 +968,110 @@ test "Sandbox.spawnToolSubprocess parent fd NOT inherited" {
 // test to exist and makes a no-op PASS visible to the verify phase.
 test "sandbox.zig does not write to stdout or stderr" {
     try testing.expect(true);
+}
+
+// ===== T-5 / S5 — waitpid status-word regression gate (Zig 0.17 `*i32` status) =====
+// Locks the invariant that ToolSubprocess.wait() returns the SAME raw status word
+// the kernel wrote. The u32 leg emulates Zig 0.16's waitpid(pid, *u32, flags):
+// the kernel only receives the ADDRESS of a 4-byte word, so both legs see the
+// same bytes. Any divergence is a regression in the @bitCast adaptation.
+
+fn s5ForkExit(code: i32) i32 {
+    const pid = std.os.linux.fork();
+    if (pid == 0) std.os.linux.exit_group(code);
+    return @intCast(pid);
+}
+
+fn s5ForkSigkill() i32 {
+    const pid = std.os.linux.fork();
+    if (pid == 0) {
+        _ = std.os.linux.kill(std.os.linux.getpid(), std.os.linux.SIG.KILL);
+        std.os.linux.exit_group(200);
+    }
+    return @intCast(pid);
+}
+
+/// Raw wait4(2) into a `*u32` — the exact Zig 0.16 shape.
+fn s5WaitpidU32(pid: i32, out: *u32) usize {
+    return std.os.linux.syscall4(.wait4, @as(u32, @bitCast(pid)), @intFromPtr(out), 0, 0);
+}
+
+test "S5: wait() status word is bit-identical to the Zig 0.16 *u32 path (exit 0)" {
+    const pid = s5ForkExit(0);
+    var sub = sandbox.ToolSubprocess{ .pid = pid, .landlock_fd = -1, .stdout_fd = -1 };
+    const got = try sub.wait();
+    const pid2 = s5ForkExit(0);
+    var expected: u32 = 0;
+    _ = s5WaitpidU32(pid2, &expected);
+    try testing.expectEqual(expected, got);
+    try testing.expect(std.os.linux.W.IFEXITED(got));
+    try testing.expectEqual(@as(u8, 0), std.os.linux.W.EXITSTATUS(got));
+}
+
+test "S5: wait() status word is bit-identical to the Zig 0.16 *u32 path (exit 3)" {
+    const pid = s5ForkExit(3);
+    var sub = sandbox.ToolSubprocess{ .pid = pid, .landlock_fd = -1, .stdout_fd = -1 };
+    const got = try sub.wait();
+    const pid2 = s5ForkExit(3);
+    var expected: u32 = 0;
+    _ = s5WaitpidU32(pid2, &expected);
+    try testing.expectEqual(expected, got);
+    try testing.expect(std.os.linux.W.IFEXITED(got));
+    try testing.expectEqual(@as(u8, 3), std.os.linux.W.EXITSTATUS(got));
+}
+
+test "S5: wait() status word is bit-identical to the Zig 0.16 *u32 path (exit 255)" {
+    const pid = s5ForkExit(255);
+    var sub = sandbox.ToolSubprocess{ .pid = pid, .landlock_fd = -1, .stdout_fd = -1 };
+    const got = try sub.wait();
+    const pid2 = s5ForkExit(255);
+    var expected: u32 = 0;
+    _ = s5WaitpidU32(pid2, &expected);
+    try testing.expectEqual(expected, got);
+    try testing.expectEqual(@as(u8, 255), std.os.linux.W.EXITSTATUS(got));
+}
+
+test "S5: wait() status word is bit-identical to the Zig 0.16 *u32 path (killed by signal)" {
+    const pid = s5ForkSigkill();
+    var sub = sandbox.ToolSubprocess{ .pid = pid, .landlock_fd = -1, .stdout_fd = -1 };
+    const got = try sub.wait();
+    const pid2 = s5ForkSigkill();
+    var expected: u32 = 0;
+    _ = s5WaitpidU32(pid2, &expected);
+    try testing.expectEqual(expected, got);
+    try testing.expect(std.os.linux.W.IFSIGNALED(got));
+    try testing.expectEqual(std.os.linux.SIG.KILL, std.os.linux.W.TERMSIG(got));
+}
+
+var s5AlarmCount: std.atomic.Value(u32) = .init(0);
+
+fn s5OnAlarm(sig: std.os.linux.SIG) callconv(.c) void {
+    _ = sig;
+    _ = s5AlarmCount.fetchAdd(1, .seq_cst);
+}
+
+test "S5: wait() retries on EINTR instead of reporting a bogus exit status" {
+    s5AlarmCount.store(0, .seq_cst);
+    var act = std.os.linux.Sigaction{
+        .handler = .{ .handler = &s5OnAlarm },
+        .mask = std.mem.zeroes(std.os.linux.sigset_t),
+        .flags = 0, // no SA_RESTART -> waitpid returns EINTR
+    };
+    _ = std.os.linux.sigaction(std.os.linux.SIG.ALRM, &act, null);
+    const pid = std.os.linux.fork();
+    if (pid == 0) {
+        var ts = std.os.linux.timespec{ .sec = 2, .nsec = 0 };
+        _ = std.os.linux.nanosleep(&ts, null);
+        std.os.linux.exit_group(7);
+    }
+    // ITIMER_REAL = 0; the kernel struct is a timeval -> microseconds.
+    var it = std.os.linux.itimerspec{
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+        .it_value = .{ .sec = 0, .nsec = 300_000 },
+    };
+    _ = std.os.linux.setitimer(0, &it, null);
+    var sub = sandbox.ToolSubprocess{ .pid = @intCast(pid), .landlock_fd = -1, .stdout_fd = -1 };
+    const got = try sub.wait();
+    try testing.expect(s5AlarmCount.load(.seq_cst) >= 1);
+    try testing.expectEqual(@as(u8, 7), std.os.linux.W.EXITSTATUS(got));
 }

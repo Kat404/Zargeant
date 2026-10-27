@@ -112,28 +112,13 @@ test-sandbox-order:
 test-cancel-e2e:
     ZARGEANT_RUN_TUI_CANCEL_E2E=1 zig build test-cancel-e2e --summary all
 
-# Run src/*.zig embedded tests via standalone binary (workaround for listen IPC bug)
+# Run the umbrella artifact (src/*.zig embedded tests).
+# T-10: the umbrella used to be picked by scanning .zig-cache for the largest
+# test binary, which could select a STALE artifact and report a false green.
+# It is now a real build step that execs the binary directly, with no
+# std.zig.Server protocol and no cache scanning.
 test-embedded:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # Step A: trigger compilation via timeout — listen IPC hangs after compile
-    timeout 120 zig build test --summary all > /dev/null 2>&1 || true
-    # Step B: pick the largest test binary (embedded src/*.zig ~197 tests)
-    bin=""
-    best_count=0
-    for b in $(find .zig-cache/o -name "test" -type f -executable 2>/dev/null); do
-        ntests=$(timeout 15 "$b" 2>&1 | grep -cE "^[0-9]+/[0-9]+ " || true)
-        if [ "$ntests" -gt "$best_count" ]; then
-            best_count=$ntests
-            bin="$b"
-        fi
-    done
-    if [ -z "$bin" ] || [ "$best_count" -lt 50 ]; then
-        echo "FAIL: no embedded-tests binary found (best: $best_count tests)" >&2
-        exit 1
-    fi
-    echo "Running $bin ($best_count tests)"
-    timeout 60 "$bin" 2>&1 | tail -5
+    zig build test-embedded --summary all
 
 # Full test suite: targets individually + embedded workaround
 test-all:

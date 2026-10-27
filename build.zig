@@ -165,8 +165,20 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(b.path("test"));
     const test_step = b.addTest(.{ .root_module = test_mod });
     const run_test = b.addRunArtifact(test_step);
+    // T-10: run the umbrella artifact as a plain child process instead of
+    // through std.zig.Server. addRunArtifact defaults a test artifact to
+    // stdio = .zig_test, which speaks the std.zig.Server protocol over stdio;
+    // that handshake never completes for this artifact and `zig build test`
+    // hangs forever (AGENTS.md section 9.2). With .inherit the test binary
+    // runs the tests itself and the build system only checks its exit code,
+    // so the step is deterministic in any environment.
+    run_test.stdio = .inherit;
     const test_decl = b.step("test", "Run unit tests");
     test_decl.dependOn(&run_test.step);
+    // T-10: dedicated step for the umbrella artifact alone, so the embedded
+    // src/*.zig tests can be run without re-running every named test target.
+    const test_embedded_decl = b.step("test-embedded", "Run the umbrella artifact only (src/root.zig embedded tests)");
+    test_embedded_decl.dependOn(&run_test.step);
 
     // test step: tests/tui/terminal_smoke.zig (PR 6, WU 6.4).
     // Renamed from tests/tui/mibu_smoke.zig (per WU 6.4). Wired as a
