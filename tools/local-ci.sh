@@ -31,7 +31,7 @@ set -euo pipefail
 readonly PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly BASE_IMAGE="docker.io/library/alpine:3.20"
 readonly CI_IMAGE="localhost/zargeant-ci:latest"
-readonly ZIG_VERSION="0.16.0"
+readonly ZIG_VERSION="0.17.0"
 readonly CACHE_DIR="${HOME}/.cache/zargeant-podman-ci"
 readonly ZIG_CACHE_DIR="${CACHE_DIR}/zig-cache"
 readonly GLOBAL_ZIG_CACHE_DIR="${CACHE_DIR}/zig-global-cache"

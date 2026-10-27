@@ -26,7 +26,7 @@ RUN apk add --no-cache \
       ca-certificates curl xz git bash gcompat \
  && update-ca-certificates
 
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.0
 RUN curl -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
  && tar -xf "zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
  && mv "zig-x86_64-linux-${ZIG_VERSION}" /opt/zig \
