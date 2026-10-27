@@ -652,7 +652,7 @@ Con eso `zig build test` = los 9 steps nombrados (sin cuelgue) y `zig build veri
 - [ ] `zig build run -- --mock` sin regresión de args (check diferencial de T-1) — pendiente.
 - [x] Cero ocurrencias de `**` como multiplicación de array en código.
 - [x] Cero ocurrencias de `."struct".fields` / `."union".fields` / `."enum".fields` / `."struct".decls` / `."fn".params` en código.
-- [x] T-5 con el gate de exit-status RED→GREEN — **5 tests añadidos y verdes** (exit 0, exit 3, exit 255, señal, EINTR). Verificados por el verifier independiente.
+- [x] T-5 con el gate de exit-status RED→GREEN — **6 tests añadidos y verdes** (exit 0, exit 3, exit 255, señal, EINTR, ECHILD). Verificados por el verifier independiente (blocker cerrado, sin blockers).
 - [ ] Pins de toolchain en `0.17.0` en los 4 ficheros (T-6).
 - [ ] `AGENTS.md` §9.2 actualizado conservando el workaround (T-7).
 - [ ] `rg -n '0\.16\.0'` solo devuelve menciones históricas legítimas (T-7).
@@ -786,3 +786,11 @@ zig build
 **L27** (2026-10-27) — **`tools/local-ci.sh` deja de saltarse los embedded tests**: el paso 4 usaba `timeout 180 zig build test` con un `SKIPPED` de salida. Con T-10 ya no hace falta: ahora es `zig build test-embedded`, un step de build normal sin hack de timeout, y un fallo se cuenta como fallo (`FAILED++`) en vez de un skip silencioso. El mensaje documenta el caveat ambiental (seccomp denegado → exit 123).
 
 **L28** (2026-10-27) — **Nota de TSan revisada**: `docs/methodology.md` atribuía el "TSan no cableado" a que el `libtsan` de 0.16 referenciaba `<linux/scc.h>` (eliminado por el kernel en 5.15). En 0.17.0 las runtimes se movieron a `lib/` (`/usr/lib/zig/libtsan`) y **ya no** hay referencias a `scc.h` → el bloqueo original parece resuelto. Pero el step sigue sin cablearse porque **nunca se re-verificó** en este host. La nota lo dice así, sin prometer nada.
+
+**L29** (2026-10-27) — **Recheck del verifier: `blocker_closed: true`, veredicto `partial` (sin blockers)**. El blocker anterior (gate de 4 casos no entregado) está **cerrado**: los 5 tests S5 existen, están verdes, y el verifier demostró por **mutación** que no son vacíos — mutar `return @bitCast(status) >> 8` deja verde el caso exit 0 pero pone en rojo exit 3 (`expected 768, found 3`), exit 255 (`expected 65280, found 255`), señal (`expected 9, found 0`) y EINTR (`expected 7, found 0`); mutar `^ 0x100` los pone a todos en rojo. Revertir el error path de R1 al baseline (`rc == maxInt(usize)`) pone el test EINTR en rojo con `expected 7, found 0` — exactamente el status falso que producía el retry muerto. El fix de R1 quedó **verificado por RED→GREEN**, no por lectura.
+
+Advisories: (a) el caso "exit 0" aislado es débil (0 es punto fijo bajo desplazamientos) — el suite completo no lo es; (b) los 7 fallos del umbrella son **idénticos en el baseline y en la corrección** (`207 passed / 7 failed` vs `212 passed / 7 failed`, mismos nombres de test) → preexistentes/ambientales, probados por comparación directa; (c) el verifier no pudo ejecutar los named steps, `zig fmt --check`, el build de producción, la sonda ECHILD ni los invariantes de hash, porque se le cortó la fase.
+
+**Lo que el verifier dejó sin ejecutar, cerrado por el padre**: los 9 named steps (exit 0), `zig fmt --check` (exit 0), el build de producción en los 3 modos de optimize (exit 0 ×3), y **la sonda ECHILD se convirtió en un test commiteado** (`S5: wait() reports WaitpidFailed (not a bogus status) when the child is already reaped`) que cierra permanentemente el camino de error no-EINTR: 6 tests S5, todos verdes.
+
+**L30** (2026-10-27) — **Nota sobre el test de exit 0**: el advisory (a) del verifier es correcto y la mitigación es estructural, no cosmética: el caso exit 0 por sí solo no detecta un status word desplazado porque 0 es invariante bajo shifts, pero los casos exit 3 / exit 255 / señal / EINTR sí, y el suite se evalúa en conjunto. No se añadió un caso exit-0 más fuerte (sería redundante con exit 3) — la cobertura de desplazamientos la dan los otros cuatro.

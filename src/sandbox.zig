@@ -1075,3 +1075,14 @@ test "S5: wait() retries on EINTR instead of reporting a bogus exit status" {
     try testing.expect(s5AlarmCount.load(.seq_cst) >= 1);
     try testing.expectEqual(@as(u8, 7), std.os.linux.W.EXITSTATUS(got));
 }
+
+test "S5: wait() reports WaitpidFailed (not a bogus status) when the child is already reaped" {
+    // Non-EINTR error path: waitpid on an already-reaped pid returns ECHILD.
+    // The error path must surface error.WaitpidFailed, never a decoded
+    // status word that a caller would read as a successful exit.
+    const pid = s5ForkExit(0);
+    var expected: u32 = 0;
+    _ = s5WaitpidU32(pid, &expected); // reap it here
+    var sub = sandbox.ToolSubprocess{ .pid = pid, .landlock_fd = -1, .stdout_fd = -1 };
+    try testing.expectError(error.WaitpidFailed, sub.wait());
+}
