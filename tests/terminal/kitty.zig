@@ -68,7 +68,7 @@ test "KittyFlags all-three .bits() returns 7 (disambiguate|report_events|alterna
 // =============================================================================
 
 test "KittyFlags has at least one decl (C32 canary lock-in)" {
-    const info: std.builtin.Type = @typeInfo(kitty.KittyFlags);
+    const info: std.lang.Type = @typeInfo(kitty.KittyFlags);
     const decls = info.@"struct".decl_names;
     try testing.expect(decls.len > 0);
     var saw_bits = false;

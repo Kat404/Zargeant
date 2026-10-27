@@ -287,7 +287,7 @@ pub const Parser = struct {
         pending: *const std.atomic.Value(bool),
         poll_fn: *const fn (fds: []linux.pollfd, timeout: i32) anyerror!usize,
     ) anyerror!Event {
-        if (builtin.os.tag != .linux) {
+        if (builtin.target.os.tag != .linux) {
             return .timeout;
         }
 
@@ -798,14 +798,14 @@ pub const Parser = struct {
 //
 // ponytail: this is the minimum that satisfies C23 (existence) plus a real
 // poll(2) round-trip on Linux. Other Unix variants defer to TODO if
-// `builtin.os.tag != .linux`. The `_io` parameter is accepted for API
+// `builtin.target.os.tag != .linux`. The `_io` parameter is accepted for API
 // symmetry with `nextWithTimeout` but not consulted here; callers may
 // pass a real or `undefined` `std.Io`.
 // =============================================================================
 
 pub fn pollReadable(io: std.Io, file: std.Io.File) bool {
     _ = io;
-    if (builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .linux) {
         // ponytail: only Linux is in the CI matrix (Arch + ubuntu-latest);
         // return true as a non-lying best-effort on other platforms.
         return true;
@@ -955,7 +955,7 @@ test "Event.resize is a void tag (C21)" {
 }
 
 test "pollReadable exists on terminal.event namespace (C23)" {
-    const info: std.builtin.Type = @typeInfo(@import("event.zig"));
+    const info: std.lang.Type = @typeInfo(@import("event.zig"));
     const decls = info.@"struct".decl_names;
     var found = false;
     for (decls) |d| {

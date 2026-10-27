@@ -167,7 +167,7 @@ test "EventKind enum has press, release, repeat" {
 // =============================================================================
 
 test "terminal.event exposes pollReadable function (C23 canary)" {
-    const info: std.builtin.Type = @typeInfo(event);
+    const info: std.lang.Type = @typeInfo(event);
     const decls = info.@"struct".decl_names;
     var found = false;
     for (decls) |d| {

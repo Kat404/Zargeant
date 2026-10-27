@@ -41,7 +41,7 @@ const builtin = @import("builtin");
 // Linux-only comptime guard (matches every other module in the project).
 // =============================================================================
 comptime {
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("tui: linux-only v1 -- see sdd/tui/proposal id=373 constraint #5");
 }
 

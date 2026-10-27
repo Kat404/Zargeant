@@ -35,7 +35,7 @@
 // =============================================================================
 comptime {
     const builtin = @import("builtin");
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("debug-call: linux-only v1 — see proposal id=318 constraint #5");
 }
 
@@ -217,7 +217,7 @@ test "tools/debug_call.zig never logs key bytes" {
 test "tools/debug_call.zig Linux guard" {
     comptime {
         const builtin = @import("builtin");
-        if (builtin.os.tag != .linux) {
+        if (builtin.target.os.tag != .linux) {
             @compileError("debug-call: linux-only v1 — see proposal id=318 constraint #5");
         }
     }

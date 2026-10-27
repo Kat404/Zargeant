@@ -17,7 +17,7 @@ const testing = std.testing;
 // Linux-only comptime guard.
 // =============================================================================
 comptime {
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("api_client tests: linux-only v1");
 }
 

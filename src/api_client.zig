@@ -40,7 +40,7 @@
 
 comptime {
     const builtin = @import("builtin");
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("api-client: linux-only v1 -- see proposal id=272 constraint #5");
 }
 
@@ -921,7 +921,7 @@ test "current_url is correct" {
 test "Linux guard emits compileError on non-Linux" {
     comptime {
         const builtin = @import("builtin");
-        if (builtin.os.tag != .linux) {
+        if (builtin.target.os.tag != .linux) {
             @compileError("api-client: linux-only v1 -- see proposal id=272 constraint #5");
         }
     }

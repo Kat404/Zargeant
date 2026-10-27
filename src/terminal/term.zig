@@ -53,7 +53,7 @@ pub const PosixBackend = struct {
     }
 
     fn ioctlGwinszPosix(handle: std.Io.File.Handle) anyerror!std.posix.winsize {
-        if (builtin.os.tag != .linux) {
+        if (builtin.target.os.tag != .linux) {
             return error.UnsupportedOs;
         }
         var ws: std.posix.winsize = std.mem.zeroes(std.posix.winsize);
@@ -347,7 +347,7 @@ test "term.zig re-exports the 6 DPM entry points (design C31)" {
     // resolve at compile time even before PR 2 lands the real impls.
     // WU-2 (tui-keyentry-rebuild, REQ-NEW-002) extends the list with the
     // 2 DEC 2004 entry points so the namespace stays discoverable.
-    const term_info: std.builtin.Type = @typeInfo(@import("term.zig"));
+    const term_info: std.lang.Type = @typeInfo(@import("term.zig"));
     const decls = term_info.@"struct".decl_names;
     const required = [_][]const u8{
         "enterAlternateScreen",

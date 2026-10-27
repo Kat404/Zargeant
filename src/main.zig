@@ -26,7 +26,7 @@ const api_auth = @import("api_auth.zig");
 // Linux-only comptime guard (matches every other module in the project).
 // =============================================================================
 comptime {
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("main: linux-only v1");
 }
 

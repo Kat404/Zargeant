@@ -24,7 +24,7 @@ const builtin = @import("builtin");
 // Linux-only — matches every other module in the project.
 // =============================================================================
 comptime {
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("cancel_e2e: linux-only v1");
 }
 

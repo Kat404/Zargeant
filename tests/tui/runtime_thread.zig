@@ -20,7 +20,7 @@ const terminal = @import("terminal");
 // Linux-only comptime guard.
 // =============================================================================
 comptime {
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("runtime_thread: linux-only v1");
 }
 
@@ -3486,7 +3486,7 @@ test "T-R2.3.3: @hasDecl terminal.event.Parser.setKittyActive (compile-time symb
     // tuiThreadInit can call it. Compile-time symbol guard — fails if
     // a future refactor renames or removes the setter. We scan
     // `@typeInfo(Parser).@"struct".decl_names` for the decl name.
-    const info: std.builtin.Type = @typeInfo(terminal.event.Parser);
+    const info: std.lang.Type = @typeInfo(terminal.event.Parser);
     const decls = info.@"struct".decl_names;
     var found = false;
     for (decls) |d| {

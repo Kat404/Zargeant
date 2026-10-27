@@ -50,7 +50,7 @@ test "terminal in-tree source resolves" {
     // @typeInfo returns .@"union" with a tag_type field (the underlying
     // enum). Assert the enum has at least one field (key, mouse, resize,
     // paste_start, paste_end, invalid, timeout, none).
-    const event_info: std.builtin.Type = @typeInfo(terminal.event.Event);
+    const event_info: std.lang.Type = @typeInfo(terminal.event.Event);
     switch (event_info) {
         .@"union" => |u| {
             try testing.expect(u.field_names.len > 0);
@@ -73,7 +73,7 @@ test "terminal.term exposes the public entry points" {
     // Per design C31 the dpm enter/exit/sync-update helpers are
     // re-exported on terminal.term so src/tui.zig can use the
     // `terminal.term.{enterAlternateScreen,...}` form byte-for-byte.
-    const term_info: std.builtin.Type = @typeInfo(terminal.term);
+    const term_info: std.lang.Type = @typeInfo(terminal.term);
     try testing.expect(term_info == .@"struct");
     const decls = term_info.@"struct".decl_names;
     var saw_enable_raw = false;
@@ -102,7 +102,7 @@ test "terminal.event exposes nextWithTimeout + pollReadable" {
     // nextWithTimeout replaces libvaxis Loop.nextEvent for PR 3.
     // pollReadable is the C23 lock-in sub-capability for the renamed
     // smoke canary to assert (obs#1511 C23).
-    const events_info: std.builtin.Type = @typeInfo(terminal.event);
+    const events_info: std.lang.Type = @typeInfo(terminal.event);
     try testing.expect(events_info == .@"struct");
     const decls = events_info.@"struct".decl_names;
     var saw_next = false;

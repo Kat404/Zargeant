@@ -26,7 +26,7 @@ const logger = @import("logger.zig");
 // Linux-only comptime guard (matches every other module in the project).
 // =============================================================================
 comptime {
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("channels: linux-only v1");
 }
 

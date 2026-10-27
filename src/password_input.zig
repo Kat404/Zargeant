@@ -25,7 +25,7 @@ const builtin = @import("builtin");
 // Linux-only comptime guard (matches every other module in the project).
 // =============================================================================
 comptime {
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("password_input: linux-only v1");
 }
 

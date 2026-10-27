@@ -32,7 +32,7 @@ const event = @import("event");
 // =============================================================================
 
 test "pty integration: 64-char bracketed paste round-trip" {
-    if (builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .linux) {
         // Linux-only — relies on /dev/ptmx + TIOCGPTPEER + ptsname for a
         // real pty. The CI matrix is Linux-only (Arch + ubuntu-latest)
         // per tests/tui/terminal_smoke.zig:99-105 precedent.

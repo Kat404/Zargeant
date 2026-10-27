@@ -36,7 +36,7 @@ const ScreenGrid = screen_grid_mod.ScreenGrid;
 // Linux-only comptime guard (matches every other module in the project).
 // =============================================================================
 comptime {
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("modal: linux-only v1");
 }
 
