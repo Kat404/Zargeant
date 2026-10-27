@@ -1,6 +1,6 @@
-# Methodology — Strict TDD + QA Layers + Zig 0.16 Best Practices
+# Methodology — Strict TDD + QA Layers + Zig 0.17 Best Practices
 
-> **Audience:** Contributors to `zargeant` (Zig 0.16 AI Agent Harness).
+> **Audience:** Contributors to `zargeant` (Zig 0.17 AI Agent Harness).
 > **Status:** Canonical reference. Updated when the workflow or toolchain changes.
 > **Companion docs:** [`investigation-2.md`](./investigation-2.md) (security architecture and isolation order), [`decisions/0001-libvaxis-to-mibu.md`](./decisions/0001-libvaxis-to-mibu.md) (TUI library selection).
 
@@ -24,7 +24,7 @@ This is why both coexist for security-critical code: TDD encodes your intent (e.
 
 ---
 
-## 2. Strict TDD in Zig 0.16
+## 2. Strict TDD in Zig 0.17
 
 ### The cycle
 
@@ -113,7 +113,7 @@ Work units compose into slices. A slice is a coherent feature across multiple wo
 >
 > **Not in the strict order (by design):**
 > - **Fuzz** (`zig build test --fuzz`) — nightly cadence, not part of the per-push verify step. The fuzzer only runs tests marked with fuzz-friendly signatures (e.g., `test "fuzz: name"` consuming `std.testing.fuzzInput()`). Add a fuzz-marked test for any surface that accepts untrusted input (parsers, hash parsers, JSON decoders). For zargeant, this applies to the BPF filter builder and `Seccomp.buildAllowlist`.
-> - **Thread Sanitizer (TSan)** — documented but **not wired**. Reason: Zig 0.16's bundled `libtsan` (`lib/std/libtsan/`) references `<linux/scc.h>`, which the kernel removed in 5.15 — compilation fails on Arch/CachyOS/nix with recent kernels. Track upstream fix (Zig 0.16.1+); meanwhile, **QA 7 helgrind** is the practical fallback for race detection on the test binary.
+> - **Thread Sanitizer (TSan)** — documented but **not wired**. Reason (as of Zig 0.16): the bundled `libtsan` referenced `<linux/scc.h>`, which the kernel removed in 5.15 — compilation failed on Arch/CachyOS/nix with recent kernels. In Zig 0.17.0 the runtime libraries moved to `lib/` (`/usr/lib/zig/libtsan`) and no longer reference `scc.h`, so the original blocker looks gone — **but the step is still not wired, because that was never re-verified**. Re-check the TSan build on this host before re-enabling it; meanwhile, **QA 7 helgrind** remains the practical fallback for race detection on the test binary.
 > - **Integration (VM smoke + `strace -f`)** — **NOT ADOPTED** (see §8).
 > - **Pen-test** — **NOT ADOPTED** (see §8).
 
@@ -138,7 +138,7 @@ Work units compose into slices. A slice is a coherent feature across multiple wo
 
 ---
 
-## 4. Zig 0.16 Best Practices
+## 4. Zig 0.17 Best Practices
 
 ### 4.1 Memory
 
@@ -163,7 +163,7 @@ Work units compose into slices. A slice is a coherent feature across multiple wo
 - `ReleaseSafe` for code that handles untrusted input (sandbox, parsers).
 - `ReleaseFast` for audited hot paths (TUI renderer, IPC).
 
-### 4.4 Zig 0.16 specifics (vs 0.13/0.14)
+### 4.4 Zig 0.17 specifics (vs 0.13/0.14)
 
 - **`@cImport` removed** → `translate-c` declared in `build.zig`.
 - `std.os.linux` direct for critical syscalls.
@@ -175,7 +175,7 @@ Work units compose into slices. A slice is a coherent feature across multiple wo
 ### 4.5 Security (zargeant-specific)
 
 - `std.os.linux.PR.SET_DUMPABLE` before loading secrets (enum, not magic number `4`).
-- `O_CLOEXEC` / `SOCK_CLOEXEC` on every open. **Zig 0.16 syntax:**
+- `O_CLOEXEC` / `SOCK_CLOEXEC` on every open. **Zig 0.17 syntax:**
   ```zig
   // File open (packed struct bool)
   .{ .CLOEXEC = true }
@@ -260,7 +260,7 @@ The TDD layer (1-3) is what you **add** to the existing flow. The current `zls �
 8. **TDD without `errdefer`** — leaks pass the green test.
 9. **Skipping `refAllDecls`** — dead declarations survive in `ReleaseSafe`.
 10. **Stack allocation in post-`clone` child** — corrupts the parent's heap (see `investigation-2.md` §3, Eje 2).
-11. **Bitwise OR on `O_*` flags** — `O_TMPFILE | O_EXCL` does not compile in 0.16. Use struct literals: `.{ .TMPFILE = true, .EXCL = true }`. Socket flags (`SOCK.CLOEXEC`) remain integer constants.
+11. **Bitwise OR on `O_*` flags** — `O_TMPFILE | O_EXCL` does not compile in 0.16+. Use struct literals: `.{ .TMPFILE = true, .EXCL = true }`. Socket flags (`SOCK.CLOEXEC`) remain integer constants.
 
 ---
 
@@ -282,7 +282,7 @@ Re-evaluate this scope when: (a) the project gains a real user base that needs V
 
 - [`investigation-2.md`](./investigation-2.md) — security architecture, isolation order, kernel primitives.
 - [`decisions/0001-libvaxis-to-mibu.md`](./decisions/0001-libvaxis-to-mibu.md) — TUI library selection rationale.
-- [Zig 0.16 Language Reference](https://ziglang.org/documentation/0.16.0/) — `std.testing`, `std.heap`, `std.os.linux`.
+- [Zig 0.17 Language Reference](https://ziglang.org/documentation/0.17.0/) — `std.testing`, `std.heap`, `std.os.linux`.
 - [Linux man-pages](https://man7.org/linux/man-pages/) — `landlock(7)`, `seccomp(2)`, `prctl(2)`, `clone(2)`, `open(2)`.
 
 ---

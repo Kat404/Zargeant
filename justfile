@@ -10,9 +10,11 @@
 #
 # Conventions:
 #   - All recipes are idempotent (safe to re-run).
-#   - Test recipes avoid `zig build test` (Zig 0.16.0 `--listen=-` IPC bug)
-#     by invoking each `zig build test-*` target individually.
-#   - The Podman CI recipes wrap `tools/local-ci.sh` (Alpine + Zig 0.16.0,
+#   - Test recipes invoke each `zig build test-*` target individually, so a
+#     failure points at one artifact and the per-step test count is visible.
+#     (The `zig build test` umbrella hang was a `std.zig.Server` protocol bug
+#     and is fixed as of Zig 0.17.0 — see AGENTS.md section 9.2.)
+#   - The Podman CI recipes wrap `tools/local-ci.sh` (Alpine + Zig 0.17.0,
 #     --rm no garbage) for full parity with GitHub Actions.
 
 set dotenv-load := false
@@ -74,6 +76,8 @@ test:
     just test-api-client
     just test-tools
     just test-cancel-path
+    just test-sandbox-order
+    just test-tui-screen-grid
     just test-cancel-e2e
 
 # Run the in-tree src/terminal/ + tests/terminal/ in isolation (140 tests)
@@ -190,7 +194,7 @@ check: fmt-check check-syscalls check-tdd check-coauthor
 
 # ─── Local CI (Podman, Alpine, --rm) ─────────────────────────────────────────
 
-# Run the full local CI suite via Podman (Alpine + Zig 0.16.0, --rm no garbage)
+# Run the full local CI suite via Podman (Alpine + Zig 0.17.0, --rm no garbage)
 ci:
     {{ci_sh}}
 

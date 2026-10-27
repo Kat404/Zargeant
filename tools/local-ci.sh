@@ -200,42 +200,37 @@ run_step "test-sandbox-order (2 tests, S1/WU-1.1 isolation order guard)" \
 run_step "test-cancel-e2e (2 tests, end-to-end cancel pipe)" \
   podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c 'zig build test-cancel-e2e --summary all'
 
-# Step 4: src/*.zig embedded tests via the cached binary (standalone,
-#         bypasses the `zig build test` listen-protocol hang).
+# Step 4: src/*.zig embedded tests (220) via the `test-embedded` build step.
 #
-# KNOWN LIMITATION: Zig 0.16.0 `zig build test --listen=-` protocol hangs
-# reproducibly inside this Podman container (and in the agent shell without
-# a TTY) after cancel_e2e CAP-09 passes. This is a Zig test-runner IPC bug,
-# NOT a code regression. Workarounds attempted:
-#   - Disable cancel_e2e via env var: still hangs
-#   - Force TTY allocation (`podman run -t`): still hangs
-#   - Run test binary standalone (no --listen): binary runs fine
-#   - Timeout-compile-only: still hangs after compilation
-# Decision: skip embedded tests locally; CI restores coverage when minutes
-# are back. The TUI-specific tests (test-tui-runtime-thread, test-terminal,
-# test-tui) cover the PR1+PR1.5 changes.
+# The umbrella artifact used to hang here: `zig build test` put the test
+# artifact in stdio = .zig_test, which speaks the std.zig.Server protocol
+# over stdio, and that handshake never completed inside this container.
+# The build now runs the umbrella artifact with stdio = .inherit (exec the
+# binary directly), so this step is a plain build step with no timeout
+# hack. See AGENTS.md section 9.2.
 if [[ "${SKIP_BUILD}" -eq 1 ]]; then
   echo ""
-  echo "─── src/*.zig embedded tests (~197) SKIPPED (--skip-build) ───"
+  echo "─── src/*.zig embedded tests (220) SKIPPED (--skip-build) ───"
 else
-  # Try once with longer timeout — if it works, great. Otherwise, document.
   set +e
   podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c '
-    timeout 180 zig build test --summary all 2>&1
+    zig build test-embedded --summary all 2>&1
   ' > /tmp/embedded-test.log 2>&1
   EXIT_CODE=$?
   set -e
   echo ""
-  echo "─── src/*.zig embedded tests (~197, via zig build test) ───"
+  echo "─── src/*.zig embedded tests (220, via zig build test-embedded) ───"
   if [[ ${EXIT_CODE} -eq 0 ]]; then
     grep -E "Build Summary|tests passed" /tmp/embedded-test.log | head -3
     echo "✓ src/*.zig embedded tests PASSED"
     PASSED=$((PASSED + 1))
   else
-    echo "ⓘ src/*.zig embedded tests SKIPPED (Zig 0.16.0 --listen IPC bug)."
-    echo "  Workaround: covered by CI when GitHub Actions minutes return."
-    echo "  TUI-specific tests above cover the PR1+PR1.5 changes."
+    echo "ⓘ src/*.zig embedded tests FAILED — see /tmp/embedded-test.log"
+    echo "  Note: in a container that denies seccomp(SECCOMP_SET_MODE_FILTER)"
+    echo "  the fail-closed sandbox child exits 123 and ~6 tests fail with"
+    echo "  'expected 0, found 123'. That is the environment, not the code."
     echo "  See: cat /tmp/embedded-test.log | tail -10"
+    FAILED=$((FAILED + 1))
   fi
 fi
 
