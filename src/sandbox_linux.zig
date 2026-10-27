@@ -22,6 +22,63 @@ const std = @import("std");
 // for self-referential test code; it does not affect external consumers.
 const sandbox = @This();
 
+/// Can this platform actually enforce the sandbox?
+///
+/// Probes in a FORKED CHILD so the caller's state is never touched: neither a
+/// Landlock ruleset nor a seccomp filter can be removed once applied.
+///
+/// The probe installs KNOWN-GOOD programs (a ruleset with no rules, an
+/// allow-all cBPF filter). That distinction matters: a failure of the probe
+/// means the PLATFORM cannot enforce the sandbox (a container that forbids
+/// the landlock or seccomp syscalls), which is environmental. A failure of
+/// the sandbox's OWN program is a defect in our code and must surface as a
+/// test failure — never as a skip. Probing with known-good programs keeps
+/// those two cases apart.
+pub fn sandboxEnforceable() bool {
+    const pid = std.os.linux.fork();
+    if (pid == 0) {
+        _ = std.os.linux.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+        const access_bits = LANDLOCK.ACCESS.FS_WRITE |
+            LANDLOCK.ACCESS.FS_READ | LANDLOCK.ACCESS.FS_EXEC;
+        const ruleset_fd = Landlock.createRuleset(access_bits) catch
+            std.os.linux.exit_group(1);
+        Landlock.restrictSelf(ruleset_fd) catch
+            std.os.linux.exit_group(1);
+
+        const BPF = std.os.linux.BPF;
+        const SECC = std.os.linux.SECCOMP;
+        const prog = [_]BPF.Insn{.{
+            .code = BPF.RET | BPF.K,
+            .dst = 0,
+            .src = 0,
+            .off = 0,
+            .imm = @bitCast(@as(u32, SECC.RET.ALLOW)),
+        }};
+        Seccomp.loadFilter(&prog) catch
+            std.os.linux.exit_group(1);
+        std.os.linux.exit_group(0);
+    }
+    if (pid == std.math.maxInt(usize)) return false; // fork() failed
+    var status: i32 = 0;
+    const rc = std.os.linux.waitpid(@intCast(pid), &status, 0);
+    if (rc == std.math.maxInt(usize)) return false;
+    // The probe child exits 0 when every setup step succeeded, 1 otherwise.
+    return (@as(u32, @bitCast(status)) >> 8) == 0;
+}
+
+/// True when this platform can actually enforce the sandbox: Landlock
+/// support AND a working seccomp filter install.
+///
+/// Tests that assert sandbox BEHAVIOUR must skip when this is false. Without
+/// the check they fail for an environmental reason — a container that denies
+/// SECCOMP_SET_MODE_FILTER — and the failure looks exactly like a security
+/// regression, which is the worst possible false signal.
+pub fn canEnforceSandbox() bool {
+    checkKernelSupport() catch return false;
+    return sandboxEnforceable();
+}
+
 // =============================================================================
 // Public types
 // =============================================================================

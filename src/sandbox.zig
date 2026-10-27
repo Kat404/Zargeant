@@ -673,6 +673,11 @@ pub const Sandbox = struct {
         try sandbox_linux.checkKernelSupport();
     }
 
+    /// Re-export from sandbox_linux: true when this platform can actually
+    /// enforce the sandbox (Landlock + a working seccomp filter install).
+    pub fn canEnforceSandbox() bool {
+        return sandbox_linux.canEnforceSandbox();
+    }
     /// Apply Landlock to the CURRENT process. Seccomp is intentionally
     /// NOT applied here — applying Seccomp would kill the caller (the test
     /// runner). For end-to-end sandbox isolation, use `spawnToolSubprocess`
@@ -851,7 +856,7 @@ pub const Sandbox = struct {
 //   - spawnToolSubprocess logger fd NOT inherited
 //   - sandbox.zig does not write to stdout or stderr (placeholder)
 //
-// All fork-isolated tests gate on `sandbox_linux.checkKernelSupport()`
+// All fork-isolated tests gate on `sandbox_linux.canEnforceSandbox()`
 // so CI on older kernels early-returns PASS without touching the kernel.
 // =============================================================================
 
@@ -885,7 +890,7 @@ test "Sandbox.checkKernelSupport returns success on 5.13+" {
 
 // 3.2 Round-trip — sandboxed child runs /bin/true and exits cleanly.
 test "Sandbox.spawnToolSubprocess fork /bin/true waitpid returns 0" {
-    sandbox_linux.checkKernelSupport() catch return;
+    if (!sandbox_linux.canEnforceSandbox()) return;
 
     const argv = [_][]const u8{"/bin/true"};
     var subs = try sandbox.Sandbox.spawnToolSubprocess(testing.allocator, test_profile, &argv, &[_][*:0]const u8{}, null);
@@ -898,7 +903,7 @@ test "Sandbox.spawnToolSubprocess fork /bin/true waitpid returns 0" {
 
 // 3.3 Filesystem enforcement — /tmp is writable in the sandboxed child.
 test "Sandbox.spawnToolSubprocess child /tmp writable" {
-    sandbox_linux.checkKernelSupport() catch return;
+    if (!sandbox_linux.canEnforceSandbox()) return;
 
     const argv = [_][]const u8{ "/bin/sh", "-c", "echo sandbox_test > /tmp/zargeant_sandbox_$$.txt; rm /tmp/zargeant_sandbox_$$.txt; exit 0" };
     var subs = try sandbox.Sandbox.spawnToolSubprocess(testing.allocator, test_profile, &argv, &[_][*:0]const u8{}, null);
@@ -912,7 +917,7 @@ test "Sandbox.spawnToolSubprocess child /tmp writable" {
 // 3.4 Filesystem enforcement — /etc/shadow is NOT in the test profile's
 // allowlist, so `cat` returns EACCES → child exits 1.
 test "Sandbox.spawnToolSubprocess child /etc/shadow EACCES" {
-    sandbox_linux.checkKernelSupport() catch return;
+    if (!sandbox_linux.canEnforceSandbox()) return;
 
     const argv = [_][]const u8{ "/bin/sh", "-c", "exec cat /etc/shadow > /dev/null 2>&1" };
     var subs = try sandbox.Sandbox.spawnToolSubprocess(testing.allocator, test_profile, &argv, &[_][*:0]const u8{}, null);
@@ -932,7 +937,7 @@ test "Sandbox.spawnToolSubprocess child /etc/shadow EACCES" {
 // If the test binary doesn't exist (CI without zig build), the test
 // early-returns PASS — coverage gap documented in apply-progress.
 test "Sandbox.spawnToolSubprocess child ptrace blocked" {
-    sandbox_linux.checkKernelSupport() catch return;
+    if (!sandbox_linux.canEnforceSandbox()) return;
 
     const test_bin = "/tmp/zargeant_ptrace_test";
     const argv = [_][]const u8{test_bin};

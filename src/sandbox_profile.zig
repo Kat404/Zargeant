@@ -281,7 +281,7 @@ test "Profile.default() allow-list contains read, write, openat, close" {
 
 test "buildFromProfile returns AppliedSandbox with landlock ruleset fd" {
     // Skip if kernel doesn't support Landlock (CI on older kernels).
-    sandbox_linux.checkKernelSupport() catch return;
+    if (!sandbox_linux.canEnforceSandbox()) return;
 
     const p = sandbox_profile.default();
     var applied = try sandbox_profile.buildFromProfile(testing.allocator, p);

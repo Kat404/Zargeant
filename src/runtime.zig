@@ -1370,6 +1370,10 @@ test "TOOLS_PROFILE exports sandbox_profile.Profile with non-empty paths" {
 }
 
 test "tools thread spawns /bin/true with empty envp (REQ-TUI-011)" {
+    // The sandbox can only enforce its syscall policy where a seccomp
+    // filter can actually be installed. Skip where the platform denies it,
+    // instead of failing for an environmental reason.
+    if (!sandbox.Sandbox.canEnforceSandbox()) return;
     // REQ-TUI-011 scenario 1 — sandbox.Sandbox.spawnToolSubprocess is
     // called with `envp.len == 0` from the tools thread. We verify by
     // spawning the canonical /bin/true and asserting a clean exit; the
@@ -1571,6 +1575,10 @@ test "agentDispatchTool: posts DispatchToolRequest on tui_to_tools" {
 // =============================================================================
 
 test "tools thread captures stdout via Sandbox.spawnToolSubprocess" {
+    // The sandbox can only enforce its syscall policy where a seccomp
+    // filter can actually be installed. Skip where the platform denies it,
+    // instead of failing for an environmental reason.
+    if (!sandbox.Sandbox.canEnforceSandbox()) return;
     // End-to-end: spawn /bin/echo via the same machinery toolsRealMain uses.
     // Verifies that spawnToolSubprocess + pipe capture + read loop + post
     // to ToolResult produces the expected output bytes (no LLM involved).
@@ -1600,6 +1608,10 @@ test "tools thread captures stdout via Sandbox.spawnToolSubprocess" {
 }
 
 test "tools thread spawns /bin/sleep N and waitpid returns after N ms" {
+    // The sandbox can only enforce its syscall policy where a seccomp
+    // filter can actually be installed. Skip where the platform denies it,
+    // instead of failing for an environmental reason.
+    if (!sandbox.Sandbox.canEnforceSandbox()) return;
     // Validates the timeout WU-4 substrate: blocking waitpid returns
     // within ~1s when child sleeps 1s. Cross-checks the deadline math:
     // deadline = nowMs() + TOOL_TIMEOUT_MS; remaining_ms computation.
