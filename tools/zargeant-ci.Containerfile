@@ -3,7 +3,7 @@
 # Migrated from ubuntu:24.04 → alpine:3.20 to reduce image footprint
 # (ubuntu ~77 MB base + Zig ~210 MB ≈ 540 MB; alpine ~7 MB + Zig ≈ 240 MB).
 #
-# Zig 0.16.0 host tarball (zig-x86_64-linux) is glibc-linked. Alpine ships
+# Zig 0.17.0 host tarball (zig-x86_64-linux) is glibc-linked. Alpine ships
 # musl, so we install `gcompat` as a thin glibc compatibility layer that
 # covers the few libc symbols Zig dynamically pulls in at startup. This is
 # the official Alpine-recommended approach for running glibc binaries
