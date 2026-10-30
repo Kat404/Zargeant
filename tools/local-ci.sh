@@ -231,7 +231,7 @@ else
   EXIT_CODE=$?
   set -e
   echo ""
-  echo "─── src/*.zig embedded tests (224, via zig build test-embedded) ───"
+  echo "─── src/*.zig embedded tests (226, via zig build test-embedded) ───"
   if [[ ${EXIT_CODE} -eq 0 ]]; then
     grep -E "Build Summary|tests passed" /tmp/embedded-test.log | head -3
     echo "✓ src/*.zig embedded tests PASSED"

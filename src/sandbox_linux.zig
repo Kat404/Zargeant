@@ -162,8 +162,11 @@ pub const Landlock = struct {
         return @as(i32, @intCast(rc));
     }
 
-    /// Add a path-beneath rule. `parent_fd` must be a directory opened with
-    /// O_PATH; `allowed_access` is the per-path FS bitmask granted.
+    /// Add a path-beneath rule. `parent_fd` must be opened with O_PATH; for
+    /// a directory the rule covers the whole hierarchy beneath it, and for
+    /// a regular file the rule only carries FS_EXECUTE (the kernel rejects
+    /// any other right on a file rule) — which is exactly what the ELF
+    /// interpreter needs.
     pub fn addPathBeneathRule(ruleset_fd: i32, parent_fd: i32, allowed_access: u64) LandlockError!void {
         const attr = path_beneath_attr{
             .allowed_access = allowed_access,

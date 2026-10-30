@@ -63,10 +63,12 @@ const startup_allow_syscalls = [_]u32{
     231, // exit_group
     56, // clone
     57, // fork
+    58, // vfork
     33, // dup2
     32, // dup
     292, // dup3
     61, // wait4
+    34, // pause
     35, // nanosleep
     72, // fcntl
     4, // stat
@@ -96,6 +98,7 @@ const startup_allow_syscalls = [_]u32{
     1, // write
     2, // open
     3, // close
+    7, // poll
     8, // creat
     9, // mmap
     12, // brk
@@ -178,6 +181,7 @@ const startup_allow_syscalls = [_]u32{
     121, // getpgid
     122, // setfsuid
     123, // setfsgid
+    125, // capget
     124, // getsid
     126, // 126 unused
     127, // 127 unused (rt_sigpending)
@@ -853,12 +857,16 @@ const test_profile = sandbox_profile.Profile{
         .{ .path = "/tmp", .access = .{ .read = true, .write = true } },
         .{ .path = "/usr/bin", .access = .{ .read = true, .execute = true } },
         .{ .path = "/bin", .access = .{ .read = true, .execute = true } },
-        // The loader directory needs EXECUTE (the kernel opens ld.so /
-        // ld-musl with FMODE_EXEC); it differs per distro (/usr/lib on
-        // merged-usr hosts, /lib on Alpine, /lib64 elsewhere).
-        .{ .path = "/usr/lib", .access = .{ .read = true, .execute = true } },
-        .{ .path = "/lib", .access = .{ .read = true, .execute = true } },
-        .{ .path = "/lib64", .access = .{ .read = true, .execute = true } },
+        // The loader needs EXECUTE on the FILE (the kernel opens it with
+        // FMODE_EXEC); on the directory it would also make every binary
+        // under it executable. Landlock v1 allows a file rule with
+        // FS_EXECUTE only. Paths that do not exist are skipped.
+        .{ .path = "/usr/lib/ld-linux-x86-64.so.2", .access = .{ .read = true, .execute = true } },
+        .{ .path = "/lib64/ld-linux-x86-64.so.2", .access = .{ .read = true, .execute = true } },
+        .{ .path = "/lib/ld-linux-x86_64.so.2", .access = .{ .read = true, .execute = true } },
+        .{ .path = "/lib/ld-musl-x86_64.so.1", .access = .{ .read = true, .execute = true } },
+        .{ .path = "/usr/lib", .access = .{ .read = true } },
+        .{ .path = "/lib", .access = .{ .read = true } },
         .{ .path = "/etc/ssl", .access = .{ .read = true } },
     },
     .allowed_syscalls = &[_]u32{},
@@ -1116,10 +1124,40 @@ test "P0: the seccomp program checks the architecture before matching syscalls" 
 test "P0: the effective syscall allowlist excludes the profile's explicit denials" {
     // The filter is the enforcement point for the profile's syscall
     // policy: a filter that allowed `mount` while the profile declares it
-    // denied would make the profile a lie.
-    for (sandbox_profile.default().denied_syscalls) |denied| {
+    // denied would make the profile a lie. The names are resolved from the
+    // x86_64 ABI so the assertion cannot drift into pinning a wrong number.
+    const SYS = std.os.linux.SYS;
+    const denied_by_policy = [_]SYS{
+        .ptrace,      .setuid,     .setgid,  .capset,          .personality, .mount,       .reboot,
+        .init_module, .kexec_load, .unshare, .perf_event_open, .bpf,         .userfaultfd,
+    };
+    for (denied_by_policy) |name| {
+        const nr: u32 = @intCast(@backingInt(name));
         for (effective_allow_syscalls) |allowed| {
-            try testing.expect(allowed != denied);
+            try testing.expect(allowed != nr);
         }
+    }
+}
+
+test "P0: the effective syscall allowlist keeps the syscalls real tools need" {
+    // The allowlist is "the whole x86_64 surface minus the policy denials",
+    // so an accidental hole is a syscall the sandboxed tool cannot call at
+    // all: ripgrep needs poll(2) and node needs capget(2), and both died
+    // with SIGSYS while those holes were in the list.
+    const required = [_]struct { nr: u32, name: std.os.linux.SYS }{
+        .{ .nr = 7, .name = .poll },
+        .{ .nr = 58, .name = .vfork },
+        .{ .nr = 125, .name = .capget },
+    };
+    for (required) |e| {
+        try testing.expectEqual(@as(u32, @intCast(@backingInt(e.name))), e.nr);
+        var found = false;
+        for (effective_allow_syscalls) |allowed| {
+            if (allowed == e.nr) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
     }
 }
