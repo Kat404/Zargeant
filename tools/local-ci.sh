@@ -200,7 +200,7 @@ run_step "test-sandbox-order (2 tests, S1/WU-1.1 isolation order guard)" \
 run_step "test-cancel-e2e (2 tests, end-to-end cancel pipe)" \
   podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c 'zig build test-cancel-e2e --summary all'
 
-# Step 4: src/*.zig embedded tests (220) via the `test-embedded` build step.
+# Step 4: src/*.zig embedded tests (224) via the `test-embedded` build step.
 #
 # The umbrella artifact used to hang here: `zig build test` put the test
 # artifact in stdio = .zig_test, which speaks the std.zig.Server protocol
@@ -210,7 +210,7 @@ run_step "test-cancel-e2e (2 tests, end-to-end cancel pipe)" \
 # hack. See AGENTS.md section 9.2.
 if [[ "${SKIP_BUILD}" -eq 1 ]]; then
   echo ""
-  echo "─── src/*.zig embedded tests (220) SKIPPED (--skip-build) ───"
+  echo "─── src/*.zig embedded tests (224) SKIPPED (--skip-build) ───"
 else
   set +e
   podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c '
@@ -219,7 +219,7 @@ else
   EXIT_CODE=$?
   set -e
   echo ""
-  echo "─── src/*.zig embedded tests (220, via zig build test-embedded) ───"
+  echo "─── src/*.zig embedded tests (224, via zig build test-embedded) ───"
   if [[ ${EXIT_CODE} -eq 0 ]]; then
     grep -E "Build Summary|tests passed" /tmp/embedded-test.log | head -3
     echo "✓ src/*.zig embedded tests PASSED"
