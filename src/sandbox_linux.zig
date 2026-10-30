@@ -221,11 +221,11 @@ pub const Seccomp = struct {
     /// everything once the allowlist grows past ~255 entries.
     ///
     /// ENCODING: `struct sock_filter` is {code u16, jt u8, jf u8, k u32};
-    /// Zig's `BPF.Insn` is {code u16, dst/src nibbles, off i16, imm u32}.
-    /// Byte 1 of the Zig struct holds dst/src, which in the classic layout
-    /// is the opcode's high byte — so `dst` MUST stay `.r0` (the
-    /// accumulator) or it corrupts the opcode. `off` maps onto the
-    /// (jt, jf) byte pair: jt = off & 0xFF, jf = (off >> 8) & 0xFF.
+    /// Zig's `BPF.Insn` is a packed {code u8, dst u4, src u4, off i16,
+    /// imm i32}. Byte 0 is the opcode and byte 1 holds dst/src — which in
+    /// the classic layout is the opcode's HIGH byte — so `dst` MUST stay
+    /// `.r0` (the accumulator) or it corrupts the opcode. `off` maps onto
+    /// the (jt, jf) byte pair: jt = off & 0xFF, jf = (off >> 8) & 0xFF.
     ///
     /// `deny` is accepted for API symmetry with the eventual Profile layer
     /// (PR 2); the deny set is implicit in "anything not in allow → kill" so
