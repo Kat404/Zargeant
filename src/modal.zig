@@ -2546,6 +2546,10 @@ test "CAP-08: ValidateApiRequest posted on tui_to_agent (Agent drains it → pos
     // WU-3 RED→GREEN fixtures). loadWithUnlock against a non-existent
     // XDG path → OpenFailed → mapped to AuthError.OpenFailed reply.
     var state: State = .{ .unlock_prompt = .{} };
+    // The request carries the typed key: an empty draft would post an empty
+    // key and make the key_len assertion below meaningless.
+    @memcpy(state.unlock_prompt.draft[0.."test-api-key".len], "test-api-key");
+    state.unlock_prompt.draft_len = "test-api-key".len;
     var ch: channels_mod.Channels = channels_mod.Channels.init();
     defer ch.closeAll(testing.io);
 
