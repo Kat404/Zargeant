@@ -138,15 +138,27 @@ echo "════════════════════════�
 FAILED=0
 PASSED=0
 
+# Per-step wall-clock ceiling. Without it a single hung step (a test that
+# blocks on a pipe, a build that waits on a lock) stalls the whole CI
+# silently — the container keeps running and nothing reports progress.
+# Generous enough for the 3-mode builds, short enough to fail the run
+# instead of hanging forever.
+readonly STEP_TIMEOUT="${STEP_TIMEOUT:-600}"
+
 run_step() {
   local label="$1"; shift
   echo ""
   echo "─── ${label} ───"
-  if "$@"; then
+  if timeout --signal=TERM --kill-after=30 "${STEP_TIMEOUT}" "$@"; then
     echo "✓ ${label} PASSED"
     PASSED=$((PASSED + 1))
   else
-    echo "✗ ${label} FAILED"
+    local rc=$?
+    if [[ "${rc}" -eq 124 || "${rc}" -eq 137 ]]; then
+      echo "✗ ${label} TIMED OUT after ${STEP_TIMEOUT}s"
+    else
+      echo "✗ ${label} FAILED (exit ${rc})"
+    fi
     FAILED=$((FAILED + 1))
   fi
 }
