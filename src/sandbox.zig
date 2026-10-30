@@ -853,8 +853,12 @@ const test_profile = sandbox_profile.Profile{
         .{ .path = "/tmp", .access = .{ .read = true, .write = true } },
         .{ .path = "/usr/bin", .access = .{ .read = true, .execute = true } },
         .{ .path = "/bin", .access = .{ .read = true, .execute = true } },
+        // The loader directory needs EXECUTE (the kernel opens ld.so /
+        // ld-musl with FMODE_EXEC); it differs per distro (/usr/lib on
+        // merged-usr hosts, /lib on Alpine, /lib64 elsewhere).
         .{ .path = "/usr/lib", .access = .{ .read = true, .execute = true } },
-        .{ .path = "/lib", .access = .{ .read = true } },
+        .{ .path = "/lib", .access = .{ .read = true, .execute = true } },
+        .{ .path = "/lib64", .access = .{ .read = true, .execute = true } },
         .{ .path = "/etc/ssl", .access = .{ .read = true } },
     },
     .allowed_syscalls = &[_]u32{},

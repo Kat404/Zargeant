@@ -640,10 +640,16 @@ pub const TOOLS_PROFILE = sandbox_profile.Profile{
         .{ .path = "/tmp", .access = .{ .read = true, .write = true, .execute = false } },
         .{ .path = "/usr", .access = .{ .read = true, .write = false, .execute = false } },
         .{ .path = "/bin", .access = .{ .read = true, .write = false, .execute = true } },
-        // The ELF interpreter (ld.so) is opened by the kernel with
+        // The ELF interpreter (ld.so / ld-musl) is opened by the kernel with
         // FMODE_EXEC, so it needs EXECUTE on its directory: without it
-        // execve fails with EACCES and no tool can start.
+        // execve fails with EACCES and no tool can start. The loader lives
+        // in a different directory per distro — /usr/lib on merged-usr
+        // hosts, /lib on Alpine, /lib64 elsewhere — so all the standard
+        // locations are granted. On a merged-usr host the three rules
+        // resolve to the same inode and are idempotent.
         .{ .path = "/usr/lib", .access = .{ .read = true, .write = false, .execute = true } },
+        .{ .path = "/lib", .access = .{ .read = true, .write = false, .execute = true } },
+        .{ .path = "/lib64", .access = .{ .read = true, .write = false, .execute = true } },
     },
     .allowed_syscalls = &[_]u32{
         0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 21, 33, 35, 39, 56, 57, 59, 61, 78, 96, 102, 104, 107, 108, 110, 158, 186, 202, 217, 218, 231, 257, 269, 273, 292, 302, 318,

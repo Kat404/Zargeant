@@ -226,9 +226,10 @@ else
     PASSED=$((PASSED + 1))
   else
     echo "ⓘ src/*.zig embedded tests FAILED — see /tmp/embedded-test.log"
-    echo "  Note: in a container that denies seccomp(SECCOMP_SET_MODE_FILTER)"
-    echo "  the fail-closed sandbox child exits 123 and ~6 tests fail with"
-    echo "  'expected 0, found 123'. That is the environment, not the code."
+    echo "  Note: a sandboxed child that cannot execve exits 127 (the exec"
+    echo "  failed), and one that cannot install its seccomp filter exits"
+    echo "  123. Both are environment-shaped failures, but neither is"
+    echo "  automatically 'not the code' — read the log before assuming it."
     echo "  See: cat /tmp/embedded-test.log | tail -10"
     FAILED=$((FAILED + 1))
   fi
