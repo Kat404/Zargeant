@@ -28,6 +28,15 @@
 const std = @import("std");
 const testing = std.testing;
 
+/// Monotonic milliseconds — the stress test needs a wall-clock deadline, and
+/// Zig 0.17 has no std.time.milliTimestamp (same pattern as runtime.zig).
+fn monotonicMs() u64 {
+    var ts = std.os.linux.timespec{ .sec = 0, .nsec = 0 };
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    const ms = @as(i64, ts.sec) * std.time.ms_per_s + @divFloor(ts.nsec, std.time.ns_per_ms);
+    return @intCast(@max(ms, 0));
+}
+
 const event = @import("event");
 
 // =============================================================================
@@ -262,14 +271,17 @@ test "issue #53: Parser.kitty_active concurrent load/store from multiple threads
         fn run(ctx: *const ReaderCtx) void {
             var local_seen_true = false;
             var local_seen_false = false;
-            var iters: usize = 0;
-            // Loop until we observe BOTH values. The cap (10000) is
-            // safety only — with the writer alternating every iteration
-            // and the writer guaranteed active until both readers
-            // complete, two consecutive iterations MUST see both
-            // values. The cap is well above any sane OS scheduling
-            // jitter.
-            while (iters < 10000 and (!local_seen_true or !local_seen_false)) : (iters += 1) {
+            // Wait for BOTH values with a WALL-CLOCK deadline, not with an
+            // iteration cap: two readers spinning in a tight loop can starve
+            // the writer on a small runner, and an iteration cap then fires
+            // while the writer never got a single slice. The writer keeps
+            // writing until both readers complete, so waiting for the
+            // condition is the correct protocol; the deadline is only the
+            // safety net for a lost wakeup.
+            const deadline_ms: u64 = 5_000;
+            const start_ms = monotonicMs();
+            while (!local_seen_true or !local_seen_false) {
+                if (monotonicMs() - start_ms >= deadline_ms) break;
                 const v: bool = ctx.p.kitty_active.load(.seq_cst);
                 if (v) {
                     local_seen_true = true;
@@ -278,16 +290,18 @@ test "issue #53: Parser.kitty_active concurrent load/store from multiple threads
                     local_seen_false = true;
                     _ = ctx.seen_false.fetchAdd(1, .seq_cst);
                 }
+                // Yield so the writer gets scheduled: the readers are hot
+                // spinners and the writer is the thread under test.
+                std.Thread.yield() catch {};
             }
-            // If the cap was hit without observing both values, the
-            // atomic API is broken (writer stopped writing before
-            // reader finished). This should never fire with the
-            // completed-count writer protocol above.
+            // If the deadline expired without observing both values, the
+            // atomic API is broken (writer stopped writing before the
+            // reader finished) or the writer never ran at all.
             if (!local_seen_true or !local_seen_false) {
                 std.debug.panic(
                     "atomic stress test failed: reader saw only one value " ++
-                        "after 10000 iterations (true={}, false={})",
-                    .{ local_seen_true, local_seen_false },
+                        "within {d} ms (true={}, false={})",
+                    .{ deadline_ms, local_seen_true, local_seen_false },
                 );
             }
             _ = ctx.completed.fetchAdd(1, .seq_cst);

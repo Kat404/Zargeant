@@ -907,10 +907,14 @@ test "Sandbox.spawnToolSubprocess child /tmp writable" {
 
 // 3.4 Filesystem enforcement — /etc/shadow is NOT in the test profile's
 // allowlist, so `cat` returns EACCES → child exits 1.
+// The command must not redirect to /dev/null: Landlock v1 cannot grant
+// FS_WRITE on a character device, so the redirection itself would fail
+// first and the shell's own exit code (1 in bash, 2 in dash) would be
+// what the test measured.
 test "Sandbox.spawnToolSubprocess child /etc/shadow EACCES" {
     if (!sandbox_linux.canEnforceSandbox()) return;
 
-    const argv = [_][]const u8{ "/bin/sh", "-c", "exec cat /etc/shadow > /dev/null 2>&1" };
+    const argv = [_][]const u8{ "/bin/sh", "-c", "exec cat /etc/shadow" };
     var subs = try sandbox.Sandbox.spawnToolSubprocess(testing.allocator, test_profile, &argv, &[_][*:0]const u8{}, null);
     defer subs.deinit();
 
