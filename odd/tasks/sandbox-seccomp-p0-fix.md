@@ -65,11 +65,11 @@ Activar el filtro es un cambio de comportamiento real: hasta ahora el hijo corr�
 
 | # | Specs | Cambio | Ruta | Riesgo | Commit |
 |---|---|---|---|---|---|
-| T-1 | S1,S3 | Tests RED: el filtro se instala y mata por `SIGSYS` una syscall denegada; el programa carga `arch` | `src/sandbox.zig` | item 2 | pendiente |
-| T-2 | S1,S2,S3 | Fix del builder: usar el programa completo con arch check y la allowlist efectiva (allow − deny) | `src/sandbox.zig` | item 2 | pendiente |
-| T-3 | S1,S2,S4 | GREEN: suite completa del sandbox + umbrella | `src/` | item 2 | pendiente |
+| T-1 | S1,S3 | Tests RED: el filtro se instala y mata por `SIGSYS` una syscall denegada; el programa carga `arch` | `src/sandbox.zig` | item 2 | `39737b5` |
+| T-2 | S1,S2,S3 | Fix del builder: un `RET ALLOW` por entrada (saltos de 8 bits), arch check, allowlist efectiva (allow − deny) | `src/sandbox_linux.zig`, `src/sandbox.zig` | item 2 | `39737b5` |
+| T-3 | S1,S2,S4 | GREEN: suite del sandbox (36/36) + umbrella (224/224) + `EXECUTE` del intérprete ELF en los perfiles | `src/sandbox.zig`, `src/runtime.zig` | item 2 | `39737b5` |
 | T-4 | S1,S2 | Verificador independiente (item 2: seguridad) | — | item 2 | pendiente |
-| T-5 | — | Cierre: doc + Log + commit final | `odd/tasks/` | none | pendiente |
+| T-5 | — | Cierre: doc + Log + commit final | `odd/tasks/` | none | `dd87a49` |
 
 ## Log
 
@@ -90,3 +90,9 @@ Activar el filtro es un cambio de comportamiento real: hasta ahora el hijo corr�
 **L8** (2026-10-29) — **Landlock: `EXECUTE` faltaba en los perfiles.** Con el filtro ya vivo, el hijo llegaba al `execve` y moría con `EACCES`: el intérprete ELF (ld.so) lo abre el kernel con `FMODE_EXEC`, así que necesita `EXECUTE` en su directorio, y el perfil de test solo concedía `READ` en `/bin` y `/usr/bin`. Se añadió `EXECUTE` en el directorio del intérprete (`/usr/lib`) y en los directorios de binarios del perfil de test; `TOOLS_PROFILE` (producción) recibió la regla `/usr/lib` con `EXECUTE`. Sin esto el sandbox no puede arrancar ninguna herramienta — un defecto que el filtro roto ocultaba (el hijo moría antes, en 123).
 
 **L9** (2026-10-29) — **Verificación**: `zig test src/sandbox.zig` → 36/36 verdes (antes 29/34 con 5 fallos). Umbrella `zig build test-embedded` → **224/224 verdes** (antes 213/220 con 7 fallos). Los 6 fallos del sandbox (exit 123) están cerrados. El séptimo (`modal.test.CAP-08`) era un **bug de test preexistente** de la rama post-roadmap: pasaba un draft vacío y assertaba `key_len > 0` → se le pasa una key real; es un arreglo de test fuera del alcance del P0, incluido porque bloqueaba el gate verde.
+
+**L10** (2026-10-29) — **Gate completo en verde** (orden de AGENTS.md §10): `just build` ✓ · `just build-safe` ✓ · `just build-fast` ✓ · `just check` ✓ (fmt + syscalls + TDD + co-author) · `just test` ✓ (9/9 steps) · `just test-embedded` ✓ (**224/224**) · `just verify` ✓ (**21/21 steps, 314/314 tests**). Cero fallos en el repo por primera vez: antes de esta feature el umbrella fallaba con 7 tests (6 del P0 + 1 de `modal.test.CAP-08`).
+
+**L11** (2026-10-29) — **Commits** (rama `feat/sandbox-seccomp-p0`, apilada sobre `feat/zig-0.17-migration @ 6959aa5`): `39737b5` fix(sandbox): build a seccomp filter the kernel actually accepts · `3a3764a` test(modal): CAP-08 must post a real key · `dd87a49` docs(odd): record the seccomp P0 fix. Los tres firmados con `-S` (política del repo).
+
+**L12** (2026-10-29) — **Pendiente de decisión del usuario**: el PR de la migración (#59) sigue en rojo en CI hasta que esta rama aterrice (6 de sus 7 falloseran el P0 y el séptimo el fix de `CAP-08`). Opciones: (a) mergear esta rama en `feat/zig-0.17-migration` para dejar #59 verde de una vez; (b) abrirla como PR apilado (#60) con base en la rama de migración y mergear #60 primero. Push y PR son decisiones del usuario.
