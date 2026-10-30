@@ -66,7 +66,7 @@ test "Key with explicit mods overrides the default" {
 // =============================================================================
 
 test "KeyCode union has char + named keys" {
-    const fields = @typeInfo(event.KeyCode).@"union".fields;
+    const fields = @typeInfo(event.KeyCode).@"union".field_names;
     try testing.expect(fields.len >= 16);
 
     // Spot-check the named tags exist by constructing each.
@@ -92,7 +92,7 @@ test "KeyCode union has char + named keys" {
 // =============================================================================
 
 test "Event union has 8 variants (REQ-TCL-004 + src/tui.zig:541-585)" {
-    try testing.expectEqual(@as(usize, 8), @typeInfo(event.Event).@"union".fields.len);
+    try testing.expectEqual(@as(usize, 8), @typeInfo(event.Event).@"union".field_names.len);
 
     // Each tag must be constructible; void tags compile without a payload,
     // the .key tag requires a Key.
@@ -129,7 +129,7 @@ test "Event.resize carries no payload (C21)" {
 // =============================================================================
 
 test "EventKind enum has press, release, repeat" {
-    const fields = @typeInfo(event.EventKind).@"enum".fields;
+    const fields = @typeInfo(event.EventKind).@"enum".field_names;
     try testing.expectEqual(@as(usize, 3), fields.len);
 
     // Comptime name-presence check. f.name is a comptime string slice;
@@ -137,21 +137,21 @@ test "EventKind enum has press, release, repeat" {
     const saw_press = comptime blk: {
         var found = false;
         for (fields) |f| {
-            if (std.mem.eql(u8, f.name, "press")) found = true;
+            if (std.mem.eql(u8, f, "press")) found = true;
         }
         break :blk found;
     };
     const saw_repeat = comptime blk: {
         var found = false;
         for (fields) |f| {
-            if (std.mem.eql(u8, f.name, "repeat")) found = true;
+            if (std.mem.eql(u8, f, "repeat")) found = true;
         }
         break :blk found;
     };
     const saw_release = comptime blk: {
         var found = false;
         for (fields) |f| {
-            if (std.mem.eql(u8, f.name, "release")) found = true;
+            if (std.mem.eql(u8, f, "release")) found = true;
         }
         break :blk found;
     };
@@ -167,11 +167,11 @@ test "EventKind enum has press, release, repeat" {
 // =============================================================================
 
 test "terminal.event exposes pollReadable function (C23 canary)" {
-    const info: std.builtin.Type = @typeInfo(event);
-    const decls = info.@"struct".decls;
+    const info: std.lang.Type = @typeInfo(event);
+    const decls = info.@"struct".decl_names;
     var found = false;
     for (decls) |d| {
-        if (std.mem.eql(u8, d.name, "pollReadable")) {
+        if (std.mem.eql(u8, d, "pollReadable")) {
             found = true;
         }
     }

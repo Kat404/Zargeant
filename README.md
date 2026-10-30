@@ -1,6 +1,6 @@
 # zargeant
 
-[![Zig](https://img.shields.io/badge/Zig-0.16.0-orange.svg)](https://ziglang.org)
+[![Zig](https://img.shields.io/badge/Zig-0.17.0-orange.svg)](https://ziglang.org)
 [![License](https://img.shields.io/badge/license-Unlicense-blue.svg)](#license)
 [![Status](https://img.shields.io/badge/status-in%20development-yellow.svg)](#status)
 
@@ -68,7 +68,7 @@ In development. All seven planned slices shipped on `main`. Phase 2 Tiger Style 
 
 ## Requirements
 
-- **Zig 0.16.0** — exact toolchain pinned (post-0.16 `std.posix.*` wrappers stripped; we use `std.os.linux.*` raw syscalls).
+- **Zig 0.17.0** — exact toolchain pinned (post-0.16 `std.posix.*` wrappers stripped; we use `std.os.linux.*` raw syscalls).
 - **Linux 5.13+** — Landlock ABI v1 is the floor. Tested on Arch Linux (kernel 6.x).
 - **Zero third-party deps.** Everything links statically from Zig stdlib + in-tree modules. The `mibu@636a36a` TUI dependency was replaced by the in-tree `src/terminal/` module (per ADR 0003, closes ADR 0001 §"Alternatives Considered" #2).
 

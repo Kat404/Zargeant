@@ -31,7 +31,7 @@ const api_client = @import("api_client.zig");
 // Linux-only comptime guard.
 // =============================================================================
 comptime {
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("runtime: linux-only v1");
 }
 
@@ -640,6 +640,21 @@ pub const TOOLS_PROFILE = sandbox_profile.Profile{
         .{ .path = "/tmp", .access = .{ .read = true, .write = true, .execute = false } },
         .{ .path = "/usr", .access = .{ .read = true, .write = false, .execute = false } },
         .{ .path = "/bin", .access = .{ .read = true, .write = false, .execute = true } },
+        // On distros where /bin is not a symlink into /usr, the tool
+        // binaries live in /usr/bin — that is the surface meant to be
+        // executable, so it gets EXECUTE too (on merged-usr hosts /bin
+        // already resolves to /usr/bin and the two rules are idempotent).
+        .{ .path = "/usr/bin", .access = .{ .read = true, .write = false, .execute = true } },
+        // The ELF interpreter (ld.so / ld-musl) is opened by the kernel with
+        // FMODE_EXEC, so it needs EXECUTE — but on the FILE, not on the
+        // whole directory: granting EXECUTE on /usr/lib would also make
+        // every binary under it executable (thousands of them). Landlock v1
+        // accepts a rule on a regular file with FS_EXECUTE only. The loader
+        // path differs per distro; the ones that do not exist are skipped.
+        .{ .path = "/usr/lib/ld-linux-x86-64.so.2", .access = .{ .read = true, .write = false, .execute = true } },
+        .{ .path = "/lib64/ld-linux-x86-64.so.2", .access = .{ .read = true, .write = false, .execute = true } },
+        .{ .path = "/lib/ld-linux-x86_64.so.2", .access = .{ .read = true, .write = false, .execute = true } },
+        .{ .path = "/lib/ld-musl-x86_64.so.1", .access = .{ .read = true, .write = false, .execute = true } },
     },
     .allowed_syscalls = &[_]u32{
         0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 21, 33, 35, 39, 56, 57, 59, 61, 78, 96, 102, 104, 107, 108, 110, 158, 186, 202, 217, 218, 231, 257, 269, 273, 292, 302, 318,
@@ -717,8 +732,8 @@ pub fn agentRunValidate(args: *const ThreadArgs, req: channels_mod.ValidateApiRe
 
     var payload: channels_mod.ValidateApiReplyPayload = .{
         .success = false,
-        .last_four = .{0} ** 4,
-        .err = .{0} ** 128,
+        .last_four = @splat(0),
+        .err = @splat(0),
         .err_len = 0,
     };
 
@@ -1250,9 +1265,9 @@ test "shutdown timeout API surface returns JoinResult enum" {
         const info = @typeInfo(JoinResult).@"enum";
         var saw_clean = false;
         var saw_timeout = false;
-        for (info.fields) |f| {
-            if (std.mem.eql(u8, f.name, "clean")) saw_clean = true;
-            if (std.mem.eql(u8, f.name, "timeout")) saw_timeout = true;
+        for (info.field_names) |f| {
+            if (std.mem.eql(u8, f, "clean")) saw_clean = true;
+            if (std.mem.eql(u8, f, "timeout")) saw_timeout = true;
         }
         if (!saw_clean or !saw_timeout) @compileError("JoinResult missing clean/timeout tags");
     }
@@ -1370,6 +1385,10 @@ test "TOOLS_PROFILE exports sandbox_profile.Profile with non-empty paths" {
 }
 
 test "tools thread spawns /bin/true with empty envp (REQ-TUI-011)" {
+    // The sandbox can only enforce its syscall policy where a seccomp
+    // filter can actually be installed. Skip where the platform denies it,
+    // instead of failing for an environmental reason.
+    if (!sandbox.Sandbox.canEnforceSandbox()) return;
     // REQ-TUI-011 scenario 1 — sandbox.Sandbox.spawnToolSubprocess is
     // called with `envp.len == 0` from the tools thread. We verify by
     // spawning the canonical /bin/true and asserting a clean exit; the
@@ -1571,6 +1590,10 @@ test "agentDispatchTool: posts DispatchToolRequest on tui_to_tools" {
 // =============================================================================
 
 test "tools thread captures stdout via Sandbox.spawnToolSubprocess" {
+    // The sandbox can only enforce its syscall policy where a seccomp
+    // filter can actually be installed. Skip where the platform denies it,
+    // instead of failing for an environmental reason.
+    if (!sandbox.Sandbox.canEnforceSandbox()) return;
     // End-to-end: spawn /bin/echo via the same machinery toolsRealMain uses.
     // Verifies that spawnToolSubprocess + pipe capture + read loop + post
     // to ToolResult produces the expected output bytes (no LLM involved).
@@ -1600,6 +1623,10 @@ test "tools thread captures stdout via Sandbox.spawnToolSubprocess" {
 }
 
 test "tools thread spawns /bin/sleep N and waitpid returns after N ms" {
+    // The sandbox can only enforce its syscall policy where a seccomp
+    // filter can actually be installed. Skip where the platform denies it,
+    // instead of failing for an environmental reason.
+    if (!sandbox.Sandbox.canEnforceSandbox()) return;
     // Validates the timeout WU-4 substrate: blocking waitpid returns
     // within ~1s when child sleeps 1s. Cross-checks the deadline math:
     // deadline = nowMs() + TOOL_TIMEOUT_MS; remaining_ms computation.

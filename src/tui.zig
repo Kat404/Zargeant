@@ -41,7 +41,7 @@ const builtin = @import("builtin");
 // Linux-only comptime guard (matches every other module in the project).
 // =============================================================================
 comptime {
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("tui: linux-only v1 -- see sdd/tui/proposal id=373 constraint #5");
 }
 
@@ -1171,7 +1171,7 @@ pub fn drainSubmitReply(
                             };
                         } else {
                             // Stay in .key_entry; copy err into inline buffer.
-                            var err_buf: [128]u8 = .{0} ** 128;
+                            var err_buf: [128]u8 = @splat(0);
                             const len = copyErrInline(&err_buf, &payload.err, payload.err_len);
                             state.* = .{
                                 .key_entry = .{
@@ -1206,7 +1206,7 @@ pub fn drainSubmitReply(
                             } };
                         } else {
                             // Stay in .unlock_prompt with err populated.
-                            var err_buf: [128]u8 = .{0} ** 128;
+                            var err_buf: [128]u8 = @splat(0);
                             const len = copyErrInline(&err_buf, &payload.err, payload.err_len);
                             state.* = .{
                                 .unlock_prompt = .{
@@ -1383,7 +1383,7 @@ test "Lifecycle struct exposes required fields" {
     // Phase 2 PR2 (T-2.6.2) deletes `prev_snapshot` — submitFrame owns
     // its own double-buffer storage via `lc.grids`, so the external
     // prev-frame dupe is no longer needed. Count drops to 14.
-    const fields = @typeInfo(Lifecycle).@"struct".fields;
+    const fields = @typeInfo(Lifecycle).@"struct".field_names;
     try testing.expectEqual(@as(usize, 14), fields.len);
 }
 

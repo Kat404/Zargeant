@@ -309,6 +309,19 @@ pub fn validateViaApiWithTarget(
         const write_rc = std.os.linux.write(fd, req_buf.items.ptr, req_buf.items.len);
         if (write_rc != req_buf.items.len) return error.WriteFailed;
 
+        // The cancel pipe is checked between reads, so the socket must NOT
+        // block: a read that would wait returns EAGAIN and the loop goes
+        // back to the poll, which re-checks the cancel pipe. With a blocking
+        // read, a cancel that arrives while we wait for the response is lost
+        // and the request hangs until the server answers — the cancel
+        // latency then depends on the server, not on the 100 ms poll budget
+        // REQ-NEW-006 asks for.
+        const getfl_rc = std.os.linux.fcntl(fd, std.os.linux.F.GETFL, 0);
+        if (getfl_rc >= std.math.maxInt(usize) - 4095) return error.ConnectFailed;
+        const nonblock: usize = @as(u32, @bitCast(std.os.linux.O{ .NONBLOCK = true }));
+        const setfl_rc = std.os.linux.fcntl(fd, std.os.linux.F.SETFL, getfl_rc | nonblock);
+        if (setfl_rc >= std.math.maxInt(usize) - 4095) return error.ConnectFailed;
+
         // Read response with cancel-pipe poll. The plain HTTP path keeps
         // the raw poll(2) integration because the TLS branch's cancel-pipe
         // wiring is WU-3 territory (T3.2 wires stdlib Future.cancel(io) via
@@ -324,9 +337,16 @@ pub fn validateViaApiWithTarget(
                     return error.Cancelled;
                 }
             }
-            const raw_n: isize = @bitCast(std.os.linux.read(fd, resp_buf[resp_len..].ptr, resp_buf.len - resp_len));
-            if (raw_n <= 0) return error.ReadFailed;
-            resp_len += @intCast(raw_n);
+            const raw_rc = std.os.linux.read(fd, resp_buf[resp_len..].ptr, resp_buf.len - resp_len);
+            if (raw_rc >= std.math.maxInt(usize) - 4095) {
+                // EAGAIN: the socket is non-blocking and nothing has arrived
+                // yet. Loop back to the poll so the cancel pipe is checked
+                // again instead of waiting on the socket.
+                if (std.os.linux.errno(raw_rc) == .AGAIN) continue;
+                return error.ReadFailed;
+            }
+            if (raw_rc == 0) return error.ReadFailed; // EOF
+            resp_len += @intCast(raw_rc);
             if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |idx| {
                 header_end = idx + 4;
             }
@@ -1089,8 +1109,8 @@ test "deriveKey produces 32-byte output for known password+salt" {
 
 // T-C1.2a — encrypt+decrypt (AES-256-GCM) round-trip.
 test "encrypt+decrypt round-trip" {
-    const key: [32]u8 = [_]u8{0xAA} ** 32;
-    const nonce: [12]u8 = [_]u8{0xBB} ** 12;
+    const key: [32]u8 = @splat(0xAA);
+    const nonce: [12]u8 = @splat(0xBB);
     const plaintext = "the quick brown fox jumps over the lazy dog";
     var ct_buf: [43]u8 = undefined;
     var tag: [16]u8 = undefined;
@@ -1102,9 +1122,9 @@ test "encrypt+decrypt round-trip" {
 
 // T-C1.2b — tampered ciphertext → error.AuthenticationFailed.
 test "tampered ciphertext → error.AuthenticationFailed" {
-    const key: [32]u8 = [_]u8{0xAA} ** 32;
-    const nonce: [12]u8 = [_]u8{0xBB} ** 12;
-    var ct: [16]u8 = [_]u8{0} ** 16;
+    const key: [32]u8 = @splat(0xAA);
+    const nonce: [12]u8 = @splat(0xBB);
+    var ct: [16]u8 = @splat(0);
     var tag: [16]u8 = undefined;
     encrypt(&ct, &tag, "0123456789abcdef", key, nonce);
     ct[0] ^= 0x01; // flip one bit

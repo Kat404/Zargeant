@@ -26,7 +26,7 @@ const logger = @import("logger.zig");
 // Linux-only comptime guard (matches every other module in the project).
 // =============================================================================
 comptime {
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("channels: linux-only v1");
 }
 
@@ -145,7 +145,7 @@ pub const Event = union(enum) {
 /// `kind = .unlock` → `key_or_pass[0..key_len]` is the unlock passphrase.
 /// The Agent thread calls `api_auth.loadWithUnlock` against the XDG
 /// credentials path. `ValidateApiReplyPayload.last_four` is set to
-/// `{0} ** 4` (unused for unlock — kept uniform to keep the reply
+/// `@splat(0)` (unused for unlock — kept uniform to keep the reply
 /// shape invariant).
 ///
 /// ponytail: `key_or_pass` is INLINE — no `[]const u8` slice aliases
@@ -155,7 +155,7 @@ pub const Event = union(enum) {
 /// moment the TUI thread writes it; the Agent thread consumes a copy.
 pub const ValidateApiRequestPayload = struct {
     kind: enum { key_entry, unlock },
-    key_or_pass: [VALIDATE_KEY_BUF_LEN]u8 = .{0} ** VALIDATE_KEY_BUF_LEN,
+    key_or_pass: [VALIDATE_KEY_BUF_LEN]u8 = @splat(0),
     key_len: usize = 0,
 };
 
@@ -178,8 +178,8 @@ pub const ValidateApiRequestPayload = struct {
 /// in the ring buffer (not the worker's stack).
 pub const ValidateApiReplyPayload = struct {
     success: bool,
-    last_four: [4]u8 = .{0} ** 4,
-    err: [128]u8 = .{0} ** 128,
+    last_four: [4]u8 = @splat(0),
+    err: [128]u8 = @splat(0),
     err_len: usize = 0,
 };
 
@@ -444,7 +444,7 @@ test "Event union has 19 variants" {
     // `ValidateApiReply` variant for the async submit reply: 17 → 18.
     // WU-3 (post-roadmap-hygiene-and-offload, FU-1 [HIGH]) added the
     // `ValidateApiRequest` variant for the Agent-thread offload: 18 → 19.
-    const fields = @typeInfo(Event).@"union".fields;
+    const fields = @typeInfo(Event).@"union".field_names;
     try testing.expectEqual(@as(usize, 19), fields.len);
 }
 

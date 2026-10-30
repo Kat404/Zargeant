@@ -91,20 +91,24 @@ const default_allow_syscalls = [_]u32{
 
 /// Default syscall denylist. Implicit-killed by the BPF filter (anything
 /// not in allow is KILL_PROCESS). Stored for audit + logger symmetry.
+///
+/// The numbers are the x86_64 ABI values and each one is pinned to its
+/// syscall name by the test below: a wrong number denies an innocent
+/// syscall while the syscall the policy names stays allowed.
 const default_deny_syscalls = [_]u32{
     101, // ptrace
-    165, // mount
-    175, // init_module
-    246, // kexec_load
-    169, // reboot
     105, // setuid
     106, // setgid
-    125, // capset
+    126, // capset
     135, // personality
-    310, // unshare (limited)
-    357, // bpf
-    336, // perf_event_open
-    374, // userfaultfd
+    165, // mount
+    169, // reboot
+    175, // init_module
+    246, // kexec_load
+    272, // unshare
+    298, // perf_event_open
+    321, // bpf
+    323, // userfaultfd
 };
 
 /// Default network egress endpoints. v1: HTTPS to MiniMax only.
@@ -204,6 +208,45 @@ pub fn buildFromProfile(allocator: std.mem.Allocator, p: Profile) !AppliedSandbo
 // no tautologies, no type-only checks, no ghost loops.
 // =============================================================================
 
+test "Profile.default() deny-list maps to the x86_64 syscall ABI" {
+    // Pins every denied number to the syscall it is supposed to deny. The
+    // list used to carry five wrong ABI values (125=capget, 310=process_vm_
+    // readv, 336=uprobe, 357 and 374 do not exist), so `bpf`, `unshare`,
+    // `perf_event_open` and `userfaultfd` were ALLOWED while innocent
+    // syscalls were denied — the policy lied about what it blocked.
+    const SYS = std.os.linux.SYS;
+    const expected = [_]struct { nr: u32, name: SYS }{
+        .{ .nr = 101, .name = .ptrace },
+        .{ .nr = 105, .name = .setuid },
+        .{ .nr = 106, .name = .setgid },
+        .{ .nr = 126, .name = .capset },
+        .{ .nr = 135, .name = .personality },
+        .{ .nr = 165, .name = .mount },
+        .{ .nr = 169, .name = .reboot },
+        .{ .nr = 175, .name = .init_module },
+        .{ .nr = 246, .name = .kexec_load },
+        .{ .nr = 272, .name = .unshare },
+        .{ .nr = 298, .name = .perf_event_open },
+        .{ .nr = 321, .name = .bpf },
+        .{ .nr = 323, .name = .userfaultfd },
+    };
+    const denied = sandbox_profile.default().denied_syscalls;
+    try testing.expectEqual(expected.len, denied.len);
+    for (expected) |e| {
+        // The number in the table IS the syscall it names.
+        try testing.expectEqual(@as(u32, @intCast(@backingInt(e.name))), e.nr);
+        // And the profile actually denies it.
+        var found = false;
+        for (denied) |d| {
+            if (d == e.nr) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
+}
+
 test "Profile struct has paths, allowed_syscalls, denied_syscalls fields" {
     const p = sandbox_profile.default();
     _ = p.paths;
@@ -251,7 +294,7 @@ test "Profile.default() includes ~/.config/zargeant as writable" {
 
 test "Profile.default() deny-list contains ptrace, mount, bpf" {
     const p = sandbox_profile.default();
-    const required_deny = [_]u32{ 101, 165, 357 }; // ptrace, mount, bpf
+    const required_deny = [_]u32{ 101, 165, 321 }; // ptrace, mount, bpf
     for (required_deny) |syscall_nr| {
         var found = false;
         for (p.denied_syscalls) |denied| {
@@ -281,7 +324,7 @@ test "Profile.default() allow-list contains read, write, openat, close" {
 
 test "buildFromProfile returns AppliedSandbox with landlock ruleset fd" {
     // Skip if kernel doesn't support Landlock (CI on older kernels).
-    sandbox_linux.checkKernelSupport() catch return;
+    if (!sandbox_linux.canEnforceSandbox()) return;
 
     const p = sandbox_profile.default();
     var applied = try sandbox_profile.buildFromProfile(testing.allocator, p);

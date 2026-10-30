@@ -39,30 +39,30 @@ test "terminal in-tree source resolves" {
     // is missing. The runtime body asserts the modules are wired AND
     // the symbols are the exact types we expect (not renamed in some
     // future refactor).
-    try testing.expect(@typeInfo(terminal.term.RawTerm).@"struct".decls.len > 0);
+    try testing.expect(@typeInfo(terminal.term.RawTerm).@"struct".decl_names.len > 0);
     // TermSize is a plain data struct (width/height only, no methods).
     // Assert the struct shape -- catches a hypothetical refactor
     // that turns TermSize into a tuple or opaque.
-    try testing.expect(@typeInfo(terminal.term.TermSize).@"struct".fields.len == 2);
-    try testing.expect(@typeInfo(terminal.kitty.KittyFlags).@"struct".decls.len > 0);
+    try testing.expect(@typeInfo(terminal.term.TermSize).@"struct".field_names.len == 2);
+    try testing.expect(@typeInfo(terminal.kitty.KittyFlags).@"struct".decl_names.len > 0);
 
     // Event is a tagged union (terminal.event.Event = union(enum) {...}).
     // @typeInfo returns .@"union" with a tag_type field (the underlying
     // enum). Assert the enum has at least one field (key, mouse, resize,
     // paste_start, paste_end, invalid, timeout, none).
-    const event_info: std.builtin.Type = @typeInfo(terminal.event.Event);
+    const event_info: std.lang.Type = @typeInfo(terminal.event.Event);
     switch (event_info) {
         .@"union" => |u| {
-            try testing.expect(u.fields.len > 0);
+            try testing.expect(u.field_names.len > 0);
             if (u.tag_type) |Tag| {
-                try testing.expect(@typeInfo(Tag).@"enum".fields.len > 0);
+                try testing.expect(@typeInfo(Tag).@"enum".field_names.len > 0);
             }
         },
         else => return error.ExpectedUnionEvent,
     }
 
     // Key is a struct with a KeyCode union field.
-    try testing.expect(@typeInfo(terminal.event.Key).@"struct".fields.len > 0);
+    try testing.expect(@typeInfo(terminal.event.Key).@"struct".field_names.len > 0);
 }
 
 test "terminal.term exposes the public entry points" {
@@ -73,9 +73,9 @@ test "terminal.term exposes the public entry points" {
     // Per design C31 the dpm enter/exit/sync-update helpers are
     // re-exported on terminal.term so src/tui.zig can use the
     // `terminal.term.{enterAlternateScreen,...}` form byte-for-byte.
-    const term_info: std.builtin.Type = @typeInfo(terminal.term);
+    const term_info: std.lang.Type = @typeInfo(terminal.term);
     try testing.expect(term_info == .@"struct");
-    const decls = term_info.@"struct".decls;
+    const decls = term_info.@"struct".decl_names;
     var saw_enable_raw = false;
     var saw_get_size = false;
     var saw_enter_alt = false;
@@ -83,12 +83,12 @@ test "terminal.term exposes the public entry points" {
     var saw_begin_sync = false;
     var saw_end_sync = false;
     for (decls) |d| {
-        if (std.mem.eql(u8, d.name, "enableRawMode")) saw_enable_raw = true;
-        if (std.mem.eql(u8, d.name, "getSize")) saw_get_size = true;
-        if (std.mem.eql(u8, d.name, "enterAlternateScreen")) saw_enter_alt = true;
-        if (std.mem.eql(u8, d.name, "exitAlternateScreen")) saw_exit_alt = true;
-        if (std.mem.eql(u8, d.name, "beginSynchronizedUpdate")) saw_begin_sync = true;
-        if (std.mem.eql(u8, d.name, "endSynchronizedUpdate")) saw_end_sync = true;
+        if (std.mem.eql(u8, d, "enableRawMode")) saw_enable_raw = true;
+        if (std.mem.eql(u8, d, "getSize")) saw_get_size = true;
+        if (std.mem.eql(u8, d, "enterAlternateScreen")) saw_enter_alt = true;
+        if (std.mem.eql(u8, d, "exitAlternateScreen")) saw_exit_alt = true;
+        if (std.mem.eql(u8, d, "beginSynchronizedUpdate")) saw_begin_sync = true;
+        if (std.mem.eql(u8, d, "endSynchronizedUpdate")) saw_end_sync = true;
     }
     try testing.expect(saw_enable_raw);
     try testing.expect(saw_get_size);
@@ -102,14 +102,14 @@ test "terminal.event exposes nextWithTimeout + pollReadable" {
     // nextWithTimeout replaces libvaxis Loop.nextEvent for PR 3.
     // pollReadable is the C23 lock-in sub-capability for the renamed
     // smoke canary to assert (obs#1511 C23).
-    const events_info: std.builtin.Type = @typeInfo(terminal.event);
+    const events_info: std.lang.Type = @typeInfo(terminal.event);
     try testing.expect(events_info == .@"struct");
-    const decls = events_info.@"struct".decls;
+    const decls = events_info.@"struct".decl_names;
     var saw_next = false;
     var saw_poll = false;
     for (decls) |d| {
-        if (std.mem.eql(u8, d.name, "nextWithTimeout")) saw_next = true;
-        if (std.mem.eql(u8, d.name, "pollReadable")) saw_poll = true;
+        if (std.mem.eql(u8, d, "nextWithTimeout")) saw_next = true;
+        if (std.mem.eql(u8, d, "pollReadable")) saw_poll = true;
     }
     try testing.expect(saw_next);
     try testing.expect(saw_poll);

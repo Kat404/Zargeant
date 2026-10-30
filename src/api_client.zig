@@ -40,7 +40,7 @@
 
 comptime {
     const builtin = @import("builtin");
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("api-client: linux-only v1 -- see proposal id=272 constraint #5");
 }
 
@@ -230,7 +230,7 @@ pub const ChunkEventStream = struct {
                         return p;
                     }
                     return ChunkEvent{ .err = .{
-                        .kind = @as(ErrorKind, @enumFromInt(@intFromEnum(e.kind))),
+                        .kind = @as(ErrorKind, @fromBackingInt(@intCast(@backingInt(e.kind)))),
                         .raw_bytes = e.raw_bytes,
                     } };
                 },
@@ -282,7 +282,7 @@ fn sseEventToChunkEvent(ev: @import("api_sse.zig").Event) ChunkEvent {
         } },
         .done => .{ .done = {} },
         .err => |e| .{ .err = .{
-            .kind = @as(ErrorKind, @enumFromInt(@intFromEnum(e.kind))),
+            .kind = @as(ErrorKind, @fromBackingInt(@intCast(@backingInt(e.kind)))),
             .raw_bytes = e.raw_bytes,
         } },
         .pending => .{ .done = {} }, // never reached
@@ -921,7 +921,7 @@ test "current_url is correct" {
 test "Linux guard emits compileError on non-Linux" {
     comptime {
         const builtin = @import("builtin");
-        if (builtin.os.tag != .linux) {
+        if (builtin.target.os.tag != .linux) {
             @compileError("api-client: linux-only v1 -- see proposal id=272 constraint #5");
         }
     }

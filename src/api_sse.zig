@@ -735,13 +735,13 @@ test "64 KiB single chunk parsed" {
 
     // Build a chunk whose total byte length is ≥ 65536.
     // Prefix + suffix together are 49 bytes; padding fills the rest.
-    const padding = "_" ** 65490;
+    const padding: [65490]u8 = @splat('_');
     const chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"" ++ padding ++ "\"}}]}\n\n";
 
     try testing.expect(chunk.len == 65536);
 
     const ev = try p.feed(chunk);
-    try testing.expectEqualStrings(padding, ev.message.content);
+    try testing.expectEqualStrings(padding[0..], ev.message.content);
 }
 
 // T2.3 — reasoning content surfaces as a separate .reasoning event when

@@ -177,10 +177,13 @@ The project uses [`just`](https://github.com/casey/just) as a thin wrapper over 
 | Build    | `just build`              | `zig build` — debug binary, fastest iteration.                                 |
 | Build    | `just build-safe`         | `zig build -Doptimize=ReleaseSafe` — production parity without LTO.            |
 | Build    | `just build-fast`         | `zig build -Doptimize=ReleaseFast` — fully optimized.                         |
+| Build    | `just dev`                | `zig build -fincremental --watch` — incremental rebuild on save (Zig 0.17+).   |
+| Build    | `just complexity`         | `zig fmt --complexity` — tokens + AST nodes per file (diff-budget metric).    |
+| Build    | `just config`             | `zig build --print-configuration` — build configuration as ZON.               |
 | Build    | `just clean`              | Wipe `.zig-cache` + `zig-out`.                                                 |
 | Run      | `just run -- <args>`      | Run production binary with forwarded args.                                     |
 | Run      | `just run-mock`           | Run with `--mock` (offline, no real HTTP).                                     |
-| Test     | `just test`               | Umbrella: all 7 individual `test-*` targets.                                   |
+| Test     | `just test`               | Umbrella: the 9 individual `test-*` targets.                                   |
 | Test     | `just test-terminal`      | `src/terminal/` + `tests/terminal/` in isolation.                              |
 | Test     | `just test-tui`           | `tests/tui/terminal_smoke.zig` (public-surface compile guard).                 |
 | Test     | `just test-runtime-thread` | `tests/tui/runtime_thread.zig` (PR1+PR1.5 TUI fix coverage).                  |
@@ -188,7 +191,9 @@ The project uses [`just`](https://github.com/casey/just) as a thin wrapper over 
 | Test     | `just test-tools`         | `tools/` in-file tests.                                                        |
 | Test     | `just test-cancel-path`   | `tests/tui/cancel_path.zig` (CAP-09 wiring guard).                             |
 | Test     | `just test-cancel-e2e`    | `tests/cancel_e2e.zig` (env-gated end-to-end cancel pipe).                     |
-| Test     | `just test-embedded`      | `src/*.zig` embedded tests via standalone binary (see §9.2).                   |
+| Test     | `just test-sandbox-order` | `tests/sandbox_order.zig` (S1/WU-1.1 isolation-order guard).                  |
+| Test     | `just test-tui-screen-grid` | `tests/tui/screen_grid.zig` (ScreenGrid value type).                        |
+| Test     | `just test-embedded`      | The umbrella artifact: 220 `src/*.zig` embedded tests (see §9.2).             |
 | Test     | `just test-all`           | `just test` + `just test-embedded`.                                           |
 | QA       | `just verify`             | `zig build verify` (QA 0..6, compile-first in 3 optimization modes).          |
 | QA       | `just fmt-check`          | `zig build check` (QA 0 — fmt + AST check).                                   |
@@ -197,7 +202,7 @@ The project uses [`just`](https://github.com/casey/just) as a thin wrapper over 
 | QA       | `just check-tdd`          | Every `src/*.zig` must have ≥ 1 `test` block.                                 |
 | QA       | `just check-coauthor`     | No `Co-Authored-By: ...AI...` lines in commits ahead of main.                  |
 | QA       | `just check`              | Umbrella: `fmt-check + check-syscalls + check-tdd + check-coauthor`.           |
-| CI       | `just ci`                 | Full local CI via Podman (Alpine + Zig 0.16.0, `--rm`, no garbage).            |
+| CI       | `just ci`                 | Full local CI via Podman (Alpine + Zig 0.17.0, `--rm`, no garbage).            |
 | CI       | `just ci-fast`            | Local CI skipping the heavy build steps (static guards only).                  |
 | CI       | `just ci-rebuild`         | Local CI wiping `~/.cache/zargeant-podman-ci/` first.                          |
 | CI       | `just ci-rebuild-image`   | Local CI rebuilding the Alpine container image from scratch.                   |
@@ -213,17 +218,25 @@ just --help         # just's own CLI help
 just -u <recipe>    # show inline docs for one recipe
 ```
 
-### 9.2 Test recipe conventions — avoid `zig build test`
+### 9.2 Test recipe conventions
 
-The test recipes **deliberately do not** invoke the umbrella `zig build test` target. Zig 0.16.0 has a reproducible hang in `std.zig.Server`'s `--listen=-` IPC protocol on non-CI environments (agent shell without TTY, Podman containers): the child test binary exits cleanly after `cancel_e2e` CAP-09 passes, but the parent `zig` process never receives the completion message and waits indefinitely.
+**The `zig build test` hang is FIXED (Zig 0.17.0 migration, T-10).** It was never a code bug: `Build.addRunArtifact` puts a test artifact in `stdio = .zig_test`, and that mode speaks the `std.zig.Server` protocol over stdio. The handshake never completed for the umbrella artifact, so the parent `zig` process waited forever — the child test binary had already exited cleanly.
 
-Workarounds attempted (all reproduced the hang):
+The fix is one line in `build.zig`:
 
-- Disabling `cancel_e2e` via `ZARGEANT_RUN_TUI_CANCEL_E2E=0` — still hangs.
-- Forcing a TTY allocation (`podman run -t`) — still hangs.
-- Running the cached test binary directly in standalone mode — separate hang location.
+```zig
+run_test.stdio = .inherit;   // exec the test binary directly; no std.zig.Server
+```
 
-**Decision**: each `test-*` recipe invokes a single `zig build test-<name>` target (compiled into one binary that runs independently). The ~197 `src/*.zig` embedded tests not covered by any individual target are deferred to GitHub Actions CI when minutes are available; `just test-embedded` includes a best-effort workaround for local coverage.
+With `.inherit` the test binary runs the tests itself and the build system only checks its exit code. `zig build test` went from hanging 200s+ to completing in ~36s, and `zig build verify` stopped depending on the environment.
+
+**What still holds**:
+
+- Each `test-*` recipe invokes a single `zig build test-<name>` target. That is still the right shape: per-step test counts, fast feedback, and a failure points at one artifact instead of twenty.
+- `just test-embedded` runs the umbrella artifact alone (220 `src/*.zig` embedded tests) through the real `test-embedded` build step. It used to scan `.zig-cache` for the largest test binary, which could select a **stale** artifact and report a false green; that heuristic is gone.
+- The Zig test runner writes its progress lines to **stderr**, so any script that counts tests must use `2>&1`.
+
+**Environmental caveat**: in a container whose own seccomp policy denies `seccomp(SECCOMP_SET_MODE_FILTER)` (errno 14 / EACCES), the fail-closed sandbox child exits with `exit_group(123)` before `execve`, and ~6 umbrella tests fail with `expected 0, found 123`. That is the environment, not the code — the status word is decoded correctly.
 
 ### 9.3 Local CI container (Podman, Alpine)
 
@@ -232,7 +245,7 @@ The `ci*` recipes wrap [`tools/local-ci.sh`](./tools/local-ci.sh), which orchest
 | Property        | Value                                                                  |
 | --------------- | ---------------------------------------------------------------------- |
 | Base image      | `docker.io/library/alpine:3.20` (musl libc, ~8 MB)                    |
-| Runtime stack   | Zig 0.16.0 (glibc-linked) + `git` + `curl` + `bash` + `gcompat`        |
+| Runtime stack   | Zig 0.17.0 (glibc-linked) + `git` + `curl` + `bash` + `gcompat`        |
 | `gcompat`       | Glibc compat layer required because Zig's x86_64-linux tarball is glibc-linked; bridges it onto musl. |
 | Container flags | `--rm` on every invocation → zero leftover containers                  |
 | Cache           | `~/.cache/zargeant-podman-ci/` (persistent `.zig-cache` between runs) |
@@ -242,6 +255,8 @@ The `ci*` recipes wrap [`tools/local-ci.sh`](./tools/local-ci.sh), which orchest
 ### 9.4 When adding new workflows
 
 Prefer a new recipe in [`justfile`](./justfile) over memorizing a long raw command. Keep the recipe name + one-line description as the discoverable surface; if a recipe has non-obvious behavior (timeouts, env vars, workarounds), add a short comment block immediately above it.
+
+Zig 0.17.0 added three capabilities worth reaching for instead of raw commands: `just dev` (incremental compilation + `--watch`, enabled for `x86_64-linux` in 0.17.0), `just complexity` (`zig fmt --complexity` — tokens and AST nodes per file, a sharper diff-budget signal than line count), and `just config` (`zig build --print-configuration` — the serialized build configuration as ZON, for diagnosing the configure phase).
 
 ---
 
@@ -253,7 +268,7 @@ Prefer a new recipe in [`justfile`](./justfile) over memorizing a long raw comma
 2. **Check** — `just check` (QA 0..5 static guards: fmt, syscalls, TDD, co-author)
 3. **test-all** — `just test-all` (umbrella test targets + embedded workaround)
 4. **verify** — `just verify` (3-mode compile + comprehensive QA gamut)
-5. **ci** — `just ci` (independent Podman Alpine + Zig 0.16.0 verification)
+5. **ci** — `just ci` (independent Podman Alpine + Zig 0.17.0 verification)
 
 **Rationale (learned the hard way — see obs#1788 session closure + Phase 2 blocker)**:
 
@@ -269,5 +284,5 @@ Prefer a new recipe in [`justfile`](./justfile) over memorizing a long raw comma
 - ❌ **Skip ci and merge based on local Podman only** — `just ci` is the only independent verification (different container, different cache state, different mount). Local results do not prove the artifact builds in a clean environment.
 - ❌ **Skip verify because ci already passed** — `verify` includes 3-mode compile (Debug + ReleaseSafe + ReleaseFast). Optimization-specific bugs only surface in `ReleaseSafe`/`ReleaseFast`. `ci` skips these (see `tools/local-ci.sh` `--skip-build` flag).
 
-**Embedded tests caveat**: Per §9.2, `just test-embedded` is best-effort due to Zig 0.16 `std.zig.Server` `--listen=-` IPC hang. Embedded test results may be incomplete on local runs; defer to GitHub Actions when CI minutes return.
+**Embedded tests**: the `std.zig.Server` `--listen=-` IPC hang that used to make them best-effort is **fixed** (§9.2) — the umbrella artifact now runs with `stdio = .inherit`, so `just test-embedded` and the `test-embedded` CI step are deterministic. The only remaining caveat is environmental: a container that denies `seccomp(SECCOMP_SET_MODE_FILTER)` makes the fail-closed sandbox child exit 123, and ~6 umbrella tests fail with `expected 0, found 123`.
 

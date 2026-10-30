@@ -63,10 +63,12 @@ const startup_allow_syscalls = [_]u32{
     231, // exit_group
     56, // clone
     57, // fork
+    58, // vfork
     33, // dup2
     32, // dup
     292, // dup3
     61, // wait4
+    34, // pause
     35, // nanosleep
     72, // fcntl
     4, // stat
@@ -96,6 +98,7 @@ const startup_allow_syscalls = [_]u32{
     1, // write
     2, // open
     3, // close
+    7, // poll
     8, // creat
     9, // mmap
     12, // brk
@@ -178,6 +181,7 @@ const startup_allow_syscalls = [_]u32{
     121, // getpgid
     122, // setfsuid
     123, // setfsgid
+    125, // capget
     124, // getsid
     126, // 126 unused
     127, // 127 unused (rt_sigpending)
@@ -504,52 +508,49 @@ const startup_allow_syscalls = [_]u32{
 
 const default_profile = sandbox_profile.default();
 
-const merged_allowlist = blk: {
-    var arr: [startup_allow_syscalls.len + default_profile.allowed_syscalls.len]u32 = undefined;
-    for (startup_allow_syscalls, 0..) |s, i| arr[i] = s;
-    for (default_profile.allowed_syscalls, 0..) |s, i| arr[startup_allow_syscalls.len + i] = s;
+/// The profile's explicit denials win over the allowlist: a filter that
+/// allowed `mount` while the profile declares it denied would make the
+/// profile a lie.
+fn isDeniedSyscall(syscall_nr: u32) bool {
+    @setEvalBranchQuota(100_000);
+    for (default_profile.denied_syscalls) |denied| {
+        if (denied == syscall_nr) return true;
+    }
+    return false;
+}
+
+/// Effective syscall allowlist for the sandbox filter:
+/// (startup_allow_syscalls ∪ profile.allowed_syscalls) − profile.denied_syscalls.
+const effective_allow_count = blk: {
+    @setEvalBranchQuota(100_000);
+    var count: usize = 0;
+    for (startup_allow_syscalls) |s| {
+        if (!isDeniedSyscall(s)) count += 1;
+    }
+    for (default_profile.allowed_syscalls) |s| {
+        if (!isDeniedSyscall(s)) count += 1;
+    }
+    break :blk count;
+};
+
+const effective_allow_syscalls = blk: {
+    @setEvalBranchQuota(100_000);
+    var arr: [effective_allow_count]u32 = undefined;
+    var i: usize = 0;
+    for (startup_allow_syscalls) |s| {
+        if (isDeniedSyscall(s)) continue;
+        arr[i] = s;
+        i += 1;
+    }
+    for (default_profile.allowed_syscalls) |s| {
+        if (isDeniedSyscall(s)) continue;
+        arr[i] = s;
+        i += 1;
+    }
     break :blk arr;
 };
 
-// Inline BPF construction (local to PR 3) — KILL on unknown syscall,
-// ALLOW on known. Syscall numbers are the kernel ABI values from
-// std.os.linux.syscalls.X64.
-fn buildToolBpf(comptime allow: []const u32) [6 + allow.len]std.os.linux.BPF.Insn {
-    @setEvalBranchQuota(100_000);
-    const BPF = std.os.linux.BPF;
-    const SECC = std.os.linux.SECCOMP;
-    const allow_len: usize = allow.len;
-    var prog: [6 + allow_len]BPF.Insn = undefined;
-    // Load seccomp_data.nr into r0. Skip the arch check (PR 3 is x86_64-only;
-    // PR 1's arch check matched AUDIT_ARCH_X86_64 = 0xC000003E but the Zen
-    // kernel here reports a different arch value, falsely KILLing every
-    // syscall. Re-add the arch check when porting to multi-arch.
-    prog[0] = BPF.Insn.ld_abs(.word, .r0, .r0, @as(i32, @intCast(@offsetOf(SECC.data, "nr"))));
-    const last_idx: i64 = @intCast(prog.len - 1);
-    for (allow, 0..) |syscall_nr, i| {
-        const idx: i64 = @intCast(4 + i);
-        const offset_to_allow: i16 = @intCast(last_idx - (idx + 1));
-        prog[4 + i] = BPF.Insn.jeq(.r0, @as(i32, @bitCast(syscall_nr)), offset_to_allow);
-    }
-    // KILL_PROCESS on unknown syscall (default deny).
-    prog[4 + allow_len] = .{
-        .code = BPF.RET | BPF.K,
-        .dst = 0,
-        .src = 0,
-        .off = 0,
-        .imm = @bitCast(@as(u32, SECC.RET.KILL_PROCESS)),
-    };
-    prog[5 + allow_len] = .{
-        .code = BPF.RET | BPF.K,
-        .dst = 0,
-        .src = 0,
-        .off = 0,
-        .imm = @bitCast(@as(u32, SECC.RET.ALLOW)),
-    };
-    return prog;
-}
-
-// DIAGNOSTIC: check if specific syscalls are in merged_allowlist.
+// DIAGNOSTIC: check if specific syscalls are in effective_allow_syscalls.
 comptime {
     @setEvalBranchQuota(100_000);
     const required = [_]u32{
@@ -568,42 +569,24 @@ comptime {
     };
     for (required) |s| {
         var found = false;
-        for (merged_allowlist) |m| {
+        for (effective_allow_syscalls) |m| {
             if (m == s) {
                 found = true;
                 break;
             }
         }
-        if (!found) @compileError("syscall " ++ @as([]const u8, @tagName(@as(std.os.linux.E, @fromBackingInt(@intCast(@as(usize, s)))))) ++ " missing from merged_allowlist");
+        if (!found) @compileError("syscall " ++ @as([]const u8, @tagName(@as(std.os.linux.E, @fromBackingInt(@intCast(@as(usize, s)))))) ++ " missing from effective_allow_syscalls");
     }
 }
 
-// DIAGNOSTIC: tiny allowlist of syscalls /bin/true definitely needs.
-const diagnostic_allow = [_]u32{
-    0, // read
-    1, // write
-    3, // close
-    9, // mmap
-    10, // mprotect
-    11, // munmap
-    12, // brk
-    25, // mremap
-    28, // madvise
-    59, // execve
-    158, // arch_prctl
-    202, // futex
-    218, // set_tid_address
-    228, // clock_gettime
-    231, // exit_group
-    257, // openat
-    273, // set_robust_list
-    302, // prlimit64
-    318, // getrandom
-};
-
+/// The sandbox's syscall filter. Built by the shared cBPF builder: complete
+/// instruction layout (no uninitialized slots — the kernel rejects those
+/// with EINVAL) plus the AUDIT_ARCH_X86_64 check, so an ia32 (`int 0x80`)
+/// call with a different syscall numbering cannot slip through the
+/// allowlist. KILL_PROCESS on anything not in the effective allowlist.
 const tool_bpf_prog = blk: {
     @setEvalBranchQuota(100_000);
-    break :blk buildToolBpf(&diagnostic_allow);
+    break :blk sandbox_linux.Seccomp.buildAllowlist(&effective_allow_syscalls, &[_]u32{});
 };
 
 // =============================================================================
@@ -641,18 +624,19 @@ pub const ToolSubprocess = struct {
     /// Loops on `EINTR`. Returns the raw status word; callers use
     /// `std.os.linux.W.{IFEXITED,IFSIGNALED,EXITSTATUS,TERMSIG}` to decode.
     pub fn wait(self: *ToolSubprocess) !u32 {
-        var status: u32 = 0;
+        var status: i32 = 0;
         while (true) {
             const rc = std.os.linux.waitpid(self.pid, &status, 0);
-            if (rc == std.math.maxInt(usize)) {
-                // EINTR (signal 4) — retry. ponytail: other errors propagate
-                // as error.WaitpidFailed; tests don't depend on the specific
-                // failure mode.
-                const err: std.os.linux.E = @fromBackingInt(@intCast(-@as(isize, @bitCast(rc))));
+            if (rc >= std.math.maxInt(usize) - 4095) {
+                // Error path: a raw syscall return encodes -errno, returned as
+                // usize. The old check compared against maxInt(usize), which
+                // matches errno 1 (EPERM) only — so the EINTR retry below was
+                // dead code and every other errno was misreported as EPERM.
+                const err = std.os.linux.errno(rc);
                 if (err == .INTR) continue;
                 return error.WaitpidFailed;
             }
-            return status;
+            return @bitCast(status);
         }
     }
 };
@@ -672,6 +656,11 @@ pub const Sandbox = struct {
         try sandbox_linux.checkKernelSupport();
     }
 
+    /// Re-export from sandbox_linux: true when this platform can actually
+    /// enforce the sandbox (Landlock + a working seccomp filter install).
+    pub fn canEnforceSandbox() bool {
+        return sandbox_linux.canEnforceSandbox();
+    }
     /// Apply Landlock to the CURRENT process. Seccomp is intentionally
     /// NOT applied here — applying Seccomp would kill the caller (the test
     /// runner). For end-to-end sandbox isolation, use `spawnToolSubprocess`
@@ -850,7 +839,7 @@ pub const Sandbox = struct {
 //   - spawnToolSubprocess logger fd NOT inherited
 //   - sandbox.zig does not write to stdout or stderr (placeholder)
 //
-// All fork-isolated tests gate on `sandbox_linux.checkKernelSupport()`
+// All fork-isolated tests gate on `sandbox_linux.canEnforceSandbox()`
 // so CI on older kernels early-returns PASS without touching the kernel.
 // =============================================================================
 
@@ -866,8 +855,16 @@ const sandbox = @This();
 const test_profile = sandbox_profile.Profile{
     .paths = &[_]sandbox_profile.PathRule{
         .{ .path = "/tmp", .access = .{ .read = true, .write = true } },
-        .{ .path = "/usr/bin", .access = .{ .read = true } },
-        .{ .path = "/bin", .access = .{ .read = true } },
+        .{ .path = "/usr/bin", .access = .{ .read = true, .execute = true } },
+        .{ .path = "/bin", .access = .{ .read = true, .execute = true } },
+        // The loader needs EXECUTE on the FILE (the kernel opens it with
+        // FMODE_EXEC); on the directory it would also make every binary
+        // under it executable. Landlock v1 allows a file rule with
+        // FS_EXECUTE only. Paths that do not exist are skipped.
+        .{ .path = "/usr/lib/ld-linux-x86-64.so.2", .access = .{ .read = true, .execute = true } },
+        .{ .path = "/lib64/ld-linux-x86-64.so.2", .access = .{ .read = true, .execute = true } },
+        .{ .path = "/lib/ld-linux-x86_64.so.2", .access = .{ .read = true, .execute = true } },
+        .{ .path = "/lib/ld-musl-x86_64.so.1", .access = .{ .read = true, .execute = true } },
         .{ .path = "/usr/lib", .access = .{ .read = true } },
         .{ .path = "/lib", .access = .{ .read = true } },
         .{ .path = "/etc/ssl", .access = .{ .read = true } },
@@ -884,7 +881,7 @@ test "Sandbox.checkKernelSupport returns success on 5.13+" {
 
 // 3.2 Round-trip — sandboxed child runs /bin/true and exits cleanly.
 test "Sandbox.spawnToolSubprocess fork /bin/true waitpid returns 0" {
-    sandbox_linux.checkKernelSupport() catch return;
+    if (!sandbox_linux.canEnforceSandbox()) return;
 
     const argv = [_][]const u8{"/bin/true"};
     var subs = try sandbox.Sandbox.spawnToolSubprocess(testing.allocator, test_profile, &argv, &[_][*:0]const u8{}, null);
@@ -897,7 +894,7 @@ test "Sandbox.spawnToolSubprocess fork /bin/true waitpid returns 0" {
 
 // 3.3 Filesystem enforcement — /tmp is writable in the sandboxed child.
 test "Sandbox.spawnToolSubprocess child /tmp writable" {
-    sandbox_linux.checkKernelSupport() catch return;
+    if (!sandbox_linux.canEnforceSandbox()) return;
 
     const argv = [_][]const u8{ "/bin/sh", "-c", "echo sandbox_test > /tmp/zargeant_sandbox_$$.txt; rm /tmp/zargeant_sandbox_$$.txt; exit 0" };
     var subs = try sandbox.Sandbox.spawnToolSubprocess(testing.allocator, test_profile, &argv, &[_][*:0]const u8{}, null);
@@ -910,10 +907,14 @@ test "Sandbox.spawnToolSubprocess child /tmp writable" {
 
 // 3.4 Filesystem enforcement — /etc/shadow is NOT in the test profile's
 // allowlist, so `cat` returns EACCES → child exits 1.
+// The command must not redirect to /dev/null: Landlock v1 cannot grant
+// FS_WRITE on a character device, so the redirection itself would fail
+// first and the shell's own exit code (1 in bash, 2 in dash) would be
+// what the test measured.
 test "Sandbox.spawnToolSubprocess child /etc/shadow EACCES" {
-    sandbox_linux.checkKernelSupport() catch return;
+    if (!sandbox_linux.canEnforceSandbox()) return;
 
-    const argv = [_][]const u8{ "/bin/sh", "-c", "exec cat /etc/shadow > /dev/null 2>&1" };
+    const argv = [_][]const u8{ "/bin/sh", "-c", "exec cat /etc/shadow" };
     var subs = try sandbox.Sandbox.spawnToolSubprocess(testing.allocator, test_profile, &argv, &[_][*:0]const u8{}, null);
     defer subs.deinit();
 
@@ -931,7 +932,7 @@ test "Sandbox.spawnToolSubprocess child /etc/shadow EACCES" {
 // If the test binary doesn't exist (CI without zig build), the test
 // early-returns PASS — coverage gap documented in apply-progress.
 test "Sandbox.spawnToolSubprocess child ptrace blocked" {
-    sandbox_linux.checkKernelSupport() catch return;
+    if (!sandbox_linux.canEnforceSandbox()) return;
 
     const test_bin = "/tmp/zargeant_ptrace_test";
     const argv = [_][]const u8{test_bin};
@@ -967,4 +968,200 @@ test "Sandbox.spawnToolSubprocess parent fd NOT inherited" {
 // test to exist and makes a no-op PASS visible to the verify phase.
 test "sandbox.zig does not write to stdout or stderr" {
     try testing.expect(true);
+}
+
+// ===== T-5 / S5 — waitpid status-word regression gate (Zig 0.17 `*i32` status) =====
+// Locks the invariant that ToolSubprocess.wait() returns the SAME raw status word
+// the kernel wrote. The u32 leg emulates Zig 0.16's waitpid(pid, *u32, flags):
+// the kernel only receives the ADDRESS of a 4-byte word, so both legs see the
+// same bytes. Any divergence is a regression in the @bitCast adaptation.
+
+fn s5ForkExit(code: i32) i32 {
+    const pid = std.os.linux.fork();
+    if (pid == 0) std.os.linux.exit_group(code);
+    return @intCast(pid);
+}
+
+fn s5ForkSigkill() i32 {
+    const pid = std.os.linux.fork();
+    if (pid == 0) {
+        _ = std.os.linux.kill(std.os.linux.getpid(), std.os.linux.SIG.KILL);
+        std.os.linux.exit_group(200);
+    }
+    return @intCast(pid);
+}
+
+/// Raw wait4(2) into a `*u32` — the exact Zig 0.16 shape.
+fn s5WaitpidU32(pid: i32, out: *u32) usize {
+    return std.os.linux.syscall4(.wait4, @as(u32, @bitCast(pid)), @intFromPtr(out), 0, 0);
+}
+
+test "S5: wait() status word is bit-identical to the Zig 0.16 *u32 path (exit 0)" {
+    const pid = s5ForkExit(0);
+    var sub = sandbox.ToolSubprocess{ .pid = pid, .landlock_fd = -1, .stdout_fd = -1 };
+    const got = try sub.wait();
+    const pid2 = s5ForkExit(0);
+    var expected: u32 = 0;
+    _ = s5WaitpidU32(pid2, &expected);
+    try testing.expectEqual(expected, got);
+    try testing.expect(std.os.linux.W.IFEXITED(got));
+    try testing.expectEqual(@as(u8, 0), std.os.linux.W.EXITSTATUS(got));
+}
+
+test "S5: wait() status word is bit-identical to the Zig 0.16 *u32 path (exit 3)" {
+    const pid = s5ForkExit(3);
+    var sub = sandbox.ToolSubprocess{ .pid = pid, .landlock_fd = -1, .stdout_fd = -1 };
+    const got = try sub.wait();
+    const pid2 = s5ForkExit(3);
+    var expected: u32 = 0;
+    _ = s5WaitpidU32(pid2, &expected);
+    try testing.expectEqual(expected, got);
+    try testing.expect(std.os.linux.W.IFEXITED(got));
+    try testing.expectEqual(@as(u8, 3), std.os.linux.W.EXITSTATUS(got));
+}
+
+test "S5: wait() status word is bit-identical to the Zig 0.16 *u32 path (exit 255)" {
+    const pid = s5ForkExit(255);
+    var sub = sandbox.ToolSubprocess{ .pid = pid, .landlock_fd = -1, .stdout_fd = -1 };
+    const got = try sub.wait();
+    const pid2 = s5ForkExit(255);
+    var expected: u32 = 0;
+    _ = s5WaitpidU32(pid2, &expected);
+    try testing.expectEqual(expected, got);
+    try testing.expectEqual(@as(u8, 255), std.os.linux.W.EXITSTATUS(got));
+}
+
+test "S5: wait() status word is bit-identical to the Zig 0.16 *u32 path (killed by signal)" {
+    const pid = s5ForkSigkill();
+    var sub = sandbox.ToolSubprocess{ .pid = pid, .landlock_fd = -1, .stdout_fd = -1 };
+    const got = try sub.wait();
+    const pid2 = s5ForkSigkill();
+    var expected: u32 = 0;
+    _ = s5WaitpidU32(pid2, &expected);
+    try testing.expectEqual(expected, got);
+    try testing.expect(std.os.linux.W.IFSIGNALED(got));
+    try testing.expectEqual(std.os.linux.SIG.KILL, std.os.linux.W.TERMSIG(got));
+}
+
+var s5AlarmCount: std.atomic.Value(u32) = .init(0);
+
+fn s5OnAlarm(sig: std.os.linux.SIG) callconv(.c) void {
+    _ = sig;
+    _ = s5AlarmCount.fetchAdd(1, .seq_cst);
+}
+
+test "S5: wait() retries on EINTR instead of reporting a bogus exit status" {
+    s5AlarmCount.store(0, .seq_cst);
+    var act = std.os.linux.Sigaction{
+        .handler = .{ .handler = &s5OnAlarm },
+        .mask = std.mem.zeroes(std.os.linux.sigset_t),
+        .flags = 0, // no SA_RESTART -> waitpid returns EINTR
+    };
+    _ = std.os.linux.sigaction(std.os.linux.SIG.ALRM, &act, null);
+    const pid = std.os.linux.fork();
+    if (pid == 0) {
+        var ts = std.os.linux.timespec{ .sec = 2, .nsec = 0 };
+        _ = std.os.linux.nanosleep(&ts, null);
+        std.os.linux.exit_group(7);
+    }
+    // ITIMER_REAL = 0; the kernel struct is a timeval -> microseconds.
+    var it = std.os.linux.itimerspec{
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+        .it_value = .{ .sec = 0, .nsec = 300_000 },
+    };
+    _ = std.os.linux.setitimer(0, &it, null);
+    var sub = sandbox.ToolSubprocess{ .pid = @intCast(pid), .landlock_fd = -1, .stdout_fd = -1 };
+    const got = try sub.wait();
+    try testing.expect(s5AlarmCount.load(.seq_cst) >= 1);
+    try testing.expectEqual(@as(u8, 7), std.os.linux.W.EXITSTATUS(got));
+}
+
+test "S5: wait() reports WaitpidFailed (not a bogus status) when the child is already reaped" {
+    // Non-EINTR error path: waitpid on an already-reaped pid returns ECHILD.
+    // The error path must surface error.WaitpidFailed, never a decoded
+    // status word that a caller would read as a successful exit.
+    const pid = s5ForkExit(0);
+    var expected: u32 = 0;
+    _ = s5WaitpidU32(pid, &expected); // reap it here
+    var sub = sandbox.ToolSubprocess{ .pid = pid, .landlock_fd = -1, .stdout_fd = -1 };
+    try testing.expectError(error.WaitpidFailed, sub.wait());
+}
+
+// ===== P0 — el filtro seccomp del sandbox (S1, S3) =====
+// El sandbox anuncia una política de syscalls. Si el programa cBPF que
+// instala está mal, el kernel lo rechaza con EINVAL, el hijo muere con
+// exit_group(123) y NINGUNA syscall se filtra: el comando se ejecuta sin
+// aislamiento de syscalls. Estos tests fijan que el filtro existe de verdad.
+
+test "P0: the sandbox seccomp filter installs and kills a denied syscall with SIGSYS" {
+    // Child: install the exact filter the sandbox installs, then call a
+    // syscall outside the allowlist (ptrace = 101, denied by the profile).
+    //   - filter live   -> the ptrace call kills the child with SIGSYS
+    //   - filter failed -> exit_group(123) below, nothing is filtered
+    //   - no filter     -> ptrace succeeds, child exits 0
+    const pid = std.os.linux.fork();
+    if (pid == 0) {
+        sandbox_linux.Seccomp.loadFilter(&tool_bpf_prog) catch {
+            std.os.linux.exit_group(123);
+        };
+        _ = std.os.linux.ptrace(std.os.linux.PTRACE.TRACEME, 0, 0, 0, 0);
+        std.os.linux.exit_group(0);
+    }
+    var status: i32 = 0;
+    _ = std.os.linux.wait4(@intCast(pid), &status, 0, null);
+    const raw: u32 = @bitCast(status);
+    try testing.expect(std.os.linux.W.IFSIGNALED(raw));
+    try testing.expectEqual(std.os.linux.SIG.SYS, std.os.linux.W.TERMSIG(raw));
+}
+
+test "P0: the seccomp program checks the architecture before matching syscalls" {
+    // The first instruction must load seccomp_data.arch (offset 4). Without
+    // the arch check, an ia32 (int 0x80) call uses a different syscall
+    // numbering and slips through the allowlist (ia32 chown = 12 = x86_64
+    // brk, which is allowed).
+    try testing.expectEqual(
+        @as(i32, @intCast(@offsetOf(std.os.linux.SECCOMP.data, "arch"))),
+        tool_bpf_prog[0].imm,
+    );
+}
+
+test "P0: the effective syscall allowlist excludes the profile's explicit denials" {
+    // The filter is the enforcement point for the profile's syscall
+    // policy: a filter that allowed `mount` while the profile declares it
+    // denied would make the profile a lie. The names are resolved from the
+    // x86_64 ABI so the assertion cannot drift into pinning a wrong number.
+    const SYS = std.os.linux.SYS;
+    const denied_by_policy = [_]SYS{
+        .ptrace,      .setuid,     .setgid,  .capset,          .personality, .mount,       .reboot,
+        .init_module, .kexec_load, .unshare, .perf_event_open, .bpf,         .userfaultfd,
+    };
+    for (denied_by_policy) |name| {
+        const nr: u32 = @intCast(@backingInt(name));
+        for (effective_allow_syscalls) |allowed| {
+            try testing.expect(allowed != nr);
+        }
+    }
+}
+
+test "P0: the effective syscall allowlist keeps the syscalls real tools need" {
+    // The allowlist is "the whole x86_64 surface minus the policy denials",
+    // so an accidental hole is a syscall the sandboxed tool cannot call at
+    // all: ripgrep needs poll(2) and node needs capget(2), and both died
+    // with SIGSYS while those holes were in the list.
+    const required = [_]struct { nr: u32, name: std.os.linux.SYS }{
+        .{ .nr = 7, .name = .poll },
+        .{ .nr = 58, .name = .vfork },
+        .{ .nr = 125, .name = .capget },
+    };
+    for (required) |e| {
+        try testing.expectEqual(@as(u32, @intCast(@backingInt(e.name))), e.nr);
+        var found = false;
+        for (effective_allow_syscalls) |allowed| {
+            if (allowed == e.nr) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
 }

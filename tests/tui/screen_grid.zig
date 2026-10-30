@@ -216,7 +216,7 @@ test "cursorFromIntent resolves CursorIntent to (col, row) or CURSOR_SKIP" {
     // Case 5: CursorIntent has exactly 2 variants and the switch is
     // exhaustive. Adding/removing a variant breaks compile (RED guard).
     {
-        const fields = @typeInfo(CursorIntent).@"enum".fields;
+        const fields = @typeInfo(CursorIntent).@"enum".field_names;
         try testing.expectEqual(@as(usize, 2), fields.len);
         // Exhaustive switch — no `else` prong. If a 3rd variant is
         // added, this block fails to compile.
@@ -260,8 +260,8 @@ test "cursorFromIntent resolves CursorIntent to (col, row) or CURSOR_SKIP" {
 
 test "diffAndEmit identical grids emit zero entries and zero trailing CUP" {
     // Empty buffer: identical prev/current + CURSOR_SKIP → nothing to emit.
-    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
-    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var prev: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
+    var current: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
 
     var buf: [64]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -276,8 +276,8 @@ test "diffAndEmit one changed cell emits CUP+SGR+UTF-8+SGR reset" {
     // 0-indexed (5, 2) → 1-indexed CUP "ESC[3;6H".
     // No style → leading SGR reset "ESC[0m", char "A", trailing SGR reset.
     // Expected: \x1b[3;6H \x1b[0m \x41 \x1b[0m
-    var prev: [24]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 24;
-    var current: [24]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 24;
+    var prev: [24]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
+    var current: [24]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
     // (col=5, row=2) with cols=8 → idx = 2*8 + 5 = 21
     current[21] = .{ .ch = 'A', .style = .{} };
 
@@ -295,8 +295,8 @@ test "diffAndEmit two adjacent changes emit two entries" {
     // Expected: two entries with growing column coordinates.
     //   entry 1: CUP "\x1b[1;3H" + "\x1b[0m" + "X" + "\x1b[0m"
     //   entry 2: CUP "\x1b[1;4H" + "\x1b[0m" + "Y" + "\x1b[0m"
-    var prev: [8]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 8;
-    var current: [8]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 8;
+    var prev: [8]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
+    var current: [8]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
     current[2] = .{ .ch = 'X', .style = .{} };
     current[3] = .{ .ch = 'Y', .style = .{} };
 
@@ -317,8 +317,8 @@ test "diffAndEmit bold style emits bold SGR (\\x1b[1m) and reset (\\x1b[0m)" {
     // leading reset is required for cumulative SGR correctness across
     // cells (issue #54 — without it, a cell setting underline after a
     // previous cell that set bold would render as bold+underline).
-    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
-    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var prev: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
+    var current: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
     current[0] = .{ .ch = 'B', .style = .{ .bold = true } };
 
     var buf: [64]u8 = undefined;
@@ -340,8 +340,8 @@ test "diffAndEmit bold style emits bold SGR (\\x1b[1m) and reset (\\x1b[0m)" {
 
 test "diffAndEmit underline style emits SGR 4" {
     // style.underline=true → leading reset + SGR 4 (\x1b[4m) + char + trailing reset.
-    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
-    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var prev: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
+    var current: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
     current[0] = .{ .ch = 'U', .style = .{ .underline = true } };
 
     var buf: [64]u8 = undefined;
@@ -357,8 +357,8 @@ test "diffAndEmit underline style emits SGR 4" {
 
 test "diffAndEmit reverse style emits SGR 7" {
     // style.reverse=true → leading reset + SGR 7 (\x1b[7m) + char + trailing reset.
-    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
-    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var prev: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
+    var current: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
     current[0] = .{ .ch = 'R', .style = .{ .reverse = true } };
 
     var buf: [64]u8 = undefined;
@@ -376,8 +376,8 @@ test "diffAndEmit combined bold + underline + reverse emits all three SGRs" {
     // style.{bold, underline, reverse} all true → reset + SGR 1 + SGR 4 + SGR 7
     // (sequential, terminal accumulates per ECMA-48 §SGR). Verifies the
     // full Style surface emission order is stable.
-    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
-    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var prev: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
+    var current: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
     current[0] = .{ .ch = 'X', .style = .{ .bold = true, .underline = true, .reverse = true } };
 
     var buf: [64]u8 = undefined;
@@ -394,8 +394,8 @@ test "diffAndEmit combined bold + underline + reverse emits all three SGRs" {
 test "diffAndEmit zero flags emits only the reset (no set SGRs)" {
     // style={} → only leading reset + char + trailing reset (no flag SGRs).
     // This is the most common case for body text cells.
-    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
-    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var prev: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
+    var current: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
     current[0] = .{ .ch = 'z', .style = .{} };
 
     var buf: [64]u8 = undefined;
@@ -414,8 +414,8 @@ test "diffAndEmit trailing CUP at cursor position when cursor_col != CURSOR_SKIP
     // sized 20×10 so the precondition `cursor_col < cols && cursor_row < rows`
     // holds (10 < 20, 4 < 10). One cell change to force the function past
     // the loop body; then emitTrailingCUP appends the trailing CUP.
-    var prev: [200]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 200;
-    var current: [200]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 200;
+    var prev: [200]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
+    var current: [200]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
     current[0] = .{ .ch = 'Z', .style = .{} };
 
     var buf: [128]u8 = undefined;
@@ -430,8 +430,8 @@ test "diffAndEmit trailing CUP at cursor position when cursor_col != CURSOR_SKIP
 
 test "diffAndEmit trailing CUP skipped when cursor_col == CURSOR_SKIP" {
     // Output ends after the last diff entry, no trailing CUP appended.
-    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
-    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var prev: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
+    var current: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
     current[0] = .{ .ch = 'Z', .style = .{} };
 
     var buf: [64]u8 = undefined;
@@ -448,8 +448,8 @@ test "diffAndEmit trailing CUP skipped when cursor_col == CURSOR_SKIP" {
 
 test "diffAndEmit emits 3-byte UTF-8 (€) intact" {
     // U+20AC (€) encodes to 3 bytes: 0xe2 0x82 0xac.
-    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
-    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var prev: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
+    var current: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
     current[0] = .{ .ch = 0x20AC, .style = .{} };
 
     var buf: [64]u8 = undefined;
@@ -469,8 +469,8 @@ test "diffAndEmit emits 3-byte UTF-8 (€) intact" {
 
 test "diffAndEmit emits 4-byte UTF-8 (😀) intact" {
     // U+1F600 (😀) encodes to 4 bytes: 0xf0 0x9f 0x98 0x80.
-    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
-    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var prev: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
+    var current: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
     current[0] = .{ .ch = 0x1F600, .style = .{} };
 
     var buf: [64]u8 = undefined;
@@ -514,8 +514,8 @@ test "diffAndEmit zero allocations under testing.allocator" {
     const fba = std.heap.FixedBufferAllocator.init(&fba_buf);
     const before = fba.end_index;
 
-    var prev: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
-    var current: [4]Cell = .{Cell{ .ch = ' ', .style = .{} }} ** 4;
+    var prev: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
+    var current: [4]Cell = @splat(Cell{ .ch = ' ', .style = .{} });
     current[0] = .{ .ch = 'A', .style = .{} };
     current[2] = .{ .ch = 'X', .style = .{ .bold = true } };
 
@@ -557,7 +557,7 @@ test "renderKeyEntryToGrid mirrors drawKeyEntry into ScreenGrid (T-2.3.1)" {
     //   drawKeyEntry writes '*' at win.cells[15 + i] for i in 0..shown.
     //   renderKeyEntryToGrid writes the same via grid.writeCell(15+i, 0, '*', .{}).
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..4], "abcd");
         const state: ModalState = .{
             .key_entry = .{
@@ -603,7 +603,7 @@ test "renderKeyEntryToGrid mirrors drawKeyEntry into ScreenGrid (T-2.3.1)" {
     //         (per design §3.4 caller contract: "Pure renderer — does NOT
     //         mutate state"). All payload fields stay byte-identical.
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..3], "xyz");
         var state: ModalState = .{
             .key_entry = .{
@@ -674,7 +674,7 @@ test "renderUnlockToGrid writes unlock modal content (T-2.3.2)" {
     //         grid.writeCell(prefix_len+i, 0, '*', .{}).
     {
         const draft_str = "secret-passphrase"; // 17 chars
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..draft_str.len], draft_str);
         const state: ModalState = .{
             .unlock_prompt = .{
@@ -719,7 +719,7 @@ test "renderUnlockToGrid writes unlock modal content (T-2.3.2)" {
     //         (per design §3.4 contract: "Pure renderer — does NOT mutate
     //         state"). All payload fields stay byte-identical.
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..5], "abcde");
         var state: ModalState = .{
             .unlock_prompt = .{
@@ -748,7 +748,7 @@ test "renderUnlockToGrid writes unlock modal content (T-2.3.2)" {
     //         with a marker char; calling with .key_entry leaves it
     //         intact (the fn early-returns before writing anything).
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..3], "xyz");
         const state: ModalState = .{
             .key_entry = .{
@@ -792,7 +792,7 @@ test "renderConsentPromptToGrid writes consent prompt content (T-2.3.2)" {
     //           last_four "WXYZ"  (4 chars)        → cols 43..46  (bold)
     //           ")?"  (2 chars)                    → cols 47..48
     {
-        var last_four: [4]u8 = .{0} ** 4;
+        var last_four: [4]u8 = @splat(0);
         @memcpy(last_four[0..4], "WXYZ");
         const path = "test.json";
         const state: ModalState = .{
@@ -858,7 +858,7 @@ test "renderConsentPromptToGrid writes consent prompt content (T-2.3.2)" {
 
     // Case 3: renderConsentPromptToGrid does NOT mutate state.
     {
-        var last_four: [4]u8 = .{0} ** 4;
+        var last_four: [4]u8 = @splat(0);
         @memcpy(last_four[0..4], "ABCD");
         const state: ModalState = .{
             .consent_prompt = .{
@@ -883,7 +883,7 @@ test "renderConsentPromptToGrid writes consent prompt content (T-2.3.2)" {
     //         WRONG variant. Mark grid with 'X'; calling with .key_entry
     //         leaves every cell intact.
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..3], "xyz");
         const state: ModalState = .{
             .key_entry = .{
@@ -926,7 +926,7 @@ test "renderErrorModalToGrid writes error modal content (T-2.3.2)" {
     //           "API rejected key" (16 chars)    → cols 14..29
     {
         const msg = "API rejected key";
-        var msg_buf: [128]u8 = .{0} ** 128;
+        var msg_buf: [128]u8 = @splat(0);
         const msg_len = copyInline(&msg_buf, msg);
         const state: ModalState = .{
             .error_modal = .{
@@ -971,7 +971,7 @@ test "renderErrorModalToGrid writes error modal content (T-2.3.2)" {
     //         blocked".len + " — set ZARGEANT_RUN_TLS_HANDSHAKE=1".len.
     {
         const msg = "TLS handshake blocked";
-        var msg_buf: [128]u8 = .{0} ** 128;
+        var msg_buf: [128]u8 = @splat(0);
         const msg_len = copyInline(&msg_buf, msg);
         const state: ModalState = .{
             .error_modal = .{
@@ -1005,7 +1005,7 @@ test "renderErrorModalToGrid writes error modal content (T-2.3.2)" {
 
     // Case 3: renderErrorModalToGrid does NOT mutate state.
     {
-        var msg_buf: [128]u8 = .{0} ** 128;
+        var msg_buf: [128]u8 = @splat(0);
         const msg_len = copyInline(&msg_buf, "boom");
         const state: ModalState = .{
             .error_modal = .{
@@ -1032,7 +1032,7 @@ test "renderErrorModalToGrid writes error modal content (T-2.3.2)" {
     //         WRONG variant. Mark grid with 'X'; calling with .key_entry
     //         leaves every cell intact.
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..3], "xyz");
         const state: ModalState = .{
             .key_entry = .{
@@ -1170,7 +1170,7 @@ test "renderAgentLoopToGrid writes agent loop content (T-2.3.2)" {
     //         WRONG variant. Mark grid with 'X'; calling with .key_entry
     //         leaves every cell intact.
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..3], "xyz");
         const state: ModalState = .{
             .key_entry = .{
@@ -1221,7 +1221,7 @@ test "renderToGrid dispatches by State variant (T-2.3.3)" {
     //         State.key_entry + draft "abcd" → 4 '*' cells at cols 15..18
     //         on row 0 (the mask region immediately after the prompt).
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..4], "abcd");
         const state: ModalState = .{
             .key_entry = .{
@@ -1246,7 +1246,7 @@ test "renderToGrid dispatches by State variant (T-2.3.3)" {
     //         representative cell to pin the layout.
     {
         const draft_str = "secret-passphrase"; // 17 chars
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..draft_str.len], draft_str);
         const state: ModalState = .{
             .unlock_prompt = .{
@@ -1269,7 +1269,7 @@ test "renderToGrid dispatches by State variant (T-2.3.3)" {
     //          "test.json" + last_four "WXYZ" → 'S' at col 0 (start of
     //          "Store key at ") and '?' at col 48 (end of banner).
     {
-        var last_four: [4]u8 = .{0} ** 4;
+        var last_four: [4]u8 = @splat(0);
         @memcpy(last_four[0..4], "WXYZ");
         const path = "test.json";
         const state: ModalState = .{
@@ -1297,7 +1297,7 @@ test "renderToGrid dispatches by State variant (T-2.3.3)" {
     //          29 (last char of "API rejected key").
     {
         const msg = "API rejected key";
-        var msg_buf: [128]u8 = .{0} ** 128;
+        var msg_buf: [128]u8 = @splat(0);
         const msg_len = copyInline(&msg_buf, msg);
         const state: ModalState = .{
             .error_modal = .{
@@ -1376,7 +1376,7 @@ test "renderToGrid dispatches by State variant (T-2.3.3)" {
     //         mutation" (design §3.4). All payload fields stay
     //         byte-identical after a .key_entry render.
     {
-        var draft_buf: [256]u8 = .{0} ** 256;
+        var draft_buf: [256]u8 = @splat(0);
         @memcpy(draft_buf[0..3], "xyz");
         const state: ModalState = .{
             .key_entry = .{

@@ -31,7 +31,7 @@ set -euo pipefail
 readonly PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly BASE_IMAGE="docker.io/library/alpine:3.20"
 readonly CI_IMAGE="localhost/zargeant-ci:latest"
-readonly ZIG_VERSION="0.16.0"
+readonly ZIG_VERSION="0.17.0"
 readonly CACHE_DIR="${HOME}/.cache/zargeant-podman-ci"
 readonly ZIG_CACHE_DIR="${CACHE_DIR}/zig-cache"
 readonly GLOBAL_ZIG_CACHE_DIR="${CACHE_DIR}/zig-global-cache"
@@ -138,15 +138,27 @@ echo "════════════════════════�
 FAILED=0
 PASSED=0
 
+# Per-step wall-clock ceiling. Without it a single hung step (a test that
+# blocks on a pipe, a build that waits on a lock) stalls the whole CI
+# silently — the container keeps running and nothing reports progress.
+# Generous enough for the 3-mode builds, short enough to fail the run
+# instead of hanging forever.
+readonly STEP_TIMEOUT="${STEP_TIMEOUT:-600}"
+
 run_step() {
   local label="$1"; shift
   echo ""
   echo "─── ${label} ───"
-  if "$@"; then
+  if timeout --signal=TERM --kill-after=30 "${STEP_TIMEOUT}" "$@"; then
     echo "✓ ${label} PASSED"
     PASSED=$((PASSED + 1))
   else
-    echo "✗ ${label} FAILED"
+    local rc=$?
+    if [[ "${rc}" -eq 124 || "${rc}" -eq 137 ]]; then
+      echo "✗ ${label} TIMED OUT after ${STEP_TIMEOUT}s"
+    else
+      echo "✗ ${label} FAILED (exit ${rc})"
+    fi
     FAILED=$((FAILED + 1))
   fi
 }
@@ -200,42 +212,38 @@ run_step "test-sandbox-order (2 tests, S1/WU-1.1 isolation order guard)" \
 run_step "test-cancel-e2e (2 tests, end-to-end cancel pipe)" \
   podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c 'zig build test-cancel-e2e --summary all'
 
-# Step 4: src/*.zig embedded tests via the cached binary (standalone,
-#         bypasses the `zig build test` listen-protocol hang).
+# Step 4: src/*.zig embedded tests (224) via the `test-embedded` build step.
 #
-# KNOWN LIMITATION: Zig 0.16.0 `zig build test --listen=-` protocol hangs
-# reproducibly inside this Podman container (and in the agent shell without
-# a TTY) after cancel_e2e CAP-09 passes. This is a Zig test-runner IPC bug,
-# NOT a code regression. Workarounds attempted:
-#   - Disable cancel_e2e via env var: still hangs
-#   - Force TTY allocation (`podman run -t`): still hangs
-#   - Run test binary standalone (no --listen): binary runs fine
-#   - Timeout-compile-only: still hangs after compilation
-# Decision: skip embedded tests locally; CI restores coverage when minutes
-# are back. The TUI-specific tests (test-tui-runtime-thread, test-terminal,
-# test-tui) cover the PR1+PR1.5 changes.
+# The umbrella artifact used to hang here: `zig build test` put the test
+# artifact in stdio = .zig_test, which speaks the std.zig.Server protocol
+# over stdio, and that handshake never completed inside this container.
+# The build now runs the umbrella artifact with stdio = .inherit (exec the
+# binary directly), so this step is a plain build step with no timeout
+# hack. See AGENTS.md section 9.2.
 if [[ "${SKIP_BUILD}" -eq 1 ]]; then
   echo ""
-  echo "─── src/*.zig embedded tests (~197) SKIPPED (--skip-build) ───"
+  echo "─── src/*.zig embedded tests (224) SKIPPED (--skip-build) ───"
 else
-  # Try once with longer timeout — if it works, great. Otherwise, document.
   set +e
   podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c '
-    timeout 180 zig build test --summary all 2>&1
+    zig build test-embedded --summary all 2>&1
   ' > /tmp/embedded-test.log 2>&1
   EXIT_CODE=$?
   set -e
   echo ""
-  echo "─── src/*.zig embedded tests (~197, via zig build test) ───"
+  echo "─── src/*.zig embedded tests (226, via zig build test-embedded) ───"
   if [[ ${EXIT_CODE} -eq 0 ]]; then
     grep -E "Build Summary|tests passed" /tmp/embedded-test.log | head -3
     echo "✓ src/*.zig embedded tests PASSED"
     PASSED=$((PASSED + 1))
   else
-    echo "ⓘ src/*.zig embedded tests SKIPPED (Zig 0.16.0 --listen IPC bug)."
-    echo "  Workaround: covered by CI when GitHub Actions minutes return."
-    echo "  TUI-specific tests above cover the PR1+PR1.5 changes."
+    echo "ⓘ src/*.zig embedded tests FAILED — see /tmp/embedded-test.log"
+    echo "  Note: a sandboxed child that cannot execve exits 127 (the exec"
+    echo "  failed), and one that cannot install its seccomp filter exits"
+    echo "  123. Both are environment-shaped failures, but neither is"
+    echo "  automatically 'not the code' — read the log before assuming it."
     echo "  See: cat /tmp/embedded-test.log | tail -10"
+    FAILED=$((FAILED + 1))
   fi
 fi
 

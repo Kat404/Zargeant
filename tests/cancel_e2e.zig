@@ -24,7 +24,7 @@ const builtin = @import("builtin");
 // Linux-only — matches every other module in the project.
 // =============================================================================
 comptime {
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("cancel_e2e: linux-only v1");
 }
 
@@ -40,6 +40,16 @@ const mock_server = @import("mock_server");
 /// (`zig build test`); runs in full `zig build verify`. The test owns
 /// the only E2E flag in the project — keep the name stable across cycles.
 const RUN_E2E_ENV = "ZARGEANT_RUN_TUI_CANCEL_E2E";
+
+/// Monotonic milliseconds — the timing assertions need a wall-clock
+/// deadline; Zig 0.17 has no std.time.milliTimestamp (same pattern as
+/// runtime.zig and tests/terminal/kitty_active.zig).
+fn monotonicMs() u64 {
+    var ts = std.os.linux.timespec{ .sec = 0, .nsec = 0 };
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    const ms = @as(i64, ts.sec) * std.time.ms_per_s + @divFloor(ts.nsec, std.time.ns_per_ms);
+    return @intCast(@max(ms, 0));
+}
 
 /// ponytail: zig 0.16 has no libc getenv(3) without `-lc`; copy the
 /// /proc/self/environ trick from api_auth.zig:651 (readEnv). Reused here
@@ -202,16 +212,33 @@ test "key-event intercept: write to cancel_pipe[1] is observable on cancel_pipe[
     //    trying to measure; the writer call is byte-for-byte identical.
     const WriterCtx = struct {
         fd: i32,
+        wrote: *std.atomic.Value(bool),
     };
-    const writer_ctx: WriterCtx = .{ .fd = cancel_pipe[1] };
+    var wrote = std.atomic.Value(bool).init(false);
+    const writer_ctx: WriterCtx = .{ .fd = cancel_pipe[1], .wrote = &wrote };
     const writer = try std.Thread.spawn(.{}, struct {
         fn run(ctx: WriterCtx) void {
             // Mirrors src/tui.zig:554 verbatim.
             _ = std.os.linux.write(ctx.fd, &.{0x01}, 1);
+            ctx.wrote.store(true, .seq_cst);
         }
     }.run, .{writer_ctx});
 
-    // 3. Poll cancel_pipe[0] with a 1ms timeout. Assert readability
+    // 3. Wait for the writer to have ISSUED the write before measuring.
+    //    The thread's start delay is not part of the CAP-09 invariant (the
+    //    pipe roundtrip is), and on a loaded runner the 1 ms poll timeout
+    //    could expire before the writer thread was scheduled at all — the
+    //    test then measured the scheduler, not the pipe.
+    const wait_deadline_ms: u64 = 5_000;
+    const wait_start_ms = monotonicMs();
+    while (!wrote.load(.seq_cst)) {
+        if (monotonicMs() - wait_start_ms >= wait_deadline_ms) {
+            return error.WriterThreadNeverRan;
+        }
+        std.Thread.yield() catch {};
+    }
+
+    // 4. Poll cancel_pipe[0] with a 1ms timeout. Assert readability
     //    arrives within ≤1ms (POSIX poll timeout is in milliseconds).
     var pfds: [1]std.os.linux.pollfd = .{.{
         .fd = cancel_pipe[0],
@@ -227,12 +254,12 @@ test "key-event intercept: write to cancel_pipe[1] is observable on cancel_pipe[
 
     writer.join();
 
-    // 4. Drain the byte (so we don't leak fd buffer pressure on the
+    // 5. Drain the byte (so we don't leak fd buffer pressure on the
     //    next test in the same process if any).
     var read_buf: [1]u8 = undefined;
     _ = std.os.linux.read(cancel_pipe[0], &read_buf, 1);
 
-    // 5. Assertions:
+    // 6. Assertions:
     //    a. poll returned 1 fd (readable)
     //    b. revents has POLL.IN set
     //    c. wall-clock elapsed < 10ms (kernel roundtrip is microseconds;
@@ -318,7 +345,7 @@ test "key-event intercept (unlock): pre-call poll observes byte on cancel_pipe[0
     var read_buf: [1]u8 = undefined;
     _ = std.os.linux.read(cancel_pipe[0], &read_buf, 1);
 
-    // 5. Assertions:
+    // 6. Assertions:
     //    a. poll returned 1 fd (readable)
     //    b. revents has POLL.IN set
     //    c. wall-clock elapsed < 100ms (T-R5.3 pre-call poll target)

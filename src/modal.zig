@@ -36,7 +36,7 @@ const ScreenGrid = screen_grid_mod.ScreenGrid;
 // Linux-only comptime guard (matches every other module in the project).
 // =============================================================================
 comptime {
-    if (builtin.os.tag != .linux)
+    if (builtin.target.os.tag != .linux)
         @compileError("modal: linux-only v1");
 }
 
@@ -422,9 +422,9 @@ pub const ErrorKind = enum {
 /// flips `validating = false`. No `std.Thread.spawn` outside runtime.zig
 /// (the runtime's 3-thread orchestrator owns all long-lived threading).
 pub const KeyEntryState = struct {
-    draft: [256]u8 = .{0} ** 256,
+    draft: [256]u8 = @splat(0),
     draft_len: usize = 0,
-    err_msg_buf: [128]u8 = .{0} ** 128,
+    err_msg_buf: [128]u8 = @splat(0),
     err_msg_len: usize = 0,
     validating: bool = false,
     // WU 0.6 (tui-ship-fast-phase0, Bug 4): explicit cursor position for
@@ -447,9 +447,9 @@ pub const KeyEntryState = struct {
 /// posts `Event.ValidateApiRequest` on `channels.tui_to_agent` (the unlock
 /// branch in `agentRunValidate` calls `api_auth.loadWithUnlock`).
 pub const UnlockState = struct {
-    draft: [256]u8 = .{0} ** 256,
+    draft: [256]u8 = @splat(0),
     draft_len: usize = 0,
-    err_msg_buf: [128]u8 = .{0} ** 128,
+    err_msg_buf: [128]u8 = @splat(0),
     err_msg_len: usize = 0,
     attempts: u8 = 0,
     validating: bool = false,
@@ -463,7 +463,7 @@ pub const UNLOCK_MAX_ATTEMPTS: u8 = 3;
 /// (deny) — the user must explicitly opt in.
 pub const ConsentState = struct {
     consent: bool = false,
-    last_four: [4]u8 = .{0} ** 4,
+    last_four: [4]u8 = @splat(0),
     path: []const u8 = "",
 };
 
@@ -486,7 +486,7 @@ pub const AgentLoopState = struct {
 /// copies the caller-provided msg into message_buf.
 pub const ErrorModalState = struct {
     kind: ErrorKind = .internal,
-    message_buf: [128]u8 = .{0} ** 128,
+    message_buf: [128]u8 = @splat(0),
     message_len: usize = 0,
     prior: PriorKind = .welcome,
 };
@@ -874,7 +874,7 @@ pub fn submitKeyEntryAsync(
 
     // Format pre-flight (REQ-TUI-006 scenario 1) — synchronous.
     if (!api_auth.validateFormat(draft)) {
-        var buf: [128]u8 = .{0} ** 128;
+        var buf: [128]u8 = @splat(0);
         const lit = "Invalid key format";
         const len = copyInline(&buf, lit);
         state.* = .{
@@ -897,7 +897,7 @@ pub fn submitKeyEntryAsync(
     var req: channels_mod.Event = .{
         .ValidateApiRequest = .{
             .kind = .key_entry,
-            .key_or_pass = .{0} ** channels_mod.VALIDATE_KEY_BUF_LEN,
+            .key_or_pass = @splat(0),
             .key_len = draft.len,
         },
     };
@@ -914,7 +914,7 @@ pub fn submitKeyEntryAsync(
         .key_entry = .{
             .draft = payload.draft,
             .draft_len = payload.draft_len,
-            .err_msg_buf = .{0} ** 128,
+            .err_msg_buf = @splat(0),
             .err_msg_len = 0,
             .validating = true,
         },
@@ -1126,7 +1126,7 @@ pub fn submitUnlockAsync(
         // WU-1 (Fix A): inline buffer (was `err_msg = "No storage path"`
         // — string literal aliasing .rodata, technically safe but uniform
         // shape is the contract).
-        var nopath_buf: [128]u8 = .{0} ** 128;
+        var nopath_buf: [128]u8 = @splat(0);
         const nopath_len = copyInline(&nopath_buf, "No storage path");
         state.* = .{
             .unlock_prompt = .{
@@ -1139,7 +1139,7 @@ pub fn submitUnlockAsync(
             },
         };
         if (next_attempts >= UNLOCK_MAX_ATTEMPTS) {
-            var too_buf: [128]u8 = .{0} ** 128;
+            var too_buf: [128]u8 = @splat(0);
             const too_len = copyInline(&too_buf, "Too many failed unlock attempts");
             state.* = .{ .error_modal = .{
                 .kind = .auth,
@@ -1154,7 +1154,7 @@ pub fn submitUnlockAsync(
     // Cap pre-check: if we're already at the cap, escalate to error_modal
     // BEFORE posting the request (no point loading the file).
     if (next_attempts >= UNLOCK_MAX_ATTEMPTS) {
-        var too_buf: [128]u8 = .{0} ** 128;
+        var too_buf: [128]u8 = @splat(0);
         const too_len = copyInline(&too_buf, "Too many failed unlock attempts");
         state.* = .{ .error_modal = .{
             .kind = .auth,
@@ -1173,7 +1173,7 @@ pub fn submitUnlockAsync(
     var req: channels_mod.Event = .{
         .ValidateApiRequest = .{
             .kind = .unlock,
-            .key_or_pass = .{0} ** channels_mod.VALIDATE_KEY_BUF_LEN,
+            .key_or_pass = @splat(0),
             .key_len = draft.len,
         },
     };
@@ -1185,7 +1185,7 @@ pub fn submitUnlockAsync(
         .unlock_prompt = .{
             .draft = payload.draft,
             .draft_len = payload.draft_len,
-            .err_msg_buf = .{0} ** 128,
+            .err_msg_buf = @splat(0),
             .err_msg_len = 0,
             .attempts = payload.attempts, // attempts bumped on reply consume
             .validating = true,
@@ -1269,7 +1269,7 @@ pub fn renderConsentPromptToGrid(grid: *ScreenGrid, state: *const State) void {
     }
 
     // Fragment 4: last_four (4 bytes, bold). Note: last_four is
-    // initialised to .{0} ** 4 by default — when untouched, those 4
+    // initialised to @splat(0) by default — when untouched, those 4
     // bytes are NUL (0x00), not spaces. Mirrors drawConsentPrompt's
     // `win.print(&payload.last_four, .{ .bold = true })` which writes
     // the bytes verbatim.
@@ -1586,7 +1586,7 @@ pub fn openErrorModal(state: *State, kind: ErrorKind, message: []const u8) void 
         .agent_loop => .agent_loop,
         .error_modal => .welcome, // fallback
     };
-    var msg_buf: [128]u8 = .{0} ** 128;
+    var msg_buf: [128]u8 = @splat(0);
     const msg_len = copyInline(&msg_buf, message);
     state.* = .{ .error_modal = .{
         .kind = kind,
@@ -1850,7 +1850,7 @@ fn io_allocator(io: std.Io) std.mem.Allocator {
 test "State tagged union has 6 variants and exhaustive switch compiles" {
     // RED: enum info shows the variant count; adding a 7th would fail
     // every draw fn that uses an exhaustive switch on State.
-    const fields = @typeInfo(State).@"union".fields;
+    const fields = @typeInfo(State).@"union".field_names;
     try testing.expectEqual(@as(usize, 6), fields.len);
 
     // Exhaustive switch on `@tagName` compiles (no else arm).
@@ -1877,7 +1877,7 @@ test "default ConsentState consent is deny" {
 test "KeyEntry rejects malformed format (redisplay)" {
     // REQ-TUI-006 scenario 1 — invalid format keeps state in key_entry
     // with an error message visible in the WindowMock snapshot.
-    var draft_buf: [256]u8 = .{0} ** 256;
+    var draft_buf: [256]u8 = @splat(0);
     @memcpy(draft_buf[0..2], "xx");
     var state: State = .{
         .key_entry = .{
@@ -1905,7 +1905,7 @@ test "KeyEntry advances to consent_prompt on API success" {
     // network or 401), so this test verifies the success-path transition
     // table directly: from valid draft, derive last_four and confirm the
     // consent_prompt variant carries the right last_four + path.
-    var draft_buf: [256]u8 = .{0} ** 256;
+    var draft_buf: [256]u8 = @splat(0);
     const draft = "test-key-1234567890ABCDEF";
     @memcpy(draft_buf[0..draft.len], draft);
     var state: State = .{
@@ -1917,7 +1917,7 @@ test "KeyEntry advances to consent_prompt on API success" {
     // We can't call submitKeyEntry successfully without network; instead,
     // we simulate the advance by running the same logic the success path
     // would run.
-    var last_four: [4]u8 = .{0} ** 4;
+    var last_four: [4]u8 = @splat(0);
     const start = draft.len - 4;
     @memcpy(last_four[0..], draft[start..]);
     state = .{ .consent_prompt = .{
@@ -1936,11 +1936,11 @@ test "drawKeyEntry renders err_msg_buf from inline buffer (renamed WU-1, REQ-TUI
     // validation failure" after migrating to the inline-buffer shape
     // (Fix A, 2026-09-01 Bug 1). Drawing reads err_msg_buf[0..err_msg_len]
     // — no stack-local slice alias.
-    var draft_buf: [256]u8 = .{0} ** 256;
+    var draft_buf: [256]u8 = @splat(0);
     const draft = "test-key-1234567890ABCDEF";
     @memcpy(draft_buf[0..draft.len], draft);
     const errmsg = "API rejected key: ConnectFailed";
-    var err_buf: [128]u8 = .{0} ** 128;
+    var err_buf: [128]u8 = @splat(0);
     const err_len = copyInline(&err_buf, errmsg);
     var state: State = .{
         .key_entry = .{
@@ -1980,7 +1980,7 @@ test "Unlock passphrase success advances to agent_loop" {
     //
     // The pure transition logic is unit-tested by skipping submitUnlock
     // (which would hit the FS) and verifying the success state-shape.
-    var draft_buf: [256]u8 = .{0} ** 256;
+    var draft_buf: [256]u8 = @splat(0);
     @memcpy(draft_buf[0..17], "secret-passphrase");
     var state: State = .{
         .unlock_prompt = .{
@@ -2012,10 +2012,10 @@ test "Unlock wrong passphrase redisplay (err_msg_buf inline, WU-1)" {
     // REQ-TUI-007 scenario 3 — submitUnlock returns error.DecryptFailed on
     // wrong passphrase; state stays in unlock_prompt with err_msg_buf
     // populated (WU-1 inline-buffer shape).
-    var draft_buf: [256]u8 = .{0} ** 256;
+    var draft_buf: [256]u8 = @splat(0);
     @memcpy(draft_buf[0..8], "bad-pass");
     const errmsg = "Unlock failed: DecryptFailed";
-    var err_buf: [128]u8 = .{0} ** 128;
+    var err_buf: [128]u8 = @splat(0);
     const err_len = copyInline(&err_buf, errmsg);
     var state: State = .{
         .unlock_prompt = .{
@@ -2152,7 +2152,7 @@ test "ErrorModal tls_gated error surfaces env-var hint" {
     // in the cell buffer when kind == .tls_gated. WU-1: seeded via the
     // inline message_buf/message_len pair (no stack-local slice alias).
     const msg = "real handshake not allowed";
-    var msg_buf: [128]u8 = .{0} ** 128;
+    var msg_buf: [128]u8 = @splat(0);
     const msg_len = copyInline(&msg_buf, msg);
     var state: State = .{ .error_modal = .{
         .kind = .tls_gated,
@@ -2185,7 +2185,7 @@ test "ErrorModal dismiss returns to prior state" {
     // .error_modal back to the captured prior state. WU-1: inline
     // message_buf shape.
     const boom = "boom";
-    var boom_buf: [128]u8 = .{0} ** 128;
+    var boom_buf: [128]u8 = @splat(0);
     const boom_len = copyInline(&boom_buf, boom);
     var state: State = .{ .error_modal = .{
         .kind = .internal,
@@ -2469,7 +2469,7 @@ test "CAP-04: submitKeyEntryAsync returns ≤1ms on format-fail (synchronous pat
     // Agent thread → agentRunValidate → ValidateApiReply) is exercised
     // by the unlock tests below. The timing budget applies equally to
     // the post-to-channel path (channel tryPut is O(1)).
-    var draft_buf: [256]u8 = .{0} ** 256;
+    var draft_buf: [256]u8 = @splat(0);
     @memcpy(draft_buf[0..2], "xx"); // too short — validateFormat fails
     var state: State = .{
         .key_entry = .{
@@ -2546,6 +2546,10 @@ test "CAP-08: ValidateApiRequest posted on tui_to_agent (Agent drains it → pos
     // WU-3 RED→GREEN fixtures). loadWithUnlock against a non-existent
     // XDG path → OpenFailed → mapped to AuthError.OpenFailed reply.
     var state: State = .{ .unlock_prompt = .{} };
+    // The request carries the typed key: an empty draft would post an empty
+    // key and make the key_len assertion below meaningless.
+    @memcpy(state.unlock_prompt.draft[0.."test-api-key".len], "test-api-key");
+    state.unlock_prompt.draft_len = "test-api-key".len;
     var ch: channels_mod.Channels = channels_mod.Channels.init();
     defer ch.closeAll(testing.io);
 

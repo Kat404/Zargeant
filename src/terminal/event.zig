@@ -287,7 +287,7 @@ pub const Parser = struct {
         pending: *const std.atomic.Value(bool),
         poll_fn: *const fn (fds: []linux.pollfd, timeout: i32) anyerror!usize,
     ) anyerror!Event {
-        if (builtin.os.tag != .linux) {
+        if (builtin.target.os.tag != .linux) {
             return .timeout;
         }
 
@@ -798,14 +798,14 @@ pub const Parser = struct {
 //
 // ponytail: this is the minimum that satisfies C23 (existence) plus a real
 // poll(2) round-trip on Linux. Other Unix variants defer to TODO if
-// `builtin.os.tag != .linux`. The `_io` parameter is accepted for API
+// `builtin.target.os.tag != .linux`. The `_io` parameter is accepted for API
 // symmetry with `nextWithTimeout` but not consulted here; callers may
 // pass a real or `undefined` `std.Io`.
 // =============================================================================
 
 pub fn pollReadable(io: std.Io, file: std.Io.File) bool {
     _ = io;
-    if (builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .linux) {
         // ponytail: only Linux is in the CI matrix (Arch + ubuntu-latest);
         // return true as a non-lying best-effort on other platforms.
         return true;
@@ -932,13 +932,13 @@ test "Key anonymous-struct coercion omits mods (C30)" {
 }
 
 test "key char payload is u21" {
-    try std.testing.expect(@typeInfo(KeyCode).@"union".fields.len > 0);
+    try std.testing.expect(@typeInfo(KeyCode).@"union".field_names.len > 0);
     const kc: KeyCode = .{ .char = '€' };
     try std.testing.expect(kc.char == 0x20AC);
 }
 
 test "Event union has 8 variants matching src/tui.zig switch arms" {
-    try testing.expectEqual(@as(usize, 8), @typeInfo(Event).@"union".fields.len);
+    try testing.expectEqual(@as(usize, 8), @typeInfo(Event).@"union".field_names.len);
     // Spot-check the bare-match void tags exist with void payloads.
     const ev: Event = .resize;
     _ = ev;
@@ -955,11 +955,11 @@ test "Event.resize is a void tag (C21)" {
 }
 
 test "pollReadable exists on terminal.event namespace (C23)" {
-    const info: std.builtin.Type = @typeInfo(@import("event.zig"));
-    const decls = info.@"struct".decls;
+    const info: std.lang.Type = @typeInfo(@import("event.zig"));
+    const decls = info.@"struct".decl_names;
     var found = false;
     for (decls) |d| {
-        if (std.mem.eql(u8, d.name, "pollReadable")) {
+        if (std.mem.eql(u8, d, "pollReadable")) {
             found = true;
             break;
         }
