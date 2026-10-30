@@ -162,8 +162,11 @@ pub const Landlock = struct {
         return @as(i32, @intCast(rc));
     }
 
-    /// Add a path-beneath rule. `parent_fd` must be a directory opened with
-    /// O_PATH; `allowed_access` is the per-path FS bitmask granted.
+    /// Add a path-beneath rule. `parent_fd` must be opened with O_PATH; for
+    /// a directory the rule covers the whole hierarchy beneath it, and for
+    /// a regular file the rule only carries FS_EXECUTE (the kernel rejects
+    /// any other right on a file rule) — which is exactly what the ELF
+    /// interpreter needs.
     pub fn addPathBeneathRule(ruleset_fd: i32, parent_fd: i32, allowed_access: u64) LandlockError!void {
         const attr = path_beneath_attr{
             .allowed_access = allowed_access,
@@ -202,15 +205,30 @@ pub const Seccomp = struct {
     /// Build a cBPF program that allows the syscalls listed in `allow` and
     /// kills the calling process for everything else. Layout (N = allow.len):
     ///
-    ///   [0]      ld_abs  seccomp_data.arch        # r0 = arch
-    ///   [1]      jeq     X86_64, +1               # skip if wrong arch
+    ///   [0]      ld_abs  seccomp_data.arch        # A = arch
+    ///   [1]      jeq     X86_64, jt=1/jf=0        # match -> [3]; else -> [2]
     ///   [2]      ret     KILL_PROCESS             # wrong arch
-    ///   [3]      ld_abs  seccomp_data.nr          # r0 = syscall number
-    ///   [4..3+N] jeq     allow[i], +skip          # one JEQ per allow
-    ///   [4+N]    ret     KILL_PROCESS             # unmatched nr
-    ///   [5+N]    ret     ALLOW                    # allow terminator
+    ///   [3]      ld_abs  seccomp_data.nr          # A = syscall number
+    ///   [4+2i]   jeq     allow[i], jt=0/jf=1      # match -> [5+2i]; else -> [6+2i]
+    ///   [5+2i]   ret     ALLOW                    # that syscall is allowed
+    ///   [4+2N]   ret     KILL_PROCESS             # nothing matched
     ///
-    /// Total instructions = 6 + allow.len. Kernel MAXINSNS is 4096.
+    /// Total instructions = 5 + 2*N. Kernel MAXINSNS is 4096.
+    ///
+    /// WHY one ALLOW per entry and not one shared terminator: classic BPF
+    /// jump distances are 8-bit (`jt`/`jf` in `struct sock_filter`), so a
+    /// shared terminator more than 255 instructions away is unreachable —
+    /// the kernel truncates the distance, the jump lands inside the table
+    /// and the filter denies the very syscall it was supposed to allow.
+    /// That truncation is why a shared-terminator program silently denies
+    /// everything once the allowlist grows past ~255 entries.
+    ///
+    /// ENCODING: `struct sock_filter` is {code u16, jt u8, jf u8, k u32};
+    /// Zig's `BPF.Insn` is a packed {code u8, dst u4, src u4, off i16,
+    /// imm i32}. Byte 0 is the opcode and byte 1 holds dst/src — which in
+    /// the classic layout is the opcode's HIGH byte — so `dst` MUST stay
+    /// `.r0` (the accumulator) or it corrupts the opcode. `off` maps onto
+    /// the (jt, jf) byte pair: jt = off & 0xFF, jf = (off >> 8) & 0xFF.
     ///
     /// `deny` is accepted for API symmetry with the eventual Profile layer
     /// (PR 2); the deny set is implicit in "anything not in allow → kill" so
@@ -219,70 +237,70 @@ pub const Seccomp = struct {
     /// Comptime-only: the returned array has its length determined at
     /// compile time from the `allow` slice. Callers pass comptime-known
     /// slices (anonymous array literals, `const` slices from comptime data).
-    /// The kernel's MAXINSNS is 4096; with `allow.len` up to ~4089 entries
-    /// the program still loads (6 + N ≤ 4095).
-    pub fn buildAllowlist(comptime allow: []const u32, comptime deny: []const u32) [6 + allow.len]std.os.linux.BPF.Insn {
+    /// The kernel's MAXINSNS is 4096; with `allow.len` up to ~2045 entries
+    /// the program still loads (5 + 2N ≤ 4095).
+    pub fn buildAllowlist(comptime allow: []const u32, comptime deny: []const u32) [5 + 2 * allow.len]std.os.linux.BPF.Insn {
         _ = deny; // see doc comment — deny set is implicit
 
         const BPF = std.os.linux.BPF;
         const SECC = std.os.linux.SECCOMP;
 
         const allow_len: usize = allow.len;
-        var prog: [6 + allow_len]BPF.Insn = undefined;
+        var prog: [5 + 2 * allow_len]BPF.Insn = undefined;
 
-        // insn[0]: load arch field of seccomp_data.
+        // [0] A = seccomp_data.arch.
         prog[0] = BPF.Insn.ld_abs(.word, .r0, .r0, @as(i32, @intCast(@offsetOf(SECC.data, "arch"))));
 
-        // insn[1]: if arch == X86_64, skip the kill (off = 1 → next insn is kill,
-        // skip means fall through to insn[3] which is the nr-load).
+        // [1] x86_64 -> [3]; any other architecture -> [2] (kill).
         // AUDIT_ARCH_X86_64 = __AUDIT_ARCH_64BIT(0x80000000) | __AUDIT_ARCH_LE(0x40000000) | EM_X86_64(62).
         // Hardcoded because std.os.linux.AUDIT.ARCH.X86_64 references a buggy
-        // enum value (.FRV) on this Zig 0.16 stdlib — see zig issue tracker.
+        // enum value (.FRV) on this Zig stdlib — see zig issue tracker.
         const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
-        const arch_x86_64_imm: i32 = @bitCast(AUDIT_ARCH_X86_64);
-        prog[1] = BPF.Insn.jeq(.r0, arch_x86_64_imm, 1);
+        prog[1] = jeqJf(0, AUDIT_ARCH_X86_64, 1, 0); // dst = A
 
-        // insn[2]: default for wrong arch — KILL_PROCESS.
-        prog[2] = .{
-            .code = BPF.RET | BPF.K,
-            .dst = 0,
-            .src = 0,
-            .off = 0,
-            .imm = @bitCast(@as(u32, SECC.RET.KILL_PROCESS)),
-        };
+        // [2] wrong architecture.
+        prog[2] = retInsn(SECC.RET.KILL_PROCESS);
 
-        // insn[3]: load nr field of seccomp_data.
+        // [3] A = seccomp_data.nr.
         prog[3] = BPF.Insn.ld_abs(.word, .r0, .r0, @as(i32, @intCast(@offsetOf(SECC.data, "nr"))));
 
-        // insn[4..3+allow.len]: one JEQ per allowed syscall. The offset is
-        // relative to the NEXT instruction (pc + 1), so jumping to the last
-        // insn index `total_insns - 1` requires offset = (total_insns - 1) - (idx + 1).
-        const last_idx: i64 = @intCast(prog.len - 1);
+        // [4+2i] test the syscall number against allow[i]; a match lands on
+        // the ALLOW right below it, a miss continues with the next entry.
         for (allow, 0..) |syscall_nr, i| {
-            const idx: i64 = @intCast(4 + i);
-            const offset_to_allow: i16 = @intCast(last_idx - (idx + 1));
-            prog[4 + i] = BPF.Insn.jeq(.r0, @as(i32, @bitCast(syscall_nr)), offset_to_allow);
+            prog[4 + 2 * i] = jeqJf(0, syscall_nr, 0, 1); // dst = A
+            prog[5 + 2 * i] = retInsn(SECC.RET.ALLOW);
         }
 
-        // insn[4 + allow.len]: default for unmatched nr — KILL_PROCESS.
-        prog[4 + allow_len] = .{
-            .code = BPF.RET | BPF.K,
-            .dst = 0,
-            .src = 0,
-            .off = 0,
-            .imm = @bitCast(@as(u32, SECC.RET.KILL_PROCESS)),
-        };
-
-        // insn[5 + allow.len]: allow terminator — every JEQ target lands here.
-        prog[5 + allow_len] = .{
-            .code = BPF.RET | BPF.K,
-            .dst = 0,
-            .src = 0,
-            .off = 0,
-            .imm = @bitCast(@as(u32, SECC.RET.ALLOW)),
-        };
+        // [4+2N] nothing matched.
+        prog[4 + 2 * allow_len] = retInsn(SECC.RET.KILL_PROCESS);
 
         return prog;
+    }
+
+    /// Classic BPF `jeq k` with explicit 8-bit jump distances. `BPF.Insn.jeq`
+    /// can only set the jump-true distance (`jt`); the jump-false distance
+    /// (`jf`) needs the second byte of the `off` field.
+    fn jeqJf(dst: u4, k: u32, jt: u8, jf: u8) std.os.linux.BPF.Insn {
+        const BPF = std.os.linux.BPF;
+        return .{
+            .code = BPF.JMP | BPF.JEQ | BPF.K,
+            .dst = dst,
+            .src = 0,
+            .off = @intCast((@as(u16, jf) << 8) | @as(u16, jt)),
+            .imm = @bitCast(k),
+        };
+    }
+
+    /// Classic BPF `ret k` — the action is the immediate.
+    fn retInsn(action: u32) std.os.linux.BPF.Insn {
+        const BPF = std.os.linux.BPF;
+        return .{
+            .code = BPF.RET | BPF.K,
+            .dst = 0,
+            .src = 0,
+            .off = 0,
+            .imm = @bitCast(action),
+        };
     }
 
     /// Load the cBPF program as the calling thread's Seccomp filter.
@@ -418,29 +436,98 @@ test "Seccomp.buildAllowlist returns fewer than 4096 instructions" {
     const prog = sandbox.Seccomp.buildAllowlist(&allow, &deny);
     try testing.expect(prog.len < 4096);
     try testing.expect(prog.len > 0);
+    // Header (arch load, arch test, kill, nr load) + 2 instructions per
+    // allowed syscall + the final kill.
+    try testing.expectEqual(@as(usize, 5 + 2 * allow.len), prog.len);
 }
 
-test "Seccomp.buildAllowlist terminates with RET.ALLOW as last instruction" {
-    const allow = [_]u32{0};
-    const deny = [_]u32{101};
-    const prog = sandbox.Seccomp.buildAllowlist(&allow, &deny);
-    try testing.expect(prog.len > 0);
-    // Final instruction MUST be a RET (BPF opcode 0x06) with imm = SECCOMP.RET.ALLOW
-    // — the allow terminator that every successful JEQ jumps to.
-    const last = prog[prog.len - 1];
-    try testing.expectEqual(@as(u8, 0x06), last.code); // BPF.RET
-    try testing.expectEqual(@as(u32, 0x7fff0000), @as(u32, @bitCast(last.imm))); // SECCOMP.RET.ALLOW
+/// The kernel reads the program as classic BPF (`struct sock_filter`:
+/// {code u16, jt u8, jf u8, k u32}). Zig's `BPF.Insn` has the same size but
+/// a different field order, so this decodes the bytes the way the kernel
+/// does.
+const ClassicInsn = extern struct {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+};
+
+fn decodeClassic(insn: std.os.linux.BPF.Insn) ClassicInsn {
+    var classic: ClassicInsn = undefined;
+    @memcpy(std.mem.asBytes(&classic), std.mem.asBytes(&insn));
+    return classic;
 }
 
-// Triangulation: with ZERO allowed syscalls, the program still has the
-// terminator and the default kill path (empty-allow edge case).
-test "Seccomp.buildAllowlist with empty allow still has RET.ALLOW terminator" {
-    const allow = [_]u32{};
-    const deny = [_]u32{ 101, 165 };
-    const prog = sandbox.Seccomp.buildAllowlist(&allow, &deny);
-    try testing.expectEqual(@as(usize, 6), prog.len);
-    const last = prog[prog.len - 1];
-    try testing.expectEqual(@as(u32, 0x7fff0000), @as(u32, @bitCast(last.imm)));
+test "Seccomp.buildAllowlist has no uninitialized instruction" {
+    // The P0 guard: the kernel rejects a program with garbage instructions
+    // (EINVAL) and, worse, a partially initialised one can silently deny
+    // everything. Every slot must hold one of the three opcodes the
+    // builder emits.
+    const BPF = std.os.linux.BPF;
+    const allow = [_]u32{ 0, 1, 60 };
+    const prog = sandbox.Seccomp.buildAllowlist(&allow, &[_]u32{});
+    for (prog) |insn| {
+        const classic = decodeClassic(insn);
+        const valid = classic.code == BPF.LD | BPF.ABS | BPF.W or
+            classic.code == BPF.JMP | BPF.JEQ | BPF.K or
+            classic.code == BPF.RET | BPF.K;
+        try testing.expect(valid);
+    }
+}
+
+test "Seccomp.buildAllowlist gives every allowed syscall its own ALLOW" {
+    // Classic BPF jump distances are 8-bit, so a shared terminator more
+    // than 255 instructions away is unreachable: the kernel truncates the
+    // distance and the filter denies the syscall it should allow. Each
+    // entry therefore jumps to the ALLOW right below it.
+    const BPF = std.os.linux.BPF;
+    const allow = [_]u32{ 0, 1, 60 };
+    const prog = sandbox.Seccomp.buildAllowlist(&allow, &[_]u32{});
+
+    // [0] arch load, [1] arch test, [2] kill, [3] nr load.
+    const arch_load = decodeClassic(prog[0]);
+    try testing.expectEqual(BPF.LD | BPF.ABS | BPF.W, arch_load.code);
+    try testing.expectEqual(@as(u32, @offsetOf(std.os.linux.SECCOMP.data, "arch")), arch_load.k);
+
+    const arch_test = decodeClassic(prog[1]);
+    try testing.expectEqual(BPF.JMP | BPF.JEQ | BPF.K, arch_test.code);
+    try testing.expectEqual(@as(u8, 1), arch_test.jt); // -> [3]
+    try testing.expectEqual(@as(u8, 0), arch_test.jf); // -> [2]
+    try testing.expectEqual(@as(u32, 0xC000_003E), arch_test.k); // AUDIT_ARCH_X86_64
+
+    const nr_load = decodeClassic(prog[3]);
+    try testing.expectEqual(BPF.LD | BPF.ABS | BPF.W, nr_load.code);
+    try testing.expectEqual(@as(u32, @offsetOf(std.os.linux.SECCOMP.data, "nr")), nr_load.k);
+
+    for (allow, 0..) |syscall_nr, i| {
+        const jeq = decodeClassic(prog[4 + 2 * i]);
+        try testing.expectEqual(BPF.JMP | BPF.JEQ | BPF.K, jeq.code);
+        try testing.expectEqual(syscall_nr, jeq.k);
+        try testing.expectEqual(@as(u8, 0), jeq.jt); // -> [5+2i] the ALLOW
+        try testing.expectEqual(@as(u8, 1), jeq.jf); // -> [6+2i] the next test
+
+        const allow_ret = decodeClassic(prog[5 + 2 * i]);
+        try testing.expectEqual(BPF.RET | BPF.K, allow_ret.code);
+        try testing.expectEqual(@as(u32, sandbox.SECCOMP.RET.ALLOW), allow_ret.k);
+    }
+
+    // The last instruction kills: nothing matched.
+    const last = decodeClassic(prog[prog.len - 1]);
+    try testing.expectEqual(BPF.RET | BPF.K, last.code);
+    try testing.expectEqual(@as(u32, sandbox.SECCOMP.RET.KILL_PROCESS), last.k);
+}
+
+test "Seccomp.buildAllowlist keeps the opcode's high byte intact" {
+    // Byte 1 of the classic instruction is the opcode's high byte; in
+    // Zig's struct that byte carries dst/src, so a non-zero dst would
+    // corrupt the opcode. Every instruction the builder emits must keep
+    // dst = .r0.
+    const allow = [_]u32{ 0, 1, 60 };
+    const prog = sandbox.Seccomp.buildAllowlist(&allow, &[_]u32{});
+    for (prog) |insn| {
+        try testing.expectEqual(@as(u4, 0), insn.dst);
+        try testing.expectEqual(@as(u8, 0), @as(u8, @truncate(decodeClassic(insn).code >> 8)));
+    }
 }
 
 // 1.6 Kernel gate — public check + underlying parser.

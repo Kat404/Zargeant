@@ -138,15 +138,27 @@ echo "════════════════════════�
 FAILED=0
 PASSED=0
 
+# Per-step wall-clock ceiling. Without it a single hung step (a test that
+# blocks on a pipe, a build that waits on a lock) stalls the whole CI
+# silently — the container keeps running and nothing reports progress.
+# Generous enough for the 3-mode builds, short enough to fail the run
+# instead of hanging forever.
+readonly STEP_TIMEOUT="${STEP_TIMEOUT:-600}"
+
 run_step() {
   local label="$1"; shift
   echo ""
   echo "─── ${label} ───"
-  if "$@"; then
+  if timeout --signal=TERM --kill-after=30 "${STEP_TIMEOUT}" "$@"; then
     echo "✓ ${label} PASSED"
     PASSED=$((PASSED + 1))
   else
-    echo "✗ ${label} FAILED"
+    local rc=$?
+    if [[ "${rc}" -eq 124 || "${rc}" -eq 137 ]]; then
+      echo "✗ ${label} TIMED OUT after ${STEP_TIMEOUT}s"
+    else
+      echo "✗ ${label} FAILED (exit ${rc})"
+    fi
     FAILED=$((FAILED + 1))
   fi
 }
@@ -200,7 +212,7 @@ run_step "test-sandbox-order (2 tests, S1/WU-1.1 isolation order guard)" \
 run_step "test-cancel-e2e (2 tests, end-to-end cancel pipe)" \
   podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c 'zig build test-cancel-e2e --summary all'
 
-# Step 4: src/*.zig embedded tests (220) via the `test-embedded` build step.
+# Step 4: src/*.zig embedded tests (224) via the `test-embedded` build step.
 #
 # The umbrella artifact used to hang here: `zig build test` put the test
 # artifact in stdio = .zig_test, which speaks the std.zig.Server protocol
@@ -210,7 +222,7 @@ run_step "test-cancel-e2e (2 tests, end-to-end cancel pipe)" \
 # hack. See AGENTS.md section 9.2.
 if [[ "${SKIP_BUILD}" -eq 1 ]]; then
   echo ""
-  echo "─── src/*.zig embedded tests (220) SKIPPED (--skip-build) ───"
+  echo "─── src/*.zig embedded tests (224) SKIPPED (--skip-build) ───"
 else
   set +e
   podman "${PODMAN_ARGS[@]}" "${CI_IMAGE}" bash -c '
@@ -219,16 +231,17 @@ else
   EXIT_CODE=$?
   set -e
   echo ""
-  echo "─── src/*.zig embedded tests (220, via zig build test-embedded) ───"
+  echo "─── src/*.zig embedded tests (226, via zig build test-embedded) ───"
   if [[ ${EXIT_CODE} -eq 0 ]]; then
     grep -E "Build Summary|tests passed" /tmp/embedded-test.log | head -3
     echo "✓ src/*.zig embedded tests PASSED"
     PASSED=$((PASSED + 1))
   else
     echo "ⓘ src/*.zig embedded tests FAILED — see /tmp/embedded-test.log"
-    echo "  Note: in a container that denies seccomp(SECCOMP_SET_MODE_FILTER)"
-    echo "  the fail-closed sandbox child exits 123 and ~6 tests fail with"
-    echo "  'expected 0, found 123'. That is the environment, not the code."
+    echo "  Note: a sandboxed child that cannot execve exits 127 (the exec"
+    echo "  failed), and one that cannot install its seccomp filter exits"
+    echo "  123. Both are environment-shaped failures, but neither is"
+    echo "  automatically 'not the code' — read the log before assuming it."
     echo "  See: cat /tmp/embedded-test.log | tail -10"
     FAILED=$((FAILED + 1))
   fi

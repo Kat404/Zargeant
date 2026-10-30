@@ -640,6 +640,21 @@ pub const TOOLS_PROFILE = sandbox_profile.Profile{
         .{ .path = "/tmp", .access = .{ .read = true, .write = true, .execute = false } },
         .{ .path = "/usr", .access = .{ .read = true, .write = false, .execute = false } },
         .{ .path = "/bin", .access = .{ .read = true, .write = false, .execute = true } },
+        // On distros where /bin is not a symlink into /usr, the tool
+        // binaries live in /usr/bin — that is the surface meant to be
+        // executable, so it gets EXECUTE too (on merged-usr hosts /bin
+        // already resolves to /usr/bin and the two rules are idempotent).
+        .{ .path = "/usr/bin", .access = .{ .read = true, .write = false, .execute = true } },
+        // The ELF interpreter (ld.so / ld-musl) is opened by the kernel with
+        // FMODE_EXEC, so it needs EXECUTE — but on the FILE, not on the
+        // whole directory: granting EXECUTE on /usr/lib would also make
+        // every binary under it executable (thousands of them). Landlock v1
+        // accepts a rule on a regular file with FS_EXECUTE only. The loader
+        // path differs per distro; the ones that do not exist are skipped.
+        .{ .path = "/usr/lib/ld-linux-x86-64.so.2", .access = .{ .read = true, .write = false, .execute = true } },
+        .{ .path = "/lib64/ld-linux-x86-64.so.2", .access = .{ .read = true, .write = false, .execute = true } },
+        .{ .path = "/lib/ld-linux-x86_64.so.2", .access = .{ .read = true, .write = false, .execute = true } },
+        .{ .path = "/lib/ld-musl-x86_64.so.1", .access = .{ .read = true, .write = false, .execute = true } },
     },
     .allowed_syscalls = &[_]u32{
         0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 21, 33, 35, 39, 56, 57, 59, 61, 78, 96, 102, 104, 107, 108, 110, 158, 186, 202, 217, 218, 231, 257, 269, 273, 292, 302, 318,

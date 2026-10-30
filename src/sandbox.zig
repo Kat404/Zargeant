@@ -63,10 +63,12 @@ const startup_allow_syscalls = [_]u32{
     231, // exit_group
     56, // clone
     57, // fork
+    58, // vfork
     33, // dup2
     32, // dup
     292, // dup3
     61, // wait4
+    34, // pause
     35, // nanosleep
     72, // fcntl
     4, // stat
@@ -96,6 +98,7 @@ const startup_allow_syscalls = [_]u32{
     1, // write
     2, // open
     3, // close
+    7, // poll
     8, // creat
     9, // mmap
     12, // brk
@@ -178,6 +181,7 @@ const startup_allow_syscalls = [_]u32{
     121, // getpgid
     122, // setfsuid
     123, // setfsgid
+    125, // capget
     124, // getsid
     126, // 126 unused
     127, // 127 unused (rt_sigpending)
@@ -504,52 +508,49 @@ const startup_allow_syscalls = [_]u32{
 
 const default_profile = sandbox_profile.default();
 
-const merged_allowlist = blk: {
-    var arr: [startup_allow_syscalls.len + default_profile.allowed_syscalls.len]u32 = undefined;
-    for (startup_allow_syscalls, 0..) |s, i| arr[i] = s;
-    for (default_profile.allowed_syscalls, 0..) |s, i| arr[startup_allow_syscalls.len + i] = s;
+/// The profile's explicit denials win over the allowlist: a filter that
+/// allowed `mount` while the profile declares it denied would make the
+/// profile a lie.
+fn isDeniedSyscall(syscall_nr: u32) bool {
+    @setEvalBranchQuota(100_000);
+    for (default_profile.denied_syscalls) |denied| {
+        if (denied == syscall_nr) return true;
+    }
+    return false;
+}
+
+/// Effective syscall allowlist for the sandbox filter:
+/// (startup_allow_syscalls ∪ profile.allowed_syscalls) − profile.denied_syscalls.
+const effective_allow_count = blk: {
+    @setEvalBranchQuota(100_000);
+    var count: usize = 0;
+    for (startup_allow_syscalls) |s| {
+        if (!isDeniedSyscall(s)) count += 1;
+    }
+    for (default_profile.allowed_syscalls) |s| {
+        if (!isDeniedSyscall(s)) count += 1;
+    }
+    break :blk count;
+};
+
+const effective_allow_syscalls = blk: {
+    @setEvalBranchQuota(100_000);
+    var arr: [effective_allow_count]u32 = undefined;
+    var i: usize = 0;
+    for (startup_allow_syscalls) |s| {
+        if (isDeniedSyscall(s)) continue;
+        arr[i] = s;
+        i += 1;
+    }
+    for (default_profile.allowed_syscalls) |s| {
+        if (isDeniedSyscall(s)) continue;
+        arr[i] = s;
+        i += 1;
+    }
     break :blk arr;
 };
 
-// Inline BPF construction (local to PR 3) — KILL on unknown syscall,
-// ALLOW on known. Syscall numbers are the kernel ABI values from
-// std.os.linux.syscalls.X64.
-fn buildToolBpf(comptime allow: []const u32) [6 + allow.len]std.os.linux.BPF.Insn {
-    @setEvalBranchQuota(100_000);
-    const BPF = std.os.linux.BPF;
-    const SECC = std.os.linux.SECCOMP;
-    const allow_len: usize = allow.len;
-    var prog: [6 + allow_len]BPF.Insn = undefined;
-    // Load seccomp_data.nr into r0. Skip the arch check (PR 3 is x86_64-only;
-    // PR 1's arch check matched AUDIT_ARCH_X86_64 = 0xC000003E but the Zen
-    // kernel here reports a different arch value, falsely KILLing every
-    // syscall. Re-add the arch check when porting to multi-arch.
-    prog[0] = BPF.Insn.ld_abs(.word, .r0, .r0, @as(i32, @intCast(@offsetOf(SECC.data, "nr"))));
-    const last_idx: i64 = @intCast(prog.len - 1);
-    for (allow, 0..) |syscall_nr, i| {
-        const idx: i64 = @intCast(4 + i);
-        const offset_to_allow: i16 = @intCast(last_idx - (idx + 1));
-        prog[4 + i] = BPF.Insn.jeq(.r0, @as(i32, @bitCast(syscall_nr)), offset_to_allow);
-    }
-    // KILL_PROCESS on unknown syscall (default deny).
-    prog[4 + allow_len] = .{
-        .code = BPF.RET | BPF.K,
-        .dst = 0,
-        .src = 0,
-        .off = 0,
-        .imm = @bitCast(@as(u32, SECC.RET.KILL_PROCESS)),
-    };
-    prog[5 + allow_len] = .{
-        .code = BPF.RET | BPF.K,
-        .dst = 0,
-        .src = 0,
-        .off = 0,
-        .imm = @bitCast(@as(u32, SECC.RET.ALLOW)),
-    };
-    return prog;
-}
-
-// DIAGNOSTIC: check if specific syscalls are in merged_allowlist.
+// DIAGNOSTIC: check if specific syscalls are in effective_allow_syscalls.
 comptime {
     @setEvalBranchQuota(100_000);
     const required = [_]u32{
@@ -568,42 +569,24 @@ comptime {
     };
     for (required) |s| {
         var found = false;
-        for (merged_allowlist) |m| {
+        for (effective_allow_syscalls) |m| {
             if (m == s) {
                 found = true;
                 break;
             }
         }
-        if (!found) @compileError("syscall " ++ @as([]const u8, @tagName(@as(std.os.linux.E, @fromBackingInt(@intCast(@as(usize, s)))))) ++ " missing from merged_allowlist");
+        if (!found) @compileError("syscall " ++ @as([]const u8, @tagName(@as(std.os.linux.E, @fromBackingInt(@intCast(@as(usize, s)))))) ++ " missing from effective_allow_syscalls");
     }
 }
 
-// DIAGNOSTIC: tiny allowlist of syscalls /bin/true definitely needs.
-const diagnostic_allow = [_]u32{
-    0, // read
-    1, // write
-    3, // close
-    9, // mmap
-    10, // mprotect
-    11, // munmap
-    12, // brk
-    25, // mremap
-    28, // madvise
-    59, // execve
-    158, // arch_prctl
-    202, // futex
-    218, // set_tid_address
-    228, // clock_gettime
-    231, // exit_group
-    257, // openat
-    273, // set_robust_list
-    302, // prlimit64
-    318, // getrandom
-};
-
+/// The sandbox's syscall filter. Built by the shared cBPF builder: complete
+/// instruction layout (no uninitialized slots — the kernel rejects those
+/// with EINVAL) plus the AUDIT_ARCH_X86_64 check, so an ia32 (`int 0x80`)
+/// call with a different syscall numbering cannot slip through the
+/// allowlist. KILL_PROCESS on anything not in the effective allowlist.
 const tool_bpf_prog = blk: {
     @setEvalBranchQuota(100_000);
-    break :blk buildToolBpf(&diagnostic_allow);
+    break :blk sandbox_linux.Seccomp.buildAllowlist(&effective_allow_syscalls, &[_]u32{});
 };
 
 // =============================================================================
@@ -872,8 +855,16 @@ const sandbox = @This();
 const test_profile = sandbox_profile.Profile{
     .paths = &[_]sandbox_profile.PathRule{
         .{ .path = "/tmp", .access = .{ .read = true, .write = true } },
-        .{ .path = "/usr/bin", .access = .{ .read = true } },
-        .{ .path = "/bin", .access = .{ .read = true } },
+        .{ .path = "/usr/bin", .access = .{ .read = true, .execute = true } },
+        .{ .path = "/bin", .access = .{ .read = true, .execute = true } },
+        // The loader needs EXECUTE on the FILE (the kernel opens it with
+        // FMODE_EXEC); on the directory it would also make every binary
+        // under it executable. Landlock v1 allows a file rule with
+        // FS_EXECUTE only. Paths that do not exist are skipped.
+        .{ .path = "/usr/lib/ld-linux-x86-64.so.2", .access = .{ .read = true, .execute = true } },
+        .{ .path = "/lib64/ld-linux-x86-64.so.2", .access = .{ .read = true, .execute = true } },
+        .{ .path = "/lib/ld-linux-x86_64.so.2", .access = .{ .read = true, .execute = true } },
+        .{ .path = "/lib/ld-musl-x86_64.so.1", .access = .{ .read = true, .execute = true } },
         .{ .path = "/usr/lib", .access = .{ .read = true } },
         .{ .path = "/lib", .access = .{ .read = true } },
         .{ .path = "/etc/ssl", .access = .{ .read = true } },
@@ -1090,4 +1081,83 @@ test "S5: wait() reports WaitpidFailed (not a bogus status) when the child is al
     _ = s5WaitpidU32(pid, &expected); // reap it here
     var sub = sandbox.ToolSubprocess{ .pid = pid, .landlock_fd = -1, .stdout_fd = -1 };
     try testing.expectError(error.WaitpidFailed, sub.wait());
+}
+
+// ===== P0 — el filtro seccomp del sandbox (S1, S3) =====
+// El sandbox anuncia una política de syscalls. Si el programa cBPF que
+// instala está mal, el kernel lo rechaza con EINVAL, el hijo muere con
+// exit_group(123) y NINGUNA syscall se filtra: el comando se ejecuta sin
+// aislamiento de syscalls. Estos tests fijan que el filtro existe de verdad.
+
+test "P0: the sandbox seccomp filter installs and kills a denied syscall with SIGSYS" {
+    // Child: install the exact filter the sandbox installs, then call a
+    // syscall outside the allowlist (ptrace = 101, denied by the profile).
+    //   - filter live   -> the ptrace call kills the child with SIGSYS
+    //   - filter failed -> exit_group(123) below, nothing is filtered
+    //   - no filter     -> ptrace succeeds, child exits 0
+    const pid = std.os.linux.fork();
+    if (pid == 0) {
+        sandbox_linux.Seccomp.loadFilter(&tool_bpf_prog) catch {
+            std.os.linux.exit_group(123);
+        };
+        _ = std.os.linux.ptrace(std.os.linux.PTRACE.TRACEME, 0, 0, 0, 0);
+        std.os.linux.exit_group(0);
+    }
+    var status: i32 = 0;
+    _ = std.os.linux.wait4(@intCast(pid), &status, 0, null);
+    const raw: u32 = @bitCast(status);
+    try testing.expect(std.os.linux.W.IFSIGNALED(raw));
+    try testing.expectEqual(std.os.linux.SIG.SYS, std.os.linux.W.TERMSIG(raw));
+}
+
+test "P0: the seccomp program checks the architecture before matching syscalls" {
+    // The first instruction must load seccomp_data.arch (offset 4). Without
+    // the arch check, an ia32 (int 0x80) call uses a different syscall
+    // numbering and slips through the allowlist (ia32 chown = 12 = x86_64
+    // brk, which is allowed).
+    try testing.expectEqual(
+        @as(i32, @intCast(@offsetOf(std.os.linux.SECCOMP.data, "arch"))),
+        tool_bpf_prog[0].imm,
+    );
+}
+
+test "P0: the effective syscall allowlist excludes the profile's explicit denials" {
+    // The filter is the enforcement point for the profile's syscall
+    // policy: a filter that allowed `mount` while the profile declares it
+    // denied would make the profile a lie. The names are resolved from the
+    // x86_64 ABI so the assertion cannot drift into pinning a wrong number.
+    const SYS = std.os.linux.SYS;
+    const denied_by_policy = [_]SYS{
+        .ptrace,      .setuid,     .setgid,  .capset,          .personality, .mount,       .reboot,
+        .init_module, .kexec_load, .unshare, .perf_event_open, .bpf,         .userfaultfd,
+    };
+    for (denied_by_policy) |name| {
+        const nr: u32 = @intCast(@backingInt(name));
+        for (effective_allow_syscalls) |allowed| {
+            try testing.expect(allowed != nr);
+        }
+    }
+}
+
+test "P0: the effective syscall allowlist keeps the syscalls real tools need" {
+    // The allowlist is "the whole x86_64 surface minus the policy denials",
+    // so an accidental hole is a syscall the sandboxed tool cannot call at
+    // all: ripgrep needs poll(2) and node needs capget(2), and both died
+    // with SIGSYS while those holes were in the list.
+    const required = [_]struct { nr: u32, name: std.os.linux.SYS }{
+        .{ .nr = 7, .name = .poll },
+        .{ .nr = 58, .name = .vfork },
+        .{ .nr = 125, .name = .capget },
+    };
+    for (required) |e| {
+        try testing.expectEqual(@as(u32, @intCast(@backingInt(e.name))), e.nr);
+        var found = false;
+        for (effective_allow_syscalls) |allowed| {
+            if (allowed == e.nr) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
 }
