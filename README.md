@@ -1,6 +1,6 @@
 # zargeant
 
-[![Zig](https://img.shields.io/badge/Zig-0.17.0-orange.svg)](https://ziglang.org)
+[![Zig](https://img.shields.io/badge/Zig-0.17.1-orange.svg)](https://ziglang.org)
 [![License](https://img.shields.io/badge/license-Unlicense-blue.svg)](#license)
 [![Status](https://img.shields.io/badge/status-in%20development-yellow.svg)](#status)
 
@@ -8,11 +8,11 @@
 
 ## What is zargeant?
 
-Zargeant is a **terminal-native AI agent harness**: a TUI that lets you drive an LLM agent directly from your terminal, with strict security boundaries on every tool invocation. It is written in **Zig 0.16** with zero external runtime dependencies, built on three concurrent threads (TUI render / Agent HTTP-SSE / Tools subprocess pool) and a Linux sandbox based on **Landlock LSM + Seccomp-BPF**.
+Zargeant is a **terminal-native AI agent harness**: a TUI that lets you drive an LLM agent directly from your terminal, with strict security boundaries on every tool invocation. It is written in **Zig 0.17** with zero external runtime dependencies, built on three concurrent threads (TUI render / Agent HTTP-SSE / Tools subprocess pool) and a Linux sandbox based on **Landlock LSM + Seccomp-BPF**.
 
 ## Why?
 
-- **Minimal binary.** Zig 0.16 + stdlib only; ~200 KB–1.5 MB stripped, cold start < 50 ms.
+- **Minimal binary.** Zig 0.17 + stdlib only; ~200 KB–1.5 MB stripped, cold start < 50 ms.
 - **Hardened by design.** Every tool subprocess runs in a sandboxed copy of the agent's profile: deny-by-default filesystem rules via Landlock, syscall allowlist via Seccomp-BPF, no `ptrace`, no `mount`, no `bpf`.
 - **Headless observability.** A mandatory `src/logger.zig` writes to `/tmp/ai-harness-debug.log` (mode `0600`). The TUI takes raw mode on the terminal; **no** writes to `stdout` or `stderr`.
 - **Strict TDD.** Every slice ships with tests written **before** implementation. 500+ tests pass on Debug + ReleaseSafe + ReleaseFast as of slice 7 PR #56 + Phase 2 PR #50 merge (386 main + 114 in-tree terminal + Phase 2 additions).
@@ -68,7 +68,7 @@ In development. All seven planned slices shipped on `main`. Phase 2 Tiger Style 
 
 ## Requirements
 
-- **Zig 0.17.0** — exact toolchain pinned (post-0.16 `std.posix.*` wrappers stripped; we use `std.os.linux.*` raw syscalls).
+- **Zig 0.17.1** — exact toolchain pinned (post-0.16 `std.posix.*` wrappers stripped; we use `std.os.linux.*` raw syscalls).
 - **Linux 5.13+** — Landlock ABI v1 is the floor. Tested on Arch Linux (kernel 6.x).
 - **Zero third-party deps.** Everything links statically from Zig stdlib + in-tree modules. The `mibu@636a36a` TUI dependency was replaced by the in-tree `src/terminal/` module (per ADR 0003, closes ADR 0001 §"Alternatives Considered" #2).
 
@@ -211,7 +211,7 @@ zargeant/
 ├── README.md                          (this file)
 ├── UNLICENSE                          (Unlicense)
 ├── .gitignore                         (zig-cache, .atl/, etc.)
-├── build.zig                          (Zig 0.16 std.Build)
+├── build.zig                          (Zig 0.17 std.Build)
 ├── build.zig.zon                      (package metadata, deps = .{})
 ├── src/
 │   ├── root.zig                       (re-export hub + comptime touch)
