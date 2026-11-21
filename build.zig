@@ -594,13 +594,35 @@ pub fn build(b: *std.Build) void {
     test_decl.dependOn(&run_screen_grid_test.step);
 
     // =========================================================================
-    // CI image staleness guard (zig-0.17.1-toolchain-bump, T-8).
-    //   Behavioural guard: with a stubbed `podman`, a stale CI image must be
-    //   re-baked and a matching one must not be. Runs with cwd = repo root;
-    //   wired into test_decl, which verify_step already depends on — so it
-    //   runs under `zig build test`, `zig build verify` (GitHub Actions) and
-    //   the `just test` umbrella.
+    // Toolchain pin guards (zig-0.17.1-toolchain-bump, T-7 / T-8).
+    //   T-7 — static guard: the four toolchain pins must agree with each
+    //   other, no functional surface may mention the retired AI-review
+    //   tool, the README must
+    //   declare a single toolchain, and local-ci.sh must compare the
+    //   image's Zig against the expected one. Deliberately version-agnostic:
+    //   it compares the pins against each other, not against a literal, so
+    //   it survives the next bump without being edited.
+    //   T-8 — behavioural guard: with a stubbed `podman`, a stale CI image
+    //   must be re-baked and a matching one must not be.
+    //   Both run with cwd = repo root: the Zig guard reads repo files
+    //   relative to it, the shell guard resolves it from BASH_SOURCE.
+    //   Wired into test_decl, which verify_step already depends on — so
+    //   they run under `zig build test`, `zig build verify` (GitHub
+    //   Actions) and the `just test` umbrella.
     // =========================================================================
+    const toolchain_pins_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/toolchain_pins.zig"),
+    });
+    const toolchain_pins_test_step = b.addTest(.{ .root_module = toolchain_pins_mod });
+    const run_toolchain_pins_test = b.addRunArtifact(toolchain_pins_test_step);
+    run_toolchain_pins_test.stdio = .inherit;
+    run_toolchain_pins_test.setCwd(b.path("."));
+    const toolchain_pins_test_decl = b.step("test-toolchain-pins", "Run tests/toolchain_pins.zig (T-7: toolchain pin / retired-tool / README guards)");
+    toolchain_pins_test_decl.dependOn(&run_toolchain_pins_test.step);
+    test_decl.dependOn(&run_toolchain_pins_test.step);
+
     const stale_image_check = b.addSystemCommand(&.{ "bash", "tools/local-ci-stale-image.test.sh" });
     stale_image_check.setCwd(b.path("."));
     const stale_image_test_decl = b.step("test-ci-stale-image", "Run tools/local-ci-stale-image.test.sh (T-8: a stale CI image must be re-baked)");
