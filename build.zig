@@ -593,5 +593,19 @@ pub fn build(b: *std.Build) void {
     screen_grid_test_decl.dependOn(&run_screen_grid_test.step);
     test_decl.dependOn(&run_screen_grid_test.step);
 
+    // =========================================================================
+    // CI image staleness guard (zig-0.17.1-toolchain-bump, T-8).
+    //   Behavioural guard: with a stubbed `podman`, a stale CI image must be
+    //   re-baked and a matching one must not be. Runs with cwd = repo root;
+    //   wired into test_decl, which verify_step already depends on — so it
+    //   runs under `zig build test`, `zig build verify` (GitHub Actions) and
+    //   the `just test` umbrella.
+    // =========================================================================
+    const stale_image_check = b.addSystemCommand(&.{ "bash", "tools/local-ci-stale-image.test.sh" });
+    stale_image_check.setCwd(b.path("."));
+    const stale_image_test_decl = b.step("test-ci-stale-image", "Run tools/local-ci-stale-image.test.sh (T-8: a stale CI image must be re-baked)");
+    stale_image_test_decl.dependOn(&stale_image_check.step);
+    test_decl.dependOn(&stale_image_check.step);
+
     if (qa_helgrind_opt) verify_step.dependOn(&helgrind_cmd.step);
 }
