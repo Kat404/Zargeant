@@ -31,7 +31,7 @@ set -euo pipefail
 readonly PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly BASE_IMAGE="docker.io/library/alpine:3.20"
 readonly CI_IMAGE="localhost/zargeant-ci:latest"
-readonly ZIG_VERSION="0.17.0"
+readonly ZIG_VERSION="0.17.1"
 readonly CACHE_DIR="${HOME}/.cache/zargeant-podman-ci"
 readonly ZIG_CACHE_DIR="${CACHE_DIR}/zig-cache"
 readonly GLOBAL_ZIG_CACHE_DIR="${CACHE_DIR}/zig-global-cache"
@@ -86,9 +86,19 @@ cleanup() {
 trap cleanup INT TERM
 
 # ─── CI image bake ────────────────────────────────────────────────────────────
+# A stale image silently verifies the OLD toolchain: `zig build` does not
+# enforce build.zig.zon's .minimum_zig_version, so the pin in build.zig.zon
+# is not a guard. Compare the toolchain actually inside the image against the
+# one this script expects, and re-bake on any mismatch.
 NEEDS_BAKE=0
 if [[ "${REBUILD_IMAGE}" -eq 1 ]] || ! podman image exists "${CI_IMAGE}" 2>/dev/null; then
   NEEDS_BAKE=1
+else
+  IMAGE_ZIG_VERSION="$(podman run --rm "${CI_IMAGE}" zig version 2>/dev/null || true)"
+  if [[ "${IMAGE_ZIG_VERSION}" != "${ZIG_VERSION}" ]]; then
+    echo "==> CI image has Zig ${IMAGE_ZIG_VERSION:-<unknown>}, expected ${ZIG_VERSION}: re-baking"
+    NEEDS_BAKE=1
+  fi
 fi
 
 if [[ "${NEEDS_BAKE}" -eq 1 ]]; then

@@ -202,7 +202,7 @@ The project uses [`just`](https://github.com/casey/just) as a thin wrapper over 
 | QA       | `just check-tdd`          | Every `src/*.zig` must have ≥ 1 `test` block.                                 |
 | QA       | `just check-coauthor`     | No `Co-Authored-By: ...AI...` lines in commits ahead of main.                  |
 | QA       | `just check`              | Umbrella: `fmt-check + check-syscalls + check-tdd + check-coauthor`.           |
-| CI       | `just ci`                 | Full local CI via Podman (Alpine + Zig 0.17.0, `--rm`, no garbage).            |
+| CI       | `just ci`                 | Full local CI via Podman (Alpine + Zig 0.17.1, `--rm`, no garbage).            |
 | CI       | `just ci-fast`            | Local CI skipping the heavy build steps (static guards only).                  |
 | CI       | `just ci-rebuild`         | Local CI wiping `~/.cache/zargeant-podman-ci/` first.                          |
 | CI       | `just ci-rebuild-image`   | Local CI rebuilding the Alpine container image from scratch.                   |
@@ -245,7 +245,7 @@ The `ci*` recipes wrap [`tools/local-ci.sh`](./tools/local-ci.sh), which orchest
 | Property        | Value                                                                  |
 | --------------- | ---------------------------------------------------------------------- |
 | Base image      | `docker.io/library/alpine:3.20` (musl libc, ~8 MB)                    |
-| Runtime stack   | Zig 0.17.0 (glibc-linked) + `git` + `curl` + `bash` + `gcompat`        |
+| Runtime stack   | Zig 0.17.1 (glibc-linked) + `git` + `curl` + `bash` + `gcompat`        |
 | `gcompat`       | Glibc compat layer required because Zig's x86_64-linux tarball is glibc-linked; bridges it onto musl. |
 | Container flags | `--rm` on every invocation → zero leftover containers                  |
 | Cache           | `~/.cache/zargeant-podman-ci/` (persistent `.zig-cache` between runs) |
@@ -268,7 +268,7 @@ Zig 0.17.0 added three capabilities worth reaching for instead of raw commands: 
 2. **Check** — `just check` (QA 0..5 static guards: fmt, syscalls, TDD, co-author)
 3. **test-all** — `just test-all` (umbrella test targets + embedded workaround)
 4. **verify** — `just verify` (3-mode compile + comprehensive QA gamut)
-5. **ci** — `just ci` (independent Podman Alpine + Zig 0.17.0 verification)
+5. **ci** — `just ci` (independent Podman Alpine + Zig 0.17.1 verification)
 
 **Rationale (learned the hard way — see obs#1788 session closure + Phase 2 blocker)**:
 

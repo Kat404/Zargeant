@@ -14,7 +14,7 @@
 #     failure points at one artifact and the per-step test count is visible.
 #     (The `zig build test` umbrella hang was a `std.zig.Server` protocol bug
 #     and is fixed as of Zig 0.17.0 — see AGENTS.md section 9.2.)
-#   - The Podman CI recipes wrap `tools/local-ci.sh` (Alpine + Zig 0.17.0,
+#   - The Podman CI recipes wrap `tools/local-ci.sh` (Alpine + Zig 0.17.1,
 #     --rm no garbage) for full parity with GitHub Actions.
 
 set dotenv-load := false
@@ -194,7 +194,7 @@ check: fmt-check check-syscalls check-tdd check-coauthor
 
 # ─── Local CI (Podman, Alpine, --rm) ─────────────────────────────────────────
 
-# Run the full local CI suite via Podman (Alpine + Zig 0.17.0, --rm no garbage)
+# Run the full local CI suite via Podman (Alpine + Zig 0.17.1, --rm no garbage)
 ci:
     {{ci_sh}}
 

@@ -282,7 +282,7 @@ Re-evaluate this scope when: (a) the project gains a real user base that needs V
 
 - [`investigation-2.md`](./investigation-2.md) — security architecture, isolation order, kernel primitives.
 - [`decisions/0001-libvaxis-to-mibu.md`](./decisions/0001-libvaxis-to-mibu.md) — TUI library selection rationale.
-- [Zig 0.17 Language Reference](https://ziglang.org/documentation/0.17.0/) — `std.testing`, `std.heap`, `std.os.linux`.
+- [Zig 0.17 Language Reference](https://ziglang.org/documentation/0.17.1/) — `std.testing`, `std.heap`, `std.os.linux`.
 - [Linux man-pages](https://man7.org/linux/man-pages/) — `landlock(7)`, `seccomp(2)`, `prctl(2)`, `clone(2)`, `open(2)`.
 
 ---

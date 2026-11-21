@@ -18,7 +18,7 @@
 ## Tests
 
 - [ ] `zig build test --summary all` exits 0
-- [ ] Toolchain: Zig 0.17.0 (`zig version`)
+- [ ] Toolchain: Zig 0.17.1 (`zig version`)
 - [ ] `zig build test --summary all -Doptimize=ReleaseSafe` exits 0
 - [ ] `zig build test --summary all -Doptimize=ReleaseFast` exits 0
 - [ ] New tests written FIRST (RED), then implementation (GREEN), then refactor
