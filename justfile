@@ -79,6 +79,7 @@ test:
     just test-sandbox-order
     just test-tui-screen-grid
     just test-cancel-e2e
+    just test-ci-stale-image
 
 # Run the in-tree src/terminal/ + tests/terminal/ in isolation (140 tests)
 test-terminal:
@@ -115,6 +116,10 @@ test-sandbox-order:
 # Run tests/cancel_e2e.zig (2 tests, end-to-end cancel pipe, env-gated)
 test-cancel-e2e:
     ZARGEANT_RUN_TUI_CANCEL_E2E=1 zig build test-cancel-e2e --summary all
+
+# Run tools/local-ci-stale-image.test.sh (T-8 — a stale CI image must be re-baked)
+test-ci-stale-image:
+    zig build test-ci-stale-image --summary all
 
 # Run the umbrella artifact (src/*.zig embedded tests).
 # T-10: the umbrella used to be picked by scanning .zig-cache for the largest
