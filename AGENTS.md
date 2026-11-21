@@ -183,7 +183,7 @@ The project uses [`just`](https://github.com/casey/just) as a thin wrapper over 
 | Build    | `just clean`              | Wipe `.zig-cache` + `zig-out`.                                                 |
 | Run      | `just run -- <args>`      | Run production binary with forwarded args.                                     |
 | Run      | `just run-mock`           | Run with `--mock` (offline, no real HTTP).                                     |
-| Test     | `just test`               | Umbrella: the 10 individual `test-*` targets.                                   |
+| Test     | `just test`               | Umbrella: the 11 individual `test-*` targets.                                  |
 | Test     | `just test-terminal`      | `src/terminal/` + `tests/terminal/` in isolation.                              |
 | Test     | `just test-tui`           | `tests/tui/terminal_smoke.zig` (public-surface compile guard).                 |
 | Test     | `just test-runtime-thread` | `tests/tui/runtime_thread.zig` (PR1+PR1.5 TUI fix coverage).                  |
@@ -193,6 +193,7 @@ The project uses [`just`](https://github.com/casey/just) as a thin wrapper over 
 | Test     | `just test-cancel-e2e`    | `tests/cancel_e2e.zig` (env-gated end-to-end cancel pipe).                     |
 | Test     | `just test-sandbox-order` | `tests/sandbox_order.zig` (S1/WU-1.1 isolation-order guard).                  |
 | Test     | `just test-tui-screen-grid` | `tests/tui/screen_grid.zig` (ScreenGrid value type).                        |
+| Test     | `just test-toolchain-pins` | `tests/toolchain_pins.zig` (toolchain pin / `gga` / README guards).        |
 | Test     | `just test-ci-stale-image` | `tools/local-ci-stale-image.test.sh` (stale CI image must be re-baked).     |
 | Test     | `just test-embedded`      | The umbrella artifact: 220 `src/*.zig` embedded tests (see §9.2).             |
 | Test     | `just test-all`           | `just test` + `just test-embedded`.                                           |
